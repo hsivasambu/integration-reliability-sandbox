@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Integration Reliability Sandbox</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    pre { background: #f3f3f3; padding: 0.75rem; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>Integration Reliability Sandbox</h1>
+  <p>A learning sandbox that will accept synthetic JSON events, store them, and deliver them
+     reliably to a controlled mock receiver. This first stage only reports service health.</p>
+  <button id="check" type="button">Check health</button>
+  <pre id="result" aria-live="polite">Not checked yet.</pre>
+  <script src="/health-check.js"></script>
+</body>
+</html>

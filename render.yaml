@@ -1,0 +1,17 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: integration-reliability-sandbox
+    runtime: node
+    plan: free            # no cost; sleeps after 15 min idle (see README)
+    region: oregon
+    branch: main
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+    # PORT is set by Render (default 10000); HOST defaults to 0.0.0.0 in code.
+    # Node version comes from .node-version (24).
