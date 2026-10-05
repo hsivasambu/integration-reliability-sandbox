@@ -22,7 +22,7 @@ describe('delivery worker', { skip }, () => {
   let server;
   let send;
   let workerErrors;
-  const quietLog = { log() {}, error: (msg) => workerErrors.push(msg) };
+  const quietLog = { log() {}, debug() {}, info() {}, warn() {}, error: (msg) => workerErrors.push(msg) };
 
   const newWorker = (overrides = {}) => createWorker({
     pool, send, pollIntervalMs: 50, leaseMs: LEASE_MS, maxAttempts: 4,

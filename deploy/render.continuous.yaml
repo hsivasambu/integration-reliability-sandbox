@@ -1,13 +1,17 @@
-# Render Blueprint: https://render.com/docs/blueprint-spec
-# Pushing changes to this file makes Render create/update the resources below.
+# PREPARED, NOT ACTIVE. Continuous-running variant of render.yaml.
+# Render only reads render.yaml in the repository root, so this file changes nothing by itself.
+# To use it (this BUYS a paid instance; get explicit approval first):
+#   copy deploy/render.continuous.yaml over render.yaml, commit, push.
+# Differences from render.yaml: a paid always-on instance type, and migrations in a pre-deploy step.
 services:
   - type: web
     name: integration-reliability-sandbox
     runtime: node
-    plan: free            # no cost; sleeps after 15 min idle (see README)
+    plan: 0.5c-512mb      # smallest paid instance ("Starter"); paid instances do not spin down. COSTS MONEY.
     region: oregon
     branch: main
     buildCommand: npm ci
+    preDeployCommand: npm run migrate   # paid instances support a pre-deploy step
     startCommand: npm start
     healthCheckPath: /health
     autoDeployTrigger: commit
@@ -18,10 +22,9 @@ services:
         fromDatabase:
           name: integration-reliability-sandbox-db
           property: connectionString   # internal (private network) URL
-      # Free instances have no pre-deploy command, so migrations run at startup.
-      # On a paid instance, remove this and add: preDeployCommand: npm run migrate
+      # Migrations run in preDeployCommand instead of at startup.
       - key: MIGRATE_ON_START
-        value: "true"
+        value: "false"
       # Render's proxy sits in front of the app; trust one hop for client IPs.
       - key: TRUST_PROXY
         value: "1"
@@ -75,7 +78,8 @@ services:
 
 databases:
   - name: integration-reliability-sandbox-db
-    plan: free            # no cost; expires 30 days after creation, no backups
+    plan: free            # STILL EXPIRES after 30 days. For long-term continuous use, upgrade the
+                          # database to a paid plan in the dashboard (also costs money).
     region: oregon        # same region as the web service for the private network
     postgresMajorVersion: "18"
     databaseName: sandbox

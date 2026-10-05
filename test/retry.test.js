@@ -1,6 +1,7 @@
 const { describe, test, before, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const http = require('node:http');
 const { once } = require('node:events');
 const request = require('supertest');
 const { createApp } = require('../src/app');
@@ -54,7 +55,7 @@ describe('retry scheduling (controllable clock)', { skip }, () => {
   let workerErrors;
   const clock = () => new Date(fakeNow);
   const advance = (ms) => { fakeNow += ms; };
-  const quietLog = { log() {}, error: (msg) => workerErrors.push(msg) };
+  const quietLog = { log() {}, debug() {}, info() {}, warn() {}, error: (msg) => workerErrors.push(msg) };
   const newWorker = (overrides = {}) => createWorker({
     pool, send, pollIntervalMs: 20, leaseMs: LEASE_MS, maxAttempts: 4, retryBaseDelayMs: 2000,
     clock, log: quietLog, ...overrides,
@@ -194,12 +195,22 @@ describe('retry scheduling (controllable clock)', { skip }, () => {
   test('terminal 4xx: a 404 from the receiver fails immediately without retry', async () => {
     const session = await newSession();
     const eventId = await submitEvent(session);
-    // An expired session is unknown to the receiver, which answers 404.
-    await pool.query(
-      "UPDATE demo_sessions SET created_at = now() - interval '2 days', expires_at = now() - interval '1 second' WHERE id = $1",
-      [session.id]);
+    // A stand-in destination that rejects every delivery with 404 (real HTTP).
+    const rejecting = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(404, { 'Content-Type': 'application/json' }).end('{"error":"not_found"}');
+    });
+    rejecting.listen(0, '127.0.0.1');
+    await once(rejecting, 'listening');
+    const sendToRejecting = createDeliveryClient({
+      receiverUrl: `http://127.0.0.1:${rejecting.address().port}/`, receiverSecret: SECRET, deliveryTimeoutMs: 800,
+    });
     await syncClock();
-    await newWorker().runOnce();
+    try {
+      await newWorker({ send: sendToRejecting }).runOnce();
+    } finally {
+      rejecting.close();
+    }
 
     const { rows: [row] } = await pool.query(
       `SELECT d.state, d.failure_reason, d.attempt_count, a.response_status, a.retryable, a.error_category

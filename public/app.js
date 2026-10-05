@@ -64,6 +64,7 @@ const state = {
   detail: null,            // { eventId, deliveries, receipt }
   detailNote: null,        // result of the last duplicate / replay action for the selected event
   receiver: null,
+  summary: null,
   pendingSubmit: null,     // { key, body } kept until the server answers, so a retry reuses the key
   poll: { timer: null, running: false, again: false, failures: 0, lastError: null },
   slowRequests: 0,
@@ -173,7 +174,9 @@ async function pollNow() {
 
 async function refresh() {
   if (!state.token) return;
-  const [events, receiver] = await Promise.all([api('GET', '/v1/events?limit=20'), api('GET', '/v1/receiver')]);
+  const [events, receiver, summary] = await Promise.all([
+    api('GET', '/v1/events?limit=20'), api('GET', '/v1/receiver'), api('GET', '/v1/summary'),
+  ]);
   if (!state.token) return; // the session expired during the request
   if (events.status !== 200 || receiver.status !== 200) {
     throw new Unavailable(`The API answered HTTP ${events.status !== 200 ? events.status : receiver.status}.`);
@@ -181,6 +184,7 @@ async function refresh() {
   state.events = events.data.data;
   state.hasMoreEvents = Boolean(events.data.nextCursor);
   state.receiver = receiver.data;
+  if (summary.status === 200) state.summary = summary.data;
   if (state.selectedId) await loadDetail(state.selectedId);
   render();
 }
@@ -216,6 +220,7 @@ function sessionExpired() {
   state.events = [];
   state.detail = null;
   state.receiver = null;
+  state.summary = null;
   selectEvent(null);
   state.sessionNote = 'Your demo session has expired or is no longer valid. Start a new one to continue.';
   render();
@@ -480,6 +485,7 @@ function render() {
   renderReceiver();
   keepFocus($('event-list'), renderEvents);
   keepFocus($('detail'), renderDetail);
+  renderSummary();
   const signedIn = Boolean(state.token);
   for (const id of ['submit-event', 'new-example']) $(id).disabled = !signedIn;
 }
@@ -672,6 +678,26 @@ function renderDetail() {
     }
   }
   container.replaceChildren(h('p', {}, h('strong', {}, event.payload.title)), lane1, lane2, lane3);
+}
+
+function renderSummary() {
+  const container = $('summary');
+  const s = state.summary;
+  if (!state.token || !s) {
+    container.replaceChildren(h('p', { class: 'muted' }, 'Start a session to see a summary.'));
+    return;
+  }
+  const d = s.recentDeliveryDuration;
+  container.replaceChildren(
+    h('p', {}, `Events: ${s.events} · delivered: ${s.byCurrentDeliveryState.delivered} · failed: ${s.byCurrentDeliveryState.failed}`
+      + ` · in progress: ${s.byCurrentDeliveryState.active} · HTTP attempts: ${s.attempts} · replays: ${s.replays}`),
+    h('p', {}, `Receiver: processed ${s.receiver.processed} event(s), recognized ${s.receiver.duplicatesRecognized} duplicate delivery(ies).`),
+    h('p', {}, h('strong', {}, 'Recent delivery time: '), d.sampleSize === 0
+      ? 'no delivered events yet.'
+      : `median ${(d.medianMs / 1000).toFixed(1)} s, slowest ${(d.maxMs / 1000).toFixed(1)} s, over ${d.sampleSize} delivered event(s).`),
+    h('details', { class: 'note' }, h('summary', {}, 'How this is measured'),
+      h('p', {}, `From: ${d.start}. To: ${d.end}. Population: ${d.population} Includes ${d.includes}.`),
+      h('p', {}, s.notice)));
 }
 
 // --- API status (from Stage 1) -----------------------------------------------------

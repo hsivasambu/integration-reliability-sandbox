@@ -22,7 +22,7 @@ describe('receiver-side duplicate protection', { skip }, () => {
   let fakeNow;
   let workerErrors;
   const clock = () => new Date(fakeNow);
-  const quietLog = { log() {}, error: (msg) => workerErrors.push(msg) };
+  const quietLog = { log() {}, debug() {}, info() {}, warn() {}, error: (msg) => workerErrors.push(msg) };
   const newWorker = () => createWorker({
     pool, send, pollIntervalMs: 20, leaseMs: 3000, maxAttempts: 4, retryBaseDelayMs: 2000, clock, log: quietLog,
   });

@@ -532,3 +532,78 @@ second deploy. `/ready` 200.
   delivery on the first attempt after the switch.
 - Rerun after fixing the check script's regexes: **27/27**, plus the extra checks **4/4** (waking notice,
   422 details, 429 limit message).
+
+## Stage 10: Operational visibility and bounded demo usage (2026-10-05)
+
+**Decisions**
+- **`src/logger.js`.** JSON lines, no dependency. Redaction is enforced in the logger: sensitive-looking keys
+  become `[redacted]`, `irs_…` tokens are masked, and registered secret values (receiver secret, ops token,
+  DATABASE_URL and its password) are masked anywhere in a line. Quiet under the test runner.
+- **Request logging** (`src/operations.js`). A request ID per request (`X-Request-Id`; a valid incoming one is
+  kept), with method, path without query, status, duration, sessionId, and eventId/deliveryId when created.
+  Successful GET/HEAD requests are logged at debug only (polling and health checks would otherwise flood info).
+  Headers and bodies are never passed to the logger. The worker logs one line per attempt and one per lease
+  recovery batch; cleanup logs only when it did something.
+- **`GET /v1/summary`.** Counts by latest-delivery state, attempts, replays, receiver processed/duplicates, and
+  "acceptance-to-delivery time" (start = 202 / `events.created_at`; end = `ended_at` of the 2xx attempt;
+  population = the session's 50 most recently completed delivered original deliveries; median and max). It's
+  labelled as a demo statistic, not an SLA. All queries are bounded (≤ 100 events per session, LIMIT 50).
+- **Worker liveness.** Migration 008 adds `worker_heartbeats` (written by `poll()` at most every 10 s;
+  `stopped_at` set on graceful stop). `GET /internal/ops/worker` (enabled only with `OPS_TOKEN`; constant-time
+  compare; Render `generateValue`) returns heartbeats, queue (overdue, oldest overdue age, retries waiting,
+  in progress, expired leases) and a verdict. `/health` and `/ready` are unchanged.
+- **Expiry and cleanup** (`src/maintenance.js`, runs in WORKER_ENABLED processes):
+  - claims skip expired sessions
+  - waiting deliveries are cancelled (`failure_reason = 'session_expired'`, new CHECK value)
+  - expired sessions are deleted after `EXPIRED_RETENTION_MINUTES` (60), skipping any session with a live
+    in-progress lease; FK cascades do the rest
+  - batches of `CLEANUP_BATCH_SIZE` with `SKIP LOCKED`
+  - the old unbounded `DELETE` on session creation is removed, and the active-session cap now counts
+    unexpired sessions only
+- **Safeguards.** Added a per-IP `/v1` limit (600/min, in-memory) and a consistent 429 body for both
+  in-memory limiters. Documented which limits are per-instance (in-memory) and which are database-enforced.
+- **Hosting** (Render docs checked 2026-10-05):
+  - Free instances spin down after 15 min without inbound traffic; spin-up takes about 1 minute.
+  - On deploys, SIGTERM is followed by SIGKILL after 30 s by default; the old and new instances overlap.
+  - Prepared `deploy/render.continuous.yaml` (`plan: 0.5c-512mb`, `preDeployCommand`, `MIGRATE_ON_START=false`).
+    It's not active and not purchased.
+  - Paid pricing was not confirmed from an official page (third-party sources list Starter at about $7/month).
+- UI: a "Session summary" panel with the metric definition, refreshed with the existing polling.
+
+**Verification (local, Node 22.18.0, Postgres 18.6)**
+- `npm test`: 124/124 pass.
+  - Updated: the Stage 2 "session creation deletes expired sessions" test now asserts it deletes nothing;
+    the terminal-404 retry test uses a real HTTP stub that answers 404, because expired sessions are no
+    longer attempted.
+  - 13 new tests in `test/operations.test.js`:
+    - logger redaction (keys, demo token, registered secret)
+    - request log fields, with no token, payload, secret or headers in the output
+    - routine reads silent at info level
+    - worker attempt log fields
+    - summary counts and metric definition, session-scoped
+    - ops endpoint: 404 when unset; 401 for a wrong token or a session token; `no_live_worker` while
+      `/ready` is 200; heartbeat appears, then `stoppedAt` after stop; `stalled` verdict
+    - expiry: no claims, cancellation
+    - purge: grace period, batch size, live-lease skip, cascade
+    - API rate limit 429
+- **Drill** (local, worker on, hard kill via `taskkill /F`, which is like a crash or SIGKILL; synthetic events):
+  - *Phase A, crash with attempts in flight* (`process_then_timeout`, 4 events). At the kill: 2 in progress,
+    2 pending. Restarted about 1.5 s later; all 4 delivered **12.1 s after restart**. The 2 in-flight
+    deliveries show `lease_expired`, then `delivered`: they waited for the 15 s lease and were recovered in
+    one batch (`recovered: 2`). The 2 pending show `failed` (timeout), then `delivered`. Receiver:
+    **processed 4, duplicates 4**, so every event was processed exactly once despite the resends.
+  - *Phase B, crash with retries scheduled* (`server_error`, 3 events). The receiver was switched to success
+    in the database while the server was down for 10.5 s; the retries were overdue by up to 6 s. All 3 were
+    delivered **0.9 s after restart**.
+  - Logs: 43 lines, all valid JSON, including the recovery line and attempt lines with eventId, deliveryId,
+    attemptNumber, responseStatus, durationMs and nextState. Leak scan found **0 occurrences** of either
+    session token, the ops token, the receiver secret, the database password, or the payload marker text.
+  - Observations and limitations:
+    - **A killed worker keeps showing as live in the ops check until its heartbeat is 60 s old**, because it
+      can't record `stopped_at`.
+    - The **first drill attempt was invalid**: the PowerShell-based kill took 1–2 s, so the in-flight window
+      was missed. It was rerun with a pre-looked-up PID and `taskkill`.
+    - Graceful SIGTERM shutdown could not be exercised on Windows (covered by the Stage 5 test, and visible
+      in Render logs on each deploy).
+    - Single run, single machine. The numbers show behaviour (lease wait ≈ lease length; overdue work picked
+      up within one poll), not performance.

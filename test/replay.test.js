@@ -18,7 +18,7 @@ describe('manual replay', { skip }, () => {
   let worker;
   let fakeNow;
   let workerErrors;
-  const quietLog = { log() {}, error: (msg) => workerErrors.push(msg) };
+  const quietLog = { log() {}, debug() {}, info() {}, warn() {}, error: (msg) => workerErrors.push(msg) };
 
   before(async () => {
     pool = await freshDatabase();

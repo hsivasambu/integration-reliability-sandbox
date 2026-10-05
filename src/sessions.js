@@ -19,11 +19,10 @@ function hashToken(token) {
 class SessionLimitError extends Error {}
 
 async function createSession(pool, { ttlHours, maxActive }) {
-  // Remove expired sessions so retained data stays bounded.
-  await pool.query('DELETE FROM demo_sessions WHERE expires_at <= now()');
-
+  // Only unexpired sessions count toward the cap. Expired ones are removed in bounded batches by
+  // the cleanup job (src/maintenance.js), never here, so no in-flight work is deleted mid-request.
   const { rows: [{ count }] } = await pool.query(
-    'SELECT count(*)::int AS count FROM demo_sessions');
+    'SELECT count(*)::int AS count FROM demo_sessions WHERE expires_at > now()');
   if (count >= maxActive) throw new SessionLimitError('Too many active demo sessions');
 
   const token = generateToken();

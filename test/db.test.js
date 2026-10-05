@@ -111,12 +111,13 @@ describe('database-backed behaviour', { skip }, () => {
       assert.equal(res.headers.allow, 'POST');
     });
 
-    test('removes expired sessions when a new one is created', async () => {
+    test('expired sessions do not count toward the cap and are left for bounded cleanup', async () => {
       await pool.query(
         "UPDATE demo_sessions SET created_at = now() - interval '2 days', expires_at = now() - interval '1 day'");
-      await request(appWith()).post('/v1/sessions').expect(201);
-      const { rows: [{ count }] } = await pool.query('SELECT count(*)::int AS count FROM demo_sessions');
-      assert.equal(count, 1);
+      const { rows: [{ before }] } = await pool.query('SELECT count(*)::int AS before FROM demo_sessions');
+      await request(appWith({ maxActiveSessions: 1 })).post('/v1/sessions').expect(201);
+      const { rows: [{ after }] } = await pool.query('SELECT count(*)::int AS after FROM demo_sessions');
+      assert.equal(after, before + 1, 'session creation no longer deletes anything');
     });
   });
 

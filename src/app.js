@@ -9,6 +9,8 @@ const { eventRoutes } = require('./events');
 const { replayRoutes } = require('./replay');
 const { receiverRoutes, receiverSettingsRoutes } = require('./receiver');
 const { sendError, methodNotAllowed } = require('./errors');
+const { requestLogger, summaryRoutes, opsRoutes } = require('./operations');
+const { logger } = require('./logger');
 
 const DEFAULTS = {
   trustProxy: 0,
@@ -21,6 +23,9 @@ const DEFAULTS = {
   workerEnabled: false,
   deliveryMaxAttempts: 4,
   maxReplaysPerEvent: 3,
+  apiRateLimit: { max: 600, windowMs: 60_000 },
+  opsToken: undefined, // without it the private ops check is disabled
+  workerStallSeconds: 60,
 };
 
 function createApp({ pool, config = {} } = {}) {
@@ -30,6 +35,7 @@ function createApp({ pool, config = {} } = {}) {
   // Don't advertise the framework in response headers.
   app.disable('x-powered-by');
   app.set('trust proxy', settings.trustProxy);
+  app.use(requestLogger());
 
   // Browser hardening. The page keeps a demo token in sessionStorage, so it must only ever run
   // its own same-origin scripts: no inline scripts, no third-party code, no framing.
@@ -65,12 +71,14 @@ function createApp({ pool, config = {} } = {}) {
       }
       res.json({ status: 'ready' });
     } catch (err) {
-      console.error(`Readiness check failed: ${err.message}`);
+      logger.warn('readiness check failed', { requestId: req.id, error: err });
       res.status(503).json({ status: 'unavailable', reason: 'database_unreachable' });
     }
   });
   app.all('/ready', methodNotAllowed(['GET', 'HEAD']));
 
+  // Per-IP request budget for the whole API (in-memory; see src/rate-limit.js for its limits).
+  app.use('/v1', createRateLimiter(settings.apiRateLimit));
   // API routes accept at most 4 KB of JSON (the largest valid event is well under this).
   app.use('/v1', express.json({ limit: '4kb' }));
 
@@ -106,11 +114,13 @@ function createApp({ pool, config = {} } = {}) {
   app.use('/v1', eventRoutes(pool, settings));
   app.use('/v1', replayRoutes(pool, settings));
   app.use('/v1', receiverSettingsRoutes(pool));
+  app.use('/v1', summaryRoutes(pool));
 
   // Mock receiver for server-side callers only (protected by RECEIVER_SECRET).
   const receiver = receiverRoutes(pool, settings);
   app.locals.receiverStats = receiver.stats;
   app.use('/internal', receiver);
+  app.use('/internal', opsRoutes(pool, settings));
 
   app.use(express.static(path.join(__dirname, '..', 'public')));
 
@@ -132,7 +142,7 @@ function createApp({ pool, config = {} } = {}) {
     if (err.status >= 400 && err.status < 500 && err.expose) {
       return sendError(res, err.status, 'bad_request', 'The request could not be processed.');
     }
-    console.error(err.stack ?? err.message);
+    logger.error('unhandled request error', { requestId: req.id, path: req.path, error: err, stack: err.stack });
     sendError(res, 500, 'internal_error', 'Something went wrong on the server.');
   });
 

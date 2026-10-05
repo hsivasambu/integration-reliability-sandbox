@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const { logger } = require('./logger');
 
 function createPool(databaseUrl) {
   const pool = new Pool({
@@ -9,7 +10,7 @@ function createPool(databaseUrl) {
     query_timeout: 5000,
   });
   // An idle client losing its connection (e.g. database restart) must not crash the app.
-  pool.on('error', (err) => console.error(`Database pool error: ${err.message}`));
+  pool.on('error', (err) => logger.warn('database pool error', { error: err }));
   return pool;
 }
 

@@ -10,12 +10,16 @@
 async function claimNext(pool, { leaseMs, now = null }) {
   const { rows } = await pool.query(
     `WITH next AS (
-       SELECT id FROM deliveries
-       WHERE state IN ('pending', 'retry_scheduled')
-         AND next_attempt_at <= coalesce($2::timestamptz, now())
-       ORDER BY next_attempt_at
+       -- Deliveries of expired sessions are never started (cleanup cancels them later).
+       SELECT d.id FROM deliveries d
+       JOIN events e ON e.id = d.event_id
+       JOIN demo_sessions s ON s.id = e.session_id
+       WHERE d.state IN ('pending', 'retry_scheduled')
+         AND d.next_attempt_at <= coalesce($2::timestamptz, now())
+         AND s.expires_at > coalesce($2::timestamptz, now())
+       ORDER BY d.next_attempt_at
        LIMIT 1
-       FOR UPDATE SKIP LOCKED
+       FOR UPDATE OF d SKIP LOCKED
      ), claimed AS (
        UPDATE deliveries d
        SET state = 'in_progress',

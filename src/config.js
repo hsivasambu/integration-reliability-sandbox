@@ -65,6 +65,24 @@ function loadConfig(env = process.env) {
   config.workerConcurrency = intSetting(env, 'WORKER_CONCURRENCY', 2, 1, 10, problems);
   // Manual replays allowed per event (each replay gets a fresh attempt budget).
   config.maxReplaysPerEvent = intSetting(env, 'MAX_REPLAYS_PER_EVENT', 3, 0, 10, problems);
+  config.workerHeartbeatIntervalMs = intSetting(env, 'WORKER_HEARTBEAT_INTERVAL_MS', 10_000, 1000, 300_000, problems);
+
+  // Operations: logging, API rate limit, cleanup, and the private ops check.
+  config.logLevel = ['debug', 'info', 'warn', 'error'].includes(env.LOG_LEVEL) ? env.LOG_LEVEL : 'info';
+  config.apiRateLimit = {
+    max: intSetting(env, 'API_RATE_LIMIT_PER_MINUTE', 600, 10, 100_000, problems),
+    windowMs: 60_000,
+  };
+  config.cleanupIntervalMs = intSetting(env, 'CLEANUP_INTERVAL_MS', 60_000, 5000, 3_600_000, problems);
+  config.cleanupBatchSize = intSetting(env, 'CLEANUP_BATCH_SIZE', 100, 1, 10_000, problems);
+  config.expiredRetentionMinutes = intSetting(env, 'EXPIRED_RETENTION_MINUTES', 60, 0, 10_080, problems);
+  config.workerStallSeconds = intSetting(env, 'WORKER_STALL_SECONDS', 60, 10, 3600, problems);
+  // Optional. Without it the private ops endpoint is disabled (404).
+  config.opsToken = env.OPS_TOKEN || undefined;
+  if (config.opsToken && (config.opsToken.length < 32 || /\s/.test(config.opsToken))) {
+    problems.push('OPS_TOKEN must be at least 32 characters with no spaces');
+  }
+
   if (config.deliveryLeaseMs < config.deliveryTimeoutMs + 1000) {
     problems.push('DELIVERY_LEASE_MS must be at least DELIVERY_TIMEOUT_MS + 1000, or healthy attempts would lose their lease');
   }

@@ -239,6 +239,7 @@ function eventRoutes(pool, { maxEventsPerSession, deliveryMaxAttempts }) {
     });
     switch (result.outcome) {
       case 'created':
+        res.locals.eventId = result.row.id;
         // 202 Accepted: durably stored and queued; delivery happens asynchronously.
         res.set('Location', statusUrl(result.row.id));
         return res.status(202).json({
@@ -248,6 +249,7 @@ function eventRoutes(pool, { maxEventsPerSession, deliveryMaxAttempts }) {
           notice: 'Accepted: stored durably and queued for asynchronous delivery. It has not been delivered yet; check statusUrl.',
         });
       case 'replayed':
+        res.locals.eventId = result.row.id;
         res.set('Idempotent-Replayed', 'true');
         return res.status(200).json({
           eventId: result.row.id,

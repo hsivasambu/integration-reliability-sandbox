@@ -120,6 +120,8 @@ function replayRoutes(pool, { deliveryMaxAttempts, maxReplaysPerEvent }) {
     const result = await replayDelivery(pool, {
       sessionId: req.session.id, deliveryId: req.params.id, idempotencyKey, maxReplays: maxReplaysPerEvent,
     });
+    if (result.replayId) res.locals.deliveryId = result.replayId;
+    if (result.eventId) res.locals.eventId = result.eventId;
     switch (result.outcome) {
       case 'created': {
         const body = await replayResource(result.replayId);
