@@ -724,3 +724,17 @@ but they need restarting by hand.
 - Load, soak or performance testing. No performance claims.
 - SIGTERM shutdown on Windows (unchanged; see Stage 5).
 - The authorized `/internal/ops/worker` call on Render (needs the owner's token).
+
+**Deployed check (2026-10-05, by Claude, after pushing a535d49).** 0.11.0 was live with the worker within about a minute
+(no migration; `render.yaml` unchanged). Smoke checklist from `docs/release-checklist.md`:
+- 1 `/health` 200 `0.11.0`, `inProcessWorker: true`
+- 2 `/ready` 200
+- 4 `/` has the CSP, `nosniff` and `X-Request-Id`
+- 5 `/docs/` 200, `/openapi.yaml` 200 (`application/yaml`, version 0.11.0), vendor bundle 200, `/docs/vendor/index.html` 404
+- 6 receiver without secret: 401 `receiver_unauthorized`
+- 7 ops without token: 401 `ops_unauthorized`
+- 8 **Newman against Render: 50 requests (43 + 7 repeated polls), 90/90 assertions, 0 failures, 40.6 s.**
+  0 token-shaped strings in the output. Created 2 sessions and 4 events.
+- Headless Edge on Render's `/docs/`: 15 operations, 7 tags, 0 console errors or CSP violations, no horizontal scroll.
+- Not done by me: item 3 (Render log view) and item 9 (manual browser scenario). They need the dashboard or a person.
+  The Stage 10 jsdom UI check was not rerun; the UI changed only by one footer link.
