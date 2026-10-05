@@ -827,3 +827,11 @@ All of these are recorded in `docs/frontend-notes.md` → *Known gaps*.
 - Windows high-contrast mode.
 - The check scripts (puppeteer-core, axe-core) live in a scratch folder, not in the repository.
 
+**Deployed check (2026-10-05, by Claude, after pushing b551c35).** The new page was live about 45 s after the push.
+- `/health` 200 (version unchanged at 0.11.0; the API didn't change), `/ready` 200, and the CSP header unchanged.
+- The same headless-Edge check against Render with real data: **35/36**. The same single "failure" was the browser's
+  own log of the deliberate offline and 401 requests. axe-core found 0 violations on desktop (empty and with data)
+  and mobile.
+- Screenshots were reviewed at 1440 px and 390 px.
+- The check created 2 sessions and 6 synthetic alerts.
+
