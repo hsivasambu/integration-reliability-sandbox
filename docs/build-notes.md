@@ -1334,6 +1334,22 @@ push; `/ready` 200.
 - Very long histories (up to the session limit of 100 alerts) beyond the 22 tested.
 - Safari's scroll anchoring (the page compensates itself, so it shouldn't depend on it).
 
+**Deployed check (2026-10-05, by Claude, after pushing dd61c22, then 173544c).**
+- First run against Render: Stage 17 46/46, Stage 16 49/49, Stage 15 49/49, Stage 14 41/41, Stage 12 24/25 (the
+  expected network log), but **Stage 13 55/56**: "alert shown in the journey at once" failed.
+- **A regression introduced by this stage.** The journey now reads from the history store, and `showAccepted()`
+  only added the accepted alert to the first-page list. So the journey stayed empty until the next list refresh.
+  That refresh is instant locally but not over the network.
+  - A deterministic check, holding every alert-list refresh at the network layer, reproduced it against Render
+    (journey empty, no card).
+  - The fix adds the accepted alert to the store at once; the same check then passed locally.
+  - Building that check took two attempts. The first held a refresh that session creation waits for, and the second
+    used a DevTools URL pattern whose `?` is a wildcard, so it also held the POST.
+- After pushing the fix (`173544c`): the check passed on Render, Stage 13 56/56, Stage 17 46/46.
+- One Stage 17 check assumed the receiver would be restored before try 2. When try 2 also failed first, try 3 was
+  confirmed, so the check now accepts a later attempt; the page was correct both ways.
+- The checks created about 12 sessions and 90 synthetic alerts.
+
 
 
 
