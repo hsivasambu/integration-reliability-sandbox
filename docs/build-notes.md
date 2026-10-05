@@ -243,3 +243,18 @@ exercised by the delivery worker stage.
     timeout → failed/timeout, no status (2015 ms); success → delivered/200 (10 ms).
 - Not run live: SIGTERM shutdown (Windows can't send SIGTERM to a native process this way). It's
   covered by the graceful-stop test, and Render's deploy logs show it.
+
+**Deployed check (2026-10-04, by Claude, after pushing 2faece5).** Version 0.5.0 was live about 30 s after the
+push, but `/health` first showed `inProcessWorker: false`. Render deployed the new code before the Blueprint's
+new `WORKER_ENABLED` value took effect. The first event (202, `Location` = status URL) stayed `pending`
+with no attempts, which demonstrates worker-disabled behaviour live. Shortly after, Render redeployed with
+the env var: `/health` showed `inProcessWorker: true`. Results with the worker running:
+- server_error → failed / 503 / http_error (3 ms)
+- timeout → failed / timeout, no status (2001 ms)
+- success → delivered / 200 (6 ms), receiver `receivedCount` 1
+- identical repeat → 200 + `Idempotent-Replayed: true`
+- another session's deliveries URL → 404
+
+This is the first confirmation that the app's loopback call to its own receiver
+(`http://127.0.0.1:10000/...`) works on Render. Not confirmed: whether the very first pending event was later
+delivered by the new instance. Its session token wasn't kept. The restart test covers that behaviour.
