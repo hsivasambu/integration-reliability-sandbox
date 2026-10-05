@@ -448,3 +448,11 @@ second deploy. `/ready` 200.
     session → 404.
   - About 2.5 s later the history showed the original failed (4×503) and the replay delivered (1×200).
     Replaying the delivered replay → 409 `delivery_not_failed`. Receiver: processed once, 0 duplicates.
+
+**Deployed check (2026-10-05, by Claude, after pushing e90d7a3).** 0.8.0 was live with the worker in about 30 s; migration 007 applied
+(`/ready` 200).
+- Replaying while the original was still retrying → 409 `delivery_not_failed (retry_scheduled)`.
+- After about 17 s the original was failed (4×503, `attempts_exhausted`). Switched to success; replay K1 → 202 pending; K1
+  again → 200 + `Idempotent-Replayed` (same id); K2 → 409 `already_replayed`; another session → 404.
+- About 3 s later the history showed the original failed (4×503) and the replay delivered (1×200, `replayOf` = original).
+  Receiver: processed once, 0 duplicates. Event summary: `delivered`, `replayCount` 1.
