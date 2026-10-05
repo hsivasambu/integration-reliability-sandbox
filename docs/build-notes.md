@@ -1122,5 +1122,19 @@ push; `/ready` 200.
   the live timeout and ptt runs.
 - The two-query race fix in the backend (deliberately not done).
 
+**Deployed check (2026-10-05, by Claude, after pushing 89e5846).** `/journey-motion.js` was served about 30 s after the
+push; `/ready` 200.
+- The first Stage 15 run against Render scored 46/49, all from timing assumptions in my tests, not page defects:
+  - axe measured the decorative, `aria-hidden` "Latest attempt" label mid-fade, at partial opacity.
+  - The ptt timed-out window fell between two 2-second polls once (the page correctly went straight to *Confirmed*
+    with "Try 1: timed out" in the history).
+  - After 5 hidden seconds, *Sending* was legitimately try 2.
+- The tests were changed: axe runs when no illustration is mid-fade; the ptt check accepts the window seen live
+  *or* shown in the history; the hidden-tab check looks for try 1's timeout in the history.
+- Rerun against Render: **Stage 15 49/49** (the ptt window was seen live), **Stage 14 41/41**, Stage 13 56/56,
+  Stage 12 35/36 (the same expected browser network log).
+- The revised suites were run against Render only, not locally again.
+- The checks created about 10 sessions and 35 synthetic alerts.
+
 
 
