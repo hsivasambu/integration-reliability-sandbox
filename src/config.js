@@ -38,6 +38,7 @@ function loadConfig(env = process.env) {
       windowMs: intSetting(env, 'SESSION_RATE_LIMIT_WINDOW_MINUTES', 60, 1, 1440, problems) * 60_000,
     },
     maxActiveSessions: intSetting(env, 'MAX_ACTIVE_SESSIONS', 1000, 1, 100_000, problems),
+    maxEventsPerSession: intSetting(env, 'MAX_EVENTS_PER_SESSION', 100, 1, 10_000, problems),
   };
 
   if (problems.length > 0) {

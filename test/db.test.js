@@ -90,10 +90,10 @@ describe('database-backed behaviour', { skip }, () => {
       assert.equal(res.body.error, 'session_capacity_reached');
     });
 
-    test('rejects request bodies over 1 KB', async () => {
+    test('rejects request bodies over 4 KB', async () => {
       const res = await request(appWith()).post('/v1/sessions')
         .set('Content-Type', 'application/json')
-        .send(JSON.stringify({ padding: 'x'.repeat(2000) }));
+        .send(JSON.stringify({ padding: 'x'.repeat(5000) }));
       assert.equal(res.status, 413);
       assert.equal(res.body.error, 'payload_too_large');
     });

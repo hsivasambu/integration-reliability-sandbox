@@ -2,7 +2,7 @@
 
 A learning sandbox that will accept synthetic JSON events, persist them, and deliver them
 reliably to a controlled mock receiver.
-**Current stage: 2. PostgreSQL connectivity and anonymous demo sessions.**
+**Current stage: 3. Session-scoped event API with idempotent submission (no delivery yet).**
 
 ## Requirements
 
@@ -38,6 +38,7 @@ The server refuses to start, and lists every problem, if required settings are m
 | `SESSION_TTL_HOURS` | `24` | Demo session lifetime (1–168) |
 | `SESSION_RATE_LIMIT_MAX` / `_WINDOW_MINUTES` | `10` / `60` | Session creations allowed per client IP per window |
 | `MAX_ACTIVE_SESSIONS` | `1000` | Cap on unexpired sessions across all clients |
+| `MAX_EVENTS_PER_SESSION` | `100` | Events one session may create (1–10000) |
 | `TRUST_PROXY` | `0` | Number of reverse proxies in front of the app (`1` on Render) |
 | `TEST_DATABASE_URL` | unset | Test database. Its name must end in `_test` because tests wipe it. |
 
@@ -62,16 +63,22 @@ database only accepts connections from Render's private network (`ipAllowList: [
 
 | Method & path | Response |
 |---|---|
-| `GET /health` | `200 {"status":"ok","version":"0.2.0"}` while the process runs (no database check) |
+| `GET /health` | `200 {"status":"ok","version":"0.3.0"}` while the process runs (no database check) |
 | `HEAD /health` | `200`, headers only |
 | `GET /ready` | `200 {"status":"ready"}` if the database is reachable and migrated, otherwise `503` with `reason` |
 | `POST /v1/sessions` | `201` with a new demo token (shown once), `429` if rate limited, `503` at capacity |
 | `GET /v1/session` | `200 {"createdAt","expiresAt"}` with a valid token, otherwise `401` |
+| `POST /v1/events` | `201` new event (stored, **pending, not delivered**); `200` identical repeat; `409` key reused with different payload; see [Events](#events) |
+| `GET /v1/events?limit=&cursor=` | `200 {"data":[...],"nextCursor"}`: your session's events, newest first |
+| `GET /v1/events/{id}` | `200 {"event"}` if it belongs to your session, otherwise `404` |
 | Wrong method on any route above | `405` with an `Allow` header |
 | `GET /` | Landing page |
 | Anything else | `404 {"error":"not_found",...}` |
 
-API request bodies over 1 KB get `413`, and malformed JSON gets `400`.
+API request bodies over 4 KB get `413`, and malformed JSON gets `400`.
+
+Every error uses one shape: `{"error": "<code>", "message": "<explanation>"}`, plus `details` for
+validation errors. Programs should branch on `error`; `message` is for people.
 
 ## Demo sessions
 
@@ -112,6 +119,58 @@ unset TOKEN
 
 Don't paste real tokens into shared collections, screenshots, or docs.
 
+## Events
+
+One event type, `demo.notification`. Request body (no other fields allowed, anywhere):
+
+```json
+{ "type": "demo.notification",
+  "payload": { "title": "Synthetic title", "message": "Synthetic message" } }
+```
+
+| Field | Rule |
+|---|---|
+| `type` | Required, exactly `demo.notification` |
+| `payload.title` | Required string, 1–100 characters, not blank, no control characters |
+| `payload.message` | Required string, 1–500 characters, not blank, line breaks allowed, no other control characters |
+| `Idempotency-Key` header | Required, 1–100 of `A-Z a-z 0-9 . _ : -` (a UUID works well) |
+
+Invalid input returns `422 validation_failed` with every problem in `details`, and nothing is stored.
+
+**201 means stored, not delivered.** The event is saved with status `pending`. There is no delivery worker
+yet, so nothing is sent anywhere in this stage.
+
+### Idempotency: safe retries
+
+The client chooses an `Idempotency-Key` per logical event and reuses it on every retry of that event.
+
+| Request | Response |
+|---|---|
+| New key | `201 Created` + `Location`, a new event |
+| Same key, same payload (field order doesn't matter) | `200 OK` + `Idempotent-Replayed: true`, the **original** event, nothing new stored |
+| Same key, different payload | `409 idempotency_key_conflict`, nothing stored |
+| Same key in a different session | Independent. Keys are scoped to the session. |
+
+Keys are remembered for the life of the session. The guarantee comes from a PostgreSQL unique
+constraint on `(session_id, idempotency_key)`, so it holds even for simultaneous requests and across
+restarts or multiple app instances. Once a session hits `MAX_EVENTS_PER_SESSION`, new keys get
+`429 event_limit_reached`, but repeats of existing keys still return the original event.
+
+### Try it (PowerShell)
+
+```powershell
+$BASE = "http://localhost:3000"
+$TOKEN = (curl.exe -s -X POST "$BASE/v1/sessions" | ConvertFrom-Json).token
+$KEY = [guid]::NewGuid().ToString()
+'{"type":"demo.notification","payload":{"title":"Synthetic title","message":"Synthetic message"}}' | Out-File -Encoding ascii event.json
+curl.exe -i -X POST "$BASE/v1/events" -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: $KEY" -H "Content-Type: application/json" --data-binary "@event.json"   # 201
+curl.exe -i -X POST "$BASE/v1/events" -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: $KEY" -H "Content-Type: application/json" --data-binary "@event.json"   # 200, Idempotent-Replayed: true
+curl.exe -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/events?limit=5"                                                                                              # your events
+Remove-Item event.json; Remove-Variable TOKEN
+```
+
+The landing page has the same flow: **Start demo session**, **Submit event**, **Send same request again**, and **Refresh list**.
+
 ## Checks (replace BASE with `http://localhost:3000` or your Render URL)
 
 ```sh
@@ -132,6 +191,8 @@ On Windows PowerShell, type `curl.exe` instead of `curl` (`curl` is an alias for
 | `405` + `Allow` header | Server is up, path exists; the **HTTP method** is wrong |
 | `/health` 200 but `/ready` 503 | App is running, **database** is unreachable or not migrated (see `reason`) |
 | `401 missing_token` / `invalid_token` | No `Authorization: Bearer` header / token unknown, malformed, or expired |
+| `404` on `/v1/events/{id}` | No such event **for your session**. Other sessions' events look identical to missing ones. |
+| `409 idempotency_key_conflict` | You reused an Idempotency-Key for a different event. Generate a new key. |
 | curl `Failed to connect` / exit code 7, browser "can't be reached" | **Nothing is listening** (server not running, wrong port/host) |
 | curl exit 6 `Could not resolve host` | Wrong hostname / typo in URL |
 | Render `502`/`503` or HTML "service waking up" page | Render can't reach a healthy app (crashed, still starting, or free instance spinning up) |
@@ -177,5 +238,6 @@ Render logs. The deploy never goes live, and the previous version keeps serving.
 
 The web service's filesystem is temporary. It's replaced on every deploy, restart, and spin-down. All
 durable state lives in Postgres, which is a separate service, so sessions and migration history
-**survive** restarts, redeploys, and spin-downs. Rate-limit counters live in memory and reset on each restart.
+**survive** restarts, redeploys, and spin-downs. Rate-limit counters live in memory and reset on each restart. Events and their idempotency keys
+are in Postgres and survive. When an expired session is cleaned up, its events are deleted with it.
 Deleting the database (or letting the free one expire) loses everything.

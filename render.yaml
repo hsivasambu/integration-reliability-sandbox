@@ -27,6 +27,8 @@ services:
         value: "1"
       - key: SESSION_TTL_HOURS
         value: "24"
+      - key: MAX_EVENTS_PER_SESSION
+        value: "100"
     # PORT is set by Render (default 10000); HOST defaults to 0.0.0.0 in code.
     # Node version comes from .node-version (24).
 

@@ -6,15 +6,59 @@
   <title>Integration Reliability Sandbox</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
-    pre { background: #f3f3f3; padding: 0.75rem; overflow-x: auto; }
+    pre { background: #f3f3f3; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; }
+    section { border-top: 1px solid #ccc; margin-top: 1.5rem; padding-top: 0.5rem; }
+    label { display: block; margin-top: 0.5rem; }
+    input, textarea { width: 100%; box-sizing: border-box; font: inherit; }
+    .note { background: #fff6d6; border-left: 4px solid #d9a400; padding: 0.5rem 0.75rem; }
+    ul { padding-left: 1.2rem; }
   </style>
 </head>
 <body>
   <h1>Integration Reliability Sandbox</h1>
   <p>A learning sandbox that will accept synthetic JSON events, store them, and deliver them
-     reliably to a controlled mock receiver. This first stage only reports service health.</p>
-  <button id="check" type="button">Check health</button>
-  <pre id="result" aria-live="polite">Not checked yet.</pre>
+     reliably to a controlled mock receiver.</p>
+
+  <section>
+    <h2>Service health</h2>
+    <button id="check" type="button">Check health</button>
+    <pre id="result" aria-live="polite">Not checked yet.</pre>
+  </section>
+
+  <section>
+    <h2>Demo session</h2>
+    <p>An anonymous, temporary credential (not an account). It is kept only in this page and is
+       lost if you reload.</p>
+    <button id="start-session" type="button">Start demo session</button>
+    <pre id="session-status" aria-live="polite">No session.</pre>
+  </section>
+
+  <section>
+    <h2>Submit a synthetic event</h2>
+    <p class="note"><strong>Stored is not delivered.</strong> Submitting saves the event with status
+       <code>pending</code>. Delivery to the mock receiver arrives in a later stage, so nothing is sent yet.</p>
+    <form id="event-form">
+      <label>Title (max 100 characters)
+        <input id="title" name="title" maxlength="100" required value="Synthetic test notification">
+      </label>
+      <label>Message (max 500 characters)
+        <textarea id="message" name="message" maxlength="500" rows="3" required>This is synthetic demo data.</textarea>
+      </label>
+      <p>Idempotency-Key: <code id="idem-key">(new key on submit)</code><br>
+         <small>A failed or repeated submit reuses this key, so the event is stored only once.</small></p>
+      <button type="submit">Submit event</button>
+      <button id="resubmit" type="button">Send same request again</button>
+    </form>
+    <pre id="event-result" aria-live="polite">Nothing submitted yet.</pre>
+  </section>
+
+  <section>
+    <h2>My events</h2>
+    <button id="refresh" type="button">Refresh list</button>
+    <ul id="event-list"></ul>
+  </section>
+
   <script src="/health-check.js"></script>
+  <script src="/demo.js"></script>
 </body>
 </html>
