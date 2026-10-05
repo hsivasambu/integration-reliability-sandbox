@@ -316,3 +316,11 @@ delivered by the new instance. Its session token wasn't kept. The restart test c
      Attempt 3 fell due while the server was down. A worker-disabled restart left it `retry_scheduled`.
      A worker-enabled restart sent the overdue retry about 1.5 s after start, and it was delivered (receiver
      switched to success).
+
+**Deployed check (2026-10-04, by Claude, after pushing 92a7884).** 0.6.0 was live in about 15 s. Within about 45 s new events reported
+`maxAttempts: 4` with the worker on; I waited for this because the Blueprint value changed from 3 to 4 and might land in a
+second deploy. `/ready` 200.
+- server_error, then success: attempt 1 503 (retryable) at :07.8, `nextAttemptAt` :09.9, attempt 2 delivered at :09.9.
+- server_error throughout: attempts at :13.9, :15.9, :20.0, :28.0 (gaps of about 2.0, 4.0, 8.1 s), then `failed` /
+  `attempts_exhausted`, 4/4.
+- timeout: attempt 1 `timeout`, no status, retryable, retry scheduled 4 s after it started (2 s timeout + 2 s delay).
