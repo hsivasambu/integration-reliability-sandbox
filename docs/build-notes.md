@@ -915,4 +915,13 @@ All of these are recorded in `docs/frontend-notes.md` → *Known gaps*.
 - Real screen readers; browsers other than Chromium-based Edge; real phones.
 - The quota on Render (100 per session there; tested locally with 8).
 
+**Deployed check (2026-10-05, by Claude, after pushing 9530030).** The composer was live about 40 s after the push;
+`/ready` 200.
+- Stage 13 suite against Render, without the quota step: **56/56**. This covered preset send, the edited message,
+  validation, the held double click (1 request), both kinds of lost request with *Check again*, reload during
+  uncertainty, expiry on load and during a send, layout, and axe 0 violations.
+- Stage 12 flow suite against Render: 35/36 (the same expected browser network log). It covered all three
+  experiments and *Deliver again* through the new send path.
+- These checks created about 8 sessions and 20 synthetic alerts.
+
 
