@@ -122,6 +122,16 @@ function createApp({ pool, config = {} } = {}) {
   app.use('/internal', receiver);
   app.use('/internal', opsRoutes(pool, settings));
 
+  // API documentation: the OpenAPI file and a Swagger UI page. Swagger UI's two files are served
+  // from the pinned swagger-ui-dist package (same origin), so the strict CSP above still applies.
+  app.get('/openapi.yaml', (req, res) => {
+    res.type('application/yaml').sendFile(path.join(__dirname, '..', 'docs', 'openapi.yaml'));
+  });
+  const swaggerUi = path.dirname(require.resolve('swagger-ui-dist/package.json'));
+  for (const file of ['swagger-ui-bundle.js', 'swagger-ui.css']) {
+    app.get(`/docs/vendor/${file}`, (req, res) => res.sendFile(path.join(swaggerUi, file)));
+  }
+
   app.use(express.static(path.join(__dirname, '..', 'public')));
 
   // Unknown routes get a JSON 404 so it is clear the server is up.

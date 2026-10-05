@@ -1,0 +1,1048 @@
+openapi: 3.1.0
+info:
+  title: Integration Reliability Sandbox API
+  version: 0.11.0
+  summary: Submit synthetic events and watch them being delivered, retried, deduplicated and replayed.
+  description: |
+    A learning sandbox. Every request uses synthetic data, and the only delivery destination is a mock
+    receiver inside the same app.
+
+    **Asynchronous delivery.** `POST /v1/events` answers `202 Accepted` once the event and its delivery
+    job are stored. Delivery happens later in a background worker. Poll the `statusUrl`
+    (`GET /v1/events/{eventId}/deliveries`) until the latest delivery's `state` is `delivered` or `failed`.
+    Nothing in this API waits for delivery to finish.
+
+    **Retries.** Attempt 1 starts as soon as a worker picks the job up. Timeouts, connection failures,
+    408, 429 and 5xx are retried after 2 s, 4 s and 8 s (deployment defaults), up to 4 attempts in total.
+    Any other 4xx fails at once (`failureReason: non_retryable`). After the 4th failed attempt the delivery is
+    `failed` / `attempts_exhausted`.
+
+    **Errors.** Every error body has the same shape: `{"error": "<code>", "message": "<text>"}`, plus
+    extra fields for some codes (`details`, `limit`, `state`, `replayDeliveryId`, `allow`, `path`). Branch
+    on `error`; `message` is for people and may change.
+
+    **Wrong method.** Any path below called with a method it doesn't list returns `405 method_not_allowed`
+    with an `Allow` header. `HEAD` is accepted wherever `GET` is. These responses are not repeated per operation.
+
+    **Limits.** Request bodies are at most 4 KB (`413 payload_too_large`); malformed JSON is
+    `400 invalid_json`. Every `/v1` path counts toward a per-IP budget (600 requests per minute by default,
+    in memory, per instance; `429 rate_limited` with `Retry-After`).
+
+    **Free hosting.** The deployed instance sleeps after 15 minutes without inbound traffic. The first request
+    after that can take about a minute. A slow first response isn't a failure.
+
+    **Request IDs.** Every response carries `X-Request-Id`. A valid incoming `X-Request-Id`
+    (8–64 characters of `A-Z a-z 0-9 -`) is reused, so you can match your request to the server log line.
+servers:
+  - url: /
+    description: The server this document was loaded from
+  - url: https://integration-reliability-sandbox.onrender.com
+    description: Deployed demo (free plan; may take about a minute to wake)
+  - url: http://localhost:3000
+    description: Local development (npm run dev)
+tags:
+  - name: Health
+    description: Liveness and readiness. Public, no token.
+  - name: Sessions
+    description: Anonymous demo sessions. The token is a limited demo credential, not a user account.
+  - name: Events
+    description: Submit events (idempotent) and read their delivery history.
+  - name: Replay
+    description: Manually replay a delivery that failed for good.
+  - name: Mock receiver
+    description: Your session's mock receiver mode and what it processed.
+  - name: Summary
+    description: Session-scoped counts and a demo delivery-time statistic.
+  - name: Internal
+    description: |
+      **Internal. Not for visitors or API clients.** Called only by server-side code that holds a secret
+      from the server's environment. Documented so the whole system is visible. No secret appears in this
+      document, and none is available to browsers.
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Liveness check (no database check)
+      description: '`200` while the process runs. Render uses this as its health check path.'
+      security: []
+      responses:
+        '200':
+          description: The process is running.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+              example: { status: ok, version: 0.11.0, inProcessWorker: true }
+
+  /ready:
+    get:
+      tags: [Health]
+      operationId: getReady
+      summary: Readiness check (database reachable and fully migrated)
+      description: Does **not** say whether a delivery worker is alive. See `GET /internal/ops/worker`.
+      security: []
+      responses:
+        '200':
+          description: The database is reachable and every migration in the code is applied.
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { const: ready }
+        '503':
+          description: Not ready.
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, reason]
+                properties:
+                  status: { const: unavailable }
+                  reason: { type: string, enum: [database_unreachable, migrations_pending] }
+              example: { status: unavailable, reason: database_unreachable }
+
+  /v1/sessions:
+    post:
+      tags: [Sessions]
+      operationId: createSession
+      summary: Create an anonymous demo session
+      description: |
+        Returns a bearer token **once**. Only its SHA-256 hash is stored, so it can't be shown again. It
+        expires after 24 hours (deployment default). No request body.
+
+        Limited to 10 creations per client IP per hour (in memory, per instance) and 1000 unexpired
+        sessions in total (database).
+      security: []
+      responses:
+        '201':
+          description: Session created. Store `token` somewhere private, such as a secret environment variable.
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NewSession' }
+              example:
+                token: irs_EXAMPLE_ONLY_not_a_real_token
+                tokenType: Bearer
+                createdAt: '2026-10-05T12:00:00.000Z'
+                expiresAt: '2026-10-06T12:00:00.000Z'
+                notice: Anonymous demo credential, shown only once. It is not a user account and expires automatically.
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: Too many active demo sessions (`session_capacity_reached`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: session_capacity_reached, message: The sandbox has too many active demo sessions. Try again later. }
+
+  /v1/session:
+    get:
+      tags: [Sessions]
+      operationId: getSession
+      summary: Check your token and see when it expires
+      responses:
+        '200':
+          description: The token is valid.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [createdAt, expiresAt]
+                properties:
+                  createdAt: { type: string, format: date-time }
+                  expiresAt: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/events:
+    post:
+      tags: [Events]
+      operationId: submitEvent
+      summary: Submit an event for asynchronous delivery (idempotent)
+      description: |
+        Stores the event and its delivery job in one transaction, then answers `202`. **202 means accepted,
+        not delivered.** Poll `statusUrl` to follow delivery.
+
+        **Idempotency rules** (keys are scoped to your session and remembered for its lifetime; enforced by a
+        PostgreSQL unique constraint, so they hold for simultaneous requests and across restarts):
+
+        | Request | Response |
+        |---|---|
+        | New key | `202` + `Location`: a new event and delivery job |
+        | Same key, same `type` + `payload` (field order ignored) | `200` + `Idempotent-Replayed: true`: the **original** event with its **current** delivery state; nothing stored or sent again |
+        | Same key, different `type` or `payload` | `409 idempotency_key_conflict`; nothing stored |
+        | Same key in another session | Independent |
+
+        Use a new key (a UUID works well) for each new logical event, and the same key when retrying a
+        request whose answer you didn't get. Once the session reaches its event limit (100 by default),
+        new keys get `429 event_limit_reached`, but repeats of existing keys still return the original event.
+
+        Checks run in this order: body size and JSON syntax (`413`, `400 invalid_json`), token,
+        `Idempotency-Key`, `Content-Type`, body validation, then idempotency.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventInput' }
+            example:
+              type: demo.notification
+              payload: { title: Synthetic title, message: Synthetic message }
+      responses:
+        '202':
+          description: Accepted and queued. Not delivered yet.
+          headers:
+            Location:
+              description: The status URL, `/v1/events/{eventId}/deliveries`.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventSubmission' }
+              example:
+                eventId: 6f1c2a4e-1111-4c4c-9a9a-000000000001
+                statusUrl: /v1/events/6f1c2a4e-1111-4c4c-9a9a-000000000001/deliveries
+                event:
+                  id: 6f1c2a4e-1111-4c4c-9a9a-000000000001
+                  type: demo.notification
+                  payload: { title: Synthetic title, message: Synthetic message }
+                  idempotencyKey: 2b7e1516-28ae-4d2a-abf7-158809cf4f3c
+                  createdAt: '2026-10-05T12:00:01.000Z'
+                  updatedAt: '2026-10-05T12:00:01.000Z'
+                  delivery:
+                    id: 0d9e8f7a-2222-4b4b-8a8a-000000000002
+                    replayOf: null
+                    state: pending
+                    attemptCount: 0
+                    maxAttempts: 4
+                    nextAttemptAt: '2026-10-05T12:00:01.000Z'
+                    failureReason: null
+                    statusUrl: /v1/events/6f1c2a4e-1111-4c4c-9a9a-000000000001/deliveries
+                    replayCount: 0
+                notice: 'Accepted: stored durably and queued for asynchronous delivery. It has not been delivered yet; check statusUrl.'
+        '200':
+          description: Identical repeat of an earlier request with this key. The original event, with its current delivery state.
+          headers:
+            Idempotent-Replayed:
+              description: Always `true` on this response.
+              schema: { type: string, const: 'true' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventSubmission' }
+        '400':
+          description: |
+            `idempotency_key_required` (header missing) or `invalid_idempotency_key` (wrong length or
+            characters). Also `invalid_json` for a malformed body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: idempotency_key_required, message: Send an Idempotency-Key header (for example a UUID) so retries cannot create duplicates. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: '`idempotency_key_conflict`: this key was already used with a different payload in this session.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: idempotency_key_conflict, message: This Idempotency-Key was already used with a different payload. Use a new key for a new event. }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415':
+          description: '`unsupported_media_type`: send `Content-Type: application/json`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429':
+          description: |
+            `event_limit_reached` (this session has created its maximum number of events; `limit` is included)
+            or `rate_limited` (per-IP request budget).
+          headers:
+            Retry-After:
+              description: Seconds to wait. Only sent with `rate_limited`.
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: event_limit_reached, message: This demo session has reached its limit of 100 events. Start a new session to continue., limit: 100 }
+    get:
+      tags: [Events]
+      operationId: listEvents
+      summary: List your session's events, newest first (cursor pagination)
+      description: |
+        Returns at most `limit` events. When more exist, `nextCursor` is set: pass it as `cursor` to get
+        the next (older) page. `nextCursor: null` means this is the last page. Cursors are opaque; don't
+        build them yourself. Unknown query parameters are rejected.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+        - name: cursor
+          in: query
+          description: The `nextCursor` value from the previous page.
+          schema: { type: string }
+      responses:
+        '200':
+          description: One page of events.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, nextCursor]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Event' }
+                  nextCursor: { type: [string, 'null'] }
+        '400':
+          description: '`invalid_query`, with `details` (for example `limit` out of range, a bad cursor, or an unknown parameter).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error: invalid_query
+                message: The query parameters are invalid.
+                details: [{ field: query.limit, issue: must be a whole number from 1 to 50 }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/events/{eventId}:
+    get:
+      tags: [Events]
+      operationId: getEvent
+      summary: Get one of your events with a summary of its latest delivery
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [event]
+                properties:
+                  event: { $ref: '#/components/schemas/Event' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFoundInSession' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/events/{eventId}/deliveries:
+    get:
+      tags: [Events]
+      operationId: getEventDeliveries
+      summary: Delivery status and full attempt history (the status URL)
+      description: |
+        Every delivery of the event, oldest first: the original, then any manual replays. Each has its own
+        `attempts`, numbered from 1. `delivery` is the latest one; poll this until `delivery.state` is
+        `delivered` or `failed`. Every 2 s is plenty. While waiting, `nextAttemptAt` says when the next
+        attempt is due.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: Delivery history.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryHistory' }
+              example:
+                eventId: 6f1c2a4e-1111-4c4c-9a9a-000000000001
+                delivery: &deliveredExample
+                  id: 0d9e8f7a-2222-4b4b-8a8a-000000000002
+                  replayOf: null
+                  state: delivered
+                  attemptCount: 2
+                  maxAttempts: 4
+                  nextAttemptAt: null
+                  failureReason: null
+                  statusUrl: /v1/events/6f1c2a4e-1111-4c4c-9a9a-000000000001/deliveries
+                  replayedBy: null
+                  createdAt: '2026-10-05T12:00:01.000Z'
+                  updatedAt: '2026-10-05T12:00:05.100Z'
+                  completedAt: '2026-10-05T12:00:05.100Z'
+                  attempts:
+                    - { attemptNumber: 1, outcome: failed, startedAt: '2026-10-05T12:00:01.200Z', endedAt: '2026-10-05T12:00:03.200Z', responseStatus: null, errorCategory: timeout, retryable: true, durationMs: 2003 }
+                    - { attemptNumber: 2, outcome: delivered, startedAt: '2026-10-05T12:00:05.080Z', endedAt: '2026-10-05T12:00:05.100Z', responseStatus: 200, errorCategory: null, retryable: null, durationMs: 20 }
+                deliveries: [*deliveredExample]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFoundInSession' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/deliveries/{deliveryId}/replay:
+    post:
+      tags: [Replay]
+      operationId: replayDelivery
+      summary: Replay a delivery that failed for good (idempotent)
+      description: |
+        Creates a **new** delivery of the same event, linked by `replayOf`, with a fresh attempt budget.
+        The failed delivery and its attempts are kept unchanged. The worker sends the **same event ID**, so
+        the receiver recognizes an event it already processed and doesn't process it again. No request body.
+
+        Only a delivery whose `state` is `failed` can be replayed, each at most once, and an event
+        allows at most 3 replays (deployment default). These rules are enforced by database constraints.
+
+        **Idempotency:** use a new `Idempotency-Key` per replay request. The same key for the same delivery
+        returns `200` + `Idempotent-Replayed: true` with the same replay, even after that replay has finished.
+        The same key for a *different* delivery is `409 idempotency_key_conflict`. Replay keys are separate
+        from event submission keys.
+
+        Checks run in this order: body size and JSON syntax, token, `Idempotency-Key`, empty body, delivery ID
+        format, ownership, earlier use of the key, then eligibility.
+      parameters:
+        - name: deliveryId
+          in: path
+          required: true
+          description: '`event.delivery.id`, or an `id` from the event''s delivery history.'
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: Replay scheduled.
+          headers:
+            Location:
+              description: The event's status URL.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReplayResult' }
+        '200':
+          description: This key already scheduled a replay of this delivery. Returns that replay with its current state.
+          headers:
+            Idempotent-Replayed:
+              schema: { type: string, const: 'true' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReplayResult' }
+        '400':
+          description: '`idempotency_key_required` or `invalid_idempotency_key`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: '`not_found`: no such delivery in your session. Other sessions'' deliveries look the same as missing ones.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            - `delivery_not_failed`: the delivery is `pending`, `retry_scheduled`, `in_progress` or `delivered` (`state` included).
+            - `already_replayed`: replayed before with another key (`replayDeliveryId` included). If that replay fails too, replay it instead.
+            - `idempotency_key_conflict`: this key already replayed a different delivery.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                notFailed: { value: { error: delivery_not_failed, message: Only failed deliveries can be replayed; this one is retry_scheduled., state: retry_scheduled } }
+                alreadyReplayed: { value: { error: already_replayed, message: This delivery has already been replayed. Replay the newer delivery if it also fails., replayDeliveryId: 0d9e8f7a-3333-4b4b-8a8a-000000000003 } }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422':
+          description: '`validation_failed`: a replay request takes no body (an empty JSON object is tolerated).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: '`replay_limit_reached` (`limit` included) or `rate_limited`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/receiver:
+    get:
+      tags: [Mock receiver]
+      operationId: getReceiver
+      summary: Your session's receiver mode and counts
+      responses:
+        '200':
+          description: Receiver settings and counts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReceiverSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    put:
+      tags: [Mock receiver]
+      operationId: setReceiverMode
+      summary: Choose how your session's mock receiver behaves
+      description: |
+        Affects only your session. Applies to deliveries that reach the receiver after the change,
+        including retries that are already scheduled.
+
+        | Mode | Receiver behaviour for an event it has **not** processed yet | What the sender records |
+        |---|---|---|
+        | `success` | Processes it, answers `200` | `delivered` |
+        | `server_error` | Answers `503` + `Retry-After: 1`, processes nothing | `http_error` 503, retried |
+        | `timeout` | Waits 4 s, then `503`; processes nothing | `timeout` after 2 s, retried |
+        | `process_then_timeout` | **Processes and commits first**, then waits 4 s before answering | `timeout` after 2 s, retried; the retry is recognized as a duplicate |
+
+        In every mode, an event that was already processed is answered `200` with `duplicate: true` and the
+        original result, before any simulated failure or delay.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [mode]
+              properties:
+                mode: { $ref: '#/components/schemas/ReceiverMode' }
+            example: { mode: server_error }
+      responses:
+        '200':
+          description: Saved. Returns the new settings and counts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReceiverSettings' }
+        '400': { $ref: '#/components/responses/InvalidJson' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415':
+          description: '`unsupported_media_type`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/receiver/receipts/{eventId}:
+    get:
+      tags: [Mock receiver]
+      operationId: getReceipt
+      summary: The receiver's view of one of your events
+      description: |
+        Whether the receiver processed the event, its synthetic result, and how many duplicate deliveries it
+        recognized. `processed: false` means none has arrived yet in a mode that processes.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: Receipt.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Receipt' }
+              example:
+                eventId: 6f1c2a4e-1111-4c4c-9a9a-000000000001
+                processed: true
+                result: { confirmationCode: RCPT-1A2B3C4D, summary: 'Notification recorded: Synthetic title' }
+                firstReceivedAt: '2026-10-05T12:00:01.210Z'
+                lastReceivedAt: '2026-10-05T12:00:05.090Z'
+                deliveriesReceived: 2
+                duplicateCount: 1
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFoundInSession' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/summary:
+    get:
+      tags: [Summary]
+      operationId: getSummary
+      summary: Your session's counts and recent delivery time
+      description: |
+        Demo statistics for your session only. **Not an SLA or performance guarantee.**
+        `recentDeliveryDuration` measures from acceptance (the 202) to the end of the successful attempt,
+        over the session's 50 most recently completed, delivered original deliveries (replays excluded).
+      responses:
+        '200':
+          description: Summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Summary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /internal/receiver/deliveries:
+    post:
+      tags: [Internal]
+      operationId: receiveDelivery
+      summary: Mock receiver endpoint (internal, server-side callers only)
+      x-internal: true
+      description: |
+        **Internal.** The delivery worker calls this with `Authorization: Bearer <RECEIVER_SECRET>`. The
+        secret exists only in server environment variables. Visitors get `401`, and that is expected.
+        The destination URL is fixed by server configuration; no client can choose it.
+      security:
+        - receiverSecret: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sessionId, eventId, type, payload]
+              properties:
+                sessionId: { type: string, format: uuid }
+                eventId:
+                  type: string
+                  format: uuid
+                  description: Stable across retries and replays. The receiver deduplicates on it.
+                type: { type: string }
+                payload: { type: object }
+      responses:
+        '200':
+          description: 'Processed now (`duplicate: false`), or recognized as already processed (`duplicate: true`, original result).'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [received, duplicate, receiptId, result, firstReceivedAt]
+                properties:
+                  received: { const: true }
+                  duplicate: { type: boolean }
+                  receiptId: { type: string, format: uuid }
+                  result: { $ref: '#/components/schemas/ReceiptResult' }
+                  firstReceivedAt: { type: string, format: date-time }
+        '401':
+          description: '`receiver_unauthorized`: missing or wrong secret (checked before the body is read).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`unknown_session`: no active session with this ID.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '503':
+          description: |
+            Simulated failure, nothing processed: `simulated_server_error` (with `Retry-After: 1`) or
+            `simulated_slow_response` (sent after 4 s in `timeout` mode; the standard 2 s client has given up by then).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /internal/ops/worker:
+    get:
+      tags: [Internal]
+      operationId: getWorkerHealth
+      summary: Worker liveness and queue health (internal, operator only)
+      x-internal: true
+      description: |
+        **Internal.** For the operator. Enabled only when `OPS_TOKEN` is configured; otherwise `GET` answers
+        `404 not_found`. A killed worker can't record that it stopped, so it keeps counting as live until its last
+        heartbeat is 60 s old.
+      security:
+        - opsToken: []
+      responses:
+        '200':
+          description: Worker heartbeats (last hour, at most 20) and queue counts.
+          headers:
+            Cache-Control: { $ref: '#/components/headers/NoStore' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerHealth' }
+        '401':
+          description: '`ops_unauthorized`: missing or wrong ops token. A session token is not accepted.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`not_found`: the check is disabled because `OPS_TOKEN` isn''t set.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    sessionToken:
+      type: http
+      scheme: bearer
+      description: |
+        The demo token from `POST /v1/sessions` (`irs_` + 43 characters). A missing or non-Bearer header gets
+        `401 missing_token`; an unknown, malformed **or expired** token gets `401 invalid_token`. Expired and
+        invalid tokens are deliberately indistinguishable.
+    receiverSecret:
+      type: http
+      scheme: bearer
+      description: Internal. `RECEIVER_SECRET` from the server environment. Never given to clients.
+    opsToken:
+      type: http
+      scheme: bearer
+      description: Internal. `OPS_TOKEN` from the server environment (Render dashboard). Never given to clients.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: '1–100 characters of `A-Z a-z 0-9 . _ : -`. A UUID works well. Scoped to your session.'
+      schema: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+      example: 2b7e1516-28ae-4d2a-abf7-158809cf4f3c
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      description: An event ID from your session. Malformed IDs, unknown IDs and other sessions' IDs all return the same `404`.
+      schema: { type: string, format: uuid }
+
+  headers:
+    X-Request-Id:
+      description: Request ID, also written to the server log line for this request.
+      schema: { type: string }
+    NoStore:
+      schema: { type: string, const: no-store }
+
+  responses:
+    Unauthorized:
+      description: '`missing_token` (no `Authorization: Bearer` header) or `invalid_token` (unknown, malformed or expired token).'
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+          example: Bearer realm="sandbox", error="invalid_token"
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: invalid_token, message: The token is invalid or expired. Create a new demo session. }
+    NotFoundInSession:
+      description: '`not_found`: no such event in **your** session. Other sessions'' events look exactly like missing ones.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: not_found, message: No event with this ID exists for your session. }
+    ValidationFailed:
+      description: '`validation_failed`. `details` lists every problem. Nothing was stored.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: validation_failed
+            message: The event is invalid. Nothing was stored.
+            details:
+              - { field: payload.title, issue: must not be blank }
+              - { field: payload.priority, issue: is not an allowed field }
+    InvalidJson:
+      description: '`invalid_json`: the body is not valid JSON.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PayloadTooLarge:
+      description: '`payload_too_large`: the body is over 4 KB.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: '`rate_limited`: the per-IP request budget is used up (in memory, per instance).'
+      headers:
+        Retry-After:
+          description: Seconds until the window resets.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: rate_limited, message: Too many requests. Try again in 42 seconds. }
+
+  schemas:
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable code. Branch on this.
+          enum:
+            - not_found
+            - method_not_allowed
+            - invalid_json
+            - payload_too_large
+            - bad_request
+            - internal_error
+            - rate_limited
+            - session_capacity_reached
+            - missing_token
+            - invalid_token
+            - idempotency_key_required
+            - invalid_idempotency_key
+            - unsupported_media_type
+            - validation_failed
+            - idempotency_key_conflict
+            - event_limit_reached
+            - invalid_query
+            - delivery_not_failed
+            - already_replayed
+            - replay_limit_reached
+            - receiver_unauthorized
+            - unknown_session
+            - simulated_server_error
+            - simulated_slow_response
+            - ops_unauthorized
+        message: { type: string, description: For people. May change. }
+        details:
+          type: array
+          items:
+            type: object
+            required: [field, issue]
+            properties:
+              field: { type: string, examples: [payload.title, query.limit, (body)] }
+              issue: { type: string }
+        limit: { type: integer }
+        state: { $ref: '#/components/schemas/DeliveryState' }
+        replayDeliveryId: { type: string, format: uuid }
+        allow: { type: array, items: { type: string } }
+        path: { type: string }
+
+    Health:
+      type: object
+      required: [status, version, inProcessWorker]
+      properties:
+        status: { const: ok }
+        version: { type: string }
+        inProcessWorker:
+          type: boolean
+          description: Whether this process runs the delivery worker (`WORKER_ENABLED`). It doesn't say whether the worker is healthy.
+
+    NewSession:
+      type: object
+      required: [token, tokenType, createdAt, expiresAt, notice]
+      properties:
+        token:
+          type: string
+          description: 'Shown once. Keep it private. Send it as `Authorization: Bearer <token>`.'
+        tokenType: { const: Bearer }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        notice: { type: string }
+
+    EventInput:
+      type: object
+      additionalProperties: false
+      required: [type, payload]
+      description: No other fields are allowed at any level. All problems are reported together.
+      properties:
+        type: { const: demo.notification }
+        payload:
+          type: object
+          additionalProperties: false
+          required: [title, message]
+          properties:
+            title:
+              type: string
+              minLength: 1
+              maxLength: 100
+              description: Not blank. No control characters. Length counts Unicode characters.
+            message:
+              type: string
+              minLength: 1
+              maxLength: 500
+              description: Not blank. Line breaks allowed; no other control characters.
+
+    Event:
+      type: object
+      required: [id, type, payload, idempotencyKey, createdAt, updatedAt, delivery]
+      properties:
+        id: { type: string, format: uuid }
+        type: { const: demo.notification }
+        payload:
+          type: object
+          properties:
+            title: { type: string }
+            message: { type: string }
+        idempotencyKey: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        delivery:
+          description: The **latest** delivery (the original, or the newest replay), plus how many replays exist.
+          allOf:
+            - $ref: '#/components/schemas/DeliverySummary'
+            - type: object
+              required: [replayCount]
+              properties:
+                replayCount: { type: integer, minimum: 0 }
+
+    EventSubmission:
+      type: object
+      required: [eventId, statusUrl, event, notice]
+      properties:
+        eventId: { type: string, format: uuid }
+        statusUrl: { type: string, description: 'Poll this: `/v1/events/{eventId}/deliveries`.' }
+        event: { $ref: '#/components/schemas/Event' }
+        notice: { type: string }
+
+    DeliveryState:
+      type: string
+      enum: [pending, retry_scheduled, in_progress, delivered, failed]
+      description: |
+        - `pending`: waiting for its first attempt (or re-queued after a worker lost its lease).
+        - `retry_scheduled`: a retryable attempt failed; the next one is due at `nextAttemptAt`.
+        - `in_progress`: a worker is sending it now.
+        - `delivered`: the receiver answered 2xx. Final.
+        - `failed`: final; see `failureReason`. Can be replayed.
+
+    DeliverySummary:
+      type: object
+      required: [id, replayOf, state, attemptCount, maxAttempts, nextAttemptAt, failureReason, statusUrl]
+      properties:
+        id: { type: string, format: uuid, description: Use this as `deliveryId` to replay. }
+        replayOf: { type: [string, 'null'], format: uuid, description: The failed delivery this one replays. }
+        state: { $ref: '#/components/schemas/DeliveryState' }
+        attemptCount: { type: integer, minimum: 0 }
+        maxAttempts: { type: integer }
+        nextAttemptAt:
+          type: [string, 'null']
+          format: date-time
+          description: When the next attempt is due. Only set while `pending` or `retry_scheduled`.
+        failureReason:
+          type: [string, 'null']
+          enum: [non_retryable, attempts_exhausted, session_expired, null]
+          description: Only set when `failed`. May be `null` for deliveries that failed before reasons were recorded.
+        statusUrl: { type: string }
+
+    Attempt:
+      type: object
+      required: [attemptNumber, outcome, startedAt, endedAt, responseStatus, errorCategory, retryable, durationMs]
+      properties:
+        attemptNumber: { type: integer, minimum: 1 }
+        outcome:
+          type: string
+          enum: [in_progress, delivered, failed, lease_expired]
+          description: '`lease_expired`: the worker vanished mid-attempt; the real result is unknown (`endedAt` stays null).'
+        startedAt: { type: string, format: date-time }
+        endedAt: { type: [string, 'null'], format: date-time }
+        responseStatus: { type: [integer, 'null'], description: 'Null when no response arrived (timeout, network error).' }
+        errorCategory: { type: [string, 'null'], enum: [http_error, timeout, network_error, lease_expired, null] }
+        retryable: { type: [boolean, 'null'] }
+        durationMs: { type: [integer, 'null'] }
+
+    DeliveryRecord:
+      allOf:
+        - $ref: '#/components/schemas/DeliverySummary'
+        - type: object
+          required: [replayedBy, createdAt, updatedAt, completedAt, attempts]
+          properties:
+            replayedBy: { type: [string, 'null'], format: uuid, description: 'The replay created from this delivery, if any.' }
+            createdAt: { type: string, format: date-time }
+            updatedAt: { type: string, format: date-time }
+            completedAt: { type: [string, 'null'], format: date-time }
+            attempts:
+              type: array
+              items: { $ref: '#/components/schemas/Attempt' }
+
+    DeliveryHistory:
+      type: object
+      required: [eventId, delivery, deliveries]
+      properties:
+        eventId: { type: string, format: uuid }
+        delivery: { $ref: '#/components/schemas/DeliveryRecord' }
+        deliveries:
+          type: array
+          description: Oldest first. The original, then each replay.
+          items: { $ref: '#/components/schemas/DeliveryRecord' }
+
+    ReplayResult:
+      type: object
+      required: [eventId, statusUrl, delivery, notice]
+      properties:
+        eventId: { type: string, format: uuid }
+        statusUrl: { type: string }
+        delivery: { $ref: '#/components/schemas/DeliverySummary' }
+        notice: { type: string }
+
+    ReceiverMode:
+      type: string
+      enum: [success, server_error, timeout, process_then_timeout]
+
+    ReceiverSettings:
+      type: object
+      required: [mode, availableModes, updatedAt, processedCount, duplicateCount, receivedCount, notice]
+      properties:
+        mode: { $ref: '#/components/schemas/ReceiverMode' }
+        availableModes: { type: array, items: { $ref: '#/components/schemas/ReceiverMode' } }
+        updatedAt: { type: [string, 'null'], format: date-time, description: Null until the mode is first changed. }
+        processedCount: { type: integer, description: Distinct events the receiver processed. }
+        duplicateCount: { type: integer, description: Extra deliveries recognized and not processed again. }
+        receivedCount: { type: integer, deprecated: true, description: Same as `processedCount`; kept for compatibility. }
+        notice: { type: string }
+
+    ReceiptResult:
+      type: object
+      properties:
+        confirmationCode: { type: string, examples: [RCPT-1A2B3C4D] }
+        summary: { type: string }
+
+    Receipt:
+      type: object
+      required: [eventId, processed, result, firstReceivedAt, lastReceivedAt, deliveriesReceived, duplicateCount]
+      properties:
+        eventId: { type: string, format: uuid }
+        processed: { type: boolean }
+        result:
+          oneOf:
+            - $ref: '#/components/schemas/ReceiptResult'
+            - type: 'null'
+        firstReceivedAt: { type: [string, 'null'], format: date-time }
+        lastReceivedAt: { type: [string, 'null'], format: date-time }
+        deliveriesReceived: { type: integer }
+        duplicateCount: { type: integer }
+
+    Summary:
+      type: object
+      required: [events, byCurrentDeliveryState, attempts, replays, receiver, recentDeliveryDuration, notice]
+      properties:
+        events: { type: integer }
+        byCurrentDeliveryState:
+          type: object
+          properties:
+            delivered: { type: integer }
+            failed: { type: integer }
+            active: { type: integer }
+        attempts: { type: integer }
+        replays: { type: integer }
+        receiver:
+          type: object
+          properties:
+            processed: { type: integer }
+            duplicatesRecognized: { type: integer }
+        recentDeliveryDuration:
+          type: object
+          required: [name, start, end, population, includes, sampleSize, medianMs, maxMs]
+          properties:
+            name: { type: string }
+            start: { type: string }
+            end: { type: string }
+            population: { type: string }
+            includes: { type: string }
+            sampleSize: { type: integer }
+            medianMs: { type: [integer, 'null'] }
+            maxMs: { type: [integer, 'null'] }
+        notice: { type: string }
+
+    WorkerHealth:
+      type: object
+      required: [checkedAt, verdict, explanation, workers, queue]
+      properties:
+        checkedAt: { type: string, format: date-time }
+        verdict: { type: string, enum: [no_live_worker, stalled, progressing, idle] }
+        explanation: { type: string }
+        workers:
+          type: array
+          items:
+            type: object
+            properties:
+              workerId: { type: string }
+              startedAt: { type: string, format: date-time }
+              lastHeartbeatAt: { type: string, format: date-time }
+              heartbeatAgeSeconds: { type: integer }
+              stoppedAt: { type: [string, 'null'], format: date-time }
+              concurrency: { type: integer }
+              inFlight: { type: integer }
+              attemptsFinished: { type: integer }
+        queue:
+          type: object
+          properties:
+            overdue: { type: integer }
+            oldestOverdueSeconds: { type: integer }
+            retriesWaiting: { type: integer }
+            inProgress: { type: integer }
+            expiredLeases: { type: integer }
+
+security:
+  - sessionToken: []

@@ -617,3 +617,110 @@ applied (`/ready` 200).
   max 1233 ms.
 - jsdom UI regression on Render: 27/27.
 - Not verified by me: the Render log stream itself (dashboard access), and the authorized ops response.
+
+## Stage 11: API documentation, Postman collection, and release checkpoint (2026-10-05)
+
+**Checkpoint before starting.** Working tree clean at `caa3255`. `npm test` 124/124 locally; deployed `/health` 200
+`0.10.0` with the worker, `/ready` 200.
+
+Inconsistencies found between notes and implementation:
+- README still used future tense ("will accept…") and said sessions scope data "from later stages". Fixed.
+- README's Postman section used `base` / `demoToken`. Replaced by the collection's `base_url` / `session_token`.
+- README failure table omitted 413, 415 and 422. Added.
+- **Not fixed (behaviour, outside this stage):** when `OPS_TOKEN` is unset, `GET /internal/ops/worker` answers 404,
+  but other methods answer 405 with `Allow`, which reveals that the route exists. Harmless (Render sets the token), but
+  inconsistent. The spec documents the GET behaviour.
+
+**Decisions**
+- **`docs/openapi.yaml`** (OpenAPI 3.1.0, hand-written from the source):
+  - all 13 paths / 15 operations
+  - shared error schema with the complete list of 25 `error` codes
+  - three bearer schemes: session token, receiver secret, ops token
+  - idempotency tables for submission and replay
+  - cursor pagination, the replay rules and 409 variants, receiver modes, and the asynchronous polling model
+  - the internal routes are tagged **Internal** with `x-internal: true` and their own security schemes
+  - examples use obvious placeholders (`irs_EXAMPLE_ONLY_not_a_real_token`) and no secret values
+- **Docs page** at `/docs/`: Swagger UI from the pinned `swagger-ui-dist@5.33.1` (new runtime dependency, needed because
+  Render's `npm ci` with `NODE_ENV=production` skips devDependencies). Only `swagger-ui-bundle.js` and `swagger-ui.css` are
+  exposed (`/docs/vendor/…`), served same-origin, so the existing strict CSP is unchanged. The initializer is a file
+  (`public/docs/docs.js`), not inline, and the public validator badge is off. The spec is served at `/openapi.yaml`.
+  A CDN wasn't used because `script-src 'self'` blocks it.
+- **`yaml`** as a devDependency, for the spec consistency tests.
+- **Postman** (`postman/`): collection v2.1 plus an environment template. 8 folders in the agreed order, 43 requests.
+  - Collection-level Bearer auth `{{session_token}}`.
+  - A collection pre-request script stops with a clear message when no environment or `base_url` is selected.
+  - Scripts capture `session_token`, `other_session_token`, `event_id`, `delivery_id`, `replay_delivery_id` and
+    `next_cursor`, and generate `idempotency_key` / `replay_idempotency_key` per new request.
+  - **Polling is explicit.** Each *Poll* request sleeps `poll_interval_ms` (2 s) first. In the runner, an unfinished
+    poll re-queues itself with `setNextRequest`, bounded by `poll_max_tries` (25 for exhaustion). By hand, the test
+    result tells the user to click Send again.
+  - No token-shaped literal is stored. The "expired credential" check builds a well-formed, never-issued token at run
+    time, because the API deliberately answers expired and unknown tokens identically. Real expiry is covered by the
+    existing automated test.
+  - Secret variables are empty in the template.
+- **Version 0.11.0.** No migration in this stage.
+- Docs: `docs/postman-walkthrough.md` (beginner guide), `docs/release-checklist.md` (smoke checklist, rollback), README links.
+
+**Verification (local, Node 22.18.0, Postgres 18.6 in Docker, Windows 11)**
+- `npm test`: **131/131** pass, `skipped 0`. 7 new tests in `test/docs.test.js`:
+  - spec version = package version
+  - for every documented path, `DELETE` returns 405 and the `Allow` methods (minus HEAD) equal the documented methods
+  - every `sendError` code in `src/` is in the spec's enum, and the reverse
+  - internal routes are tagged, `x-internal`, and use non-session security
+  - spec and Postman files contain no token-shaped strings, `RECEIVER_SECRET=`, `OPS_TOKEN=` or `postgres://` URLs,
+    and the secret variables are empty
+  - environment placeholders present, folder order 1–8, and every request path exists in the spec
+  - `/docs/` and assets served under the CSP with no inline script, and only the two vendor files exposed
+  - Mutation checks: deleting `invalid_query` from the spec's enum, and renaming `PUT /v1/receiver` to `PATCH`, each
+    made a test fail.
+- `redocly lint` (`@redocly/cli`, run from a scratch folder, not a project dependency): **valid, 0 errors**. 3 warnings were
+  accepted as intended: `localhost` server entry, and no 4xx on `/health` and `/ready` (they have none).
+- **Real browser (headless Microsoft Edge via puppeteer-core, scratch only)** at 390×844: `/docs/` rendered all 15
+  operations and 7 tags. 0 console errors, 0 CSP violations, 0 failed requests. Only same-origin and `data:` resources;
+  no horizontal scroll. The internal receiver operation expanded and showed its "Internal" description.
+- **Newman** (scratch install) against a local server with the worker on: **52 requests (43 + 9 repeated polls), 94/94
+  assertions, 0 failures, 36.8 s.** The polls looped as designed (exhaustion: 6 re-polls, then `failed` 4/4;
+  process_then_timeout: in_progress → retry_scheduled → delivered). No demo token appeared in the Newman output or the
+  server log.
+- **Migrations** (scratch databases in the local container, dropped afterwards):
+  - (a) Clean database: 001–008 applied in order; second run "Database schema is up to date"; `pendingMigrations` empty;
+    the expected 9 tables exist.
+  - (b) **Existing database with events.** Migrated to 003 only, then inserted 2 sessions, 6 events, 4 old-style
+    receipts (2 per event, i.e. repeats) and persisted `server_error` modes. `npm run migrate` applied 004–008.
+    - Events byte-for-byte unchanged.
+    - Every event got exactly one `pending`, due delivery with the event's `created_at`.
+    - `events.status` dropped.
+    - Receipts folded to 2 rows with `delivery_count` 2 and `RCPT-MIGRATED`; the old table dropped.
+    - Second run: up to date.
+    - Then the **current app was started on that database**: the old events were listed, the persisted `server_error`
+      mode gave 503s, and after switching to success all 6 were delivered.
+    - The event with a migrated receipt was answered as a duplicate on attempt 1 (not processed again;
+      `deliveriesReceived` 3).
+  - (c) Copy of the dev database (`pg_dump` → new DB; 34 events, 37 deliveries, 81 attempts): "up to date", counts unchanged.
+- **Bounded concurrency check** (local; 1 server with its worker + 2 standalone `worker-main.js` processes, each concurrency 2):
+  - *Duplicate submission*, 3 rounds. 25 simultaneous identical requests gave exactly one 202 and 24 × 200 with
+    `Idempotent-Replayed`, 1 distinct event ID. 25 simultaneous requests with the same new key and 25 different
+    payloads gave one 202 and 24 × 409. The database had 1 event row and 1 delivery per key.
+  - *Job claims*: 50 events (5 sessions × 10) gave 50 deliveries and **50 attempt rows, max 1 attempt per delivery**,
+    0 non-delivered attempts; receiver processed 50, 0 duplicates. The attempt log lines (56 = 50 + the 6 events from
+    part 1) were split 16 / 19 / 21 across the 3 processes.
+  - Logs: 329 lines from the 3 processes, all JSON; 0 demo tokens, 0 secret values, 0 payload text.
+  - This shows correctness under modest contention on one machine. **It is not a load or performance test**, and no
+    throughput claim is made from it.
+- **Rollback target check**: v0.10.0 (`caa3255`, git worktree) against the current schema → "Database schema is up to
+  date", `/ready` 200, event delivered on attempt 1, `/docs/` 404. So 0.11 → 0.10 is an application-only rollback.
+- Render rollback behaviour is taken from Render's docs (checked 2026-10-05): a dashboard rollback redeploys an earlier
+  build artifact with that deploy's env vars, **disables auto-deploy**, and doesn't touch databases.
+
+**Mistake during verification.** While stopping my own test servers, a process filter also stopped two `src/server.js`
+processes that I hadn't started (probably the owner's local dev server). No data is affected (state is in Postgres),
+but they need restarting by hand.
+
+**Not run / not verified**
+- Importing the files into the Postman **app** itself (only Newman, which uses the same runtime, was run). The
+  walkthrough's UI steps (menu names) follow Postman's current UI as I understand it; I didn't watch them in a session.
+- Screen-reader and keyboard checks of the Swagger UI page (third-party UI).
+- A real-expiry run (24 h) in Postman; that path is covered by the automated test.
+- Load, soak or performance testing. No performance claims.
+- SIGTERM shutdown on Windows (unchanged; see Stage 5).
+- The authorized `/internal/ops/worker` call on Render (needs the owner's token).

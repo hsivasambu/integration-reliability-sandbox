@@ -1,6 +1,6 @@
 {
   "name": "integration-reliability-sandbox",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "private": true,
   "description": "Synthetic event delivery sandbox for learning integration reliability.",
   "main": "src/server.js",
@@ -22,9 +22,11 @@
   "license": "UNLICENSED",
   "dependencies": {
     "express": "^5.2.1",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "swagger-ui-dist": "5.33.1"
   },
   "devDependencies": {
-    "supertest": "^7.3.1"
+    "supertest": "^7.3.1",
+    "yaml": "^2.9.1"
   }
 }

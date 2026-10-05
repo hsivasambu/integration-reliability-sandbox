@@ -1,8 +1,15 @@
 # Integration Reliability Sandbox
 
-A learning sandbox that will accept synthetic JSON events, persist them, and deliver them
+A learning sandbox that accepts synthetic JSON events, persists them, and delivers them
 reliably to a controlled mock receiver.
-**Current stage: 10. Operational visibility and bounded demo usage.**
+**Current stage: 11. API documentation, Postman collection, and release checkpoint.**
+
+| Want to… | Go to |
+|---|---|
+| Read the API reference | `/docs/` on the running app (Swagger UI), or [`docs/openapi.yaml`](docs/openapi.yaml) |
+| Try the API step by step | [`docs/postman-walkthrough.md`](docs/postman-walkthrough.md) and the files in [`postman/`](postman/) |
+| Deploy, smoke-test or roll back | [`docs/release-checklist.md`](docs/release-checklist.md) |
+| See how each stage was built and verified | [`docs/build-notes.md`](docs/build-notes.md) |
 
 ## Requirements
 
@@ -21,7 +28,10 @@ npm run dev:worker      # optional second terminal: standalone delivery worker (
 npm test                # all tests (database tests need TEST_DATABASE_URL)
 ```
 
-Open http://localhost:3000. With `WORKER_ENABLED=true` in `.env` (or `npm run dev:worker` running), the page can
+`npm test` reports database-backed tests as **skipped** (not failed) when `TEST_DATABASE_URL` is unset. Check the
+summary line says `skipped 0` before trusting a green run.
+
+Open http://localhost:3000 (API reference at http://localhost:3000/docs/). With `WORKER_ENABLED=true` in `.env` (or `npm run dev:worker` running), the page can
 run every scenario end to end.
 
 `npm run db:down` stops the database and keeps its data. To delete local data completely:
@@ -82,7 +92,7 @@ database only accepts connections from Render's private network (`ipAllowList: [
 
 | Method & path | Response |
 |---|---|
-| `GET /health` | `200 {"status":"ok","version":"0.10.0","inProcessWorker":true|false}` while the process runs (no database check) |
+| `GET /health` | `200 {"status":"ok","version":"0.11.0","inProcessWorker":true|false}` while the process runs (no database check) |
 | `HEAD /health` | `200`, headers only |
 | `GET /ready` | `200 {"status":"ready"}` if the database is reachable and migrated, otherwise `503` with `reason` |
 | `POST /v1/sessions` | `201` with a new demo token (shown once), `429` if rate limited, `503` at capacity |
@@ -100,6 +110,8 @@ database only accepts connections from Render's private network (`ipAllowList: [
 | `POST /internal/receiver/deliveries` | Mock receiver. Requires `Authorization: Bearer <RECEIVER_SECRET>`; `401` otherwise. Server-side callers only. |
 | Wrong method on any route above | `405` with an `Allow` header |
 | `GET /` | Browser UI (`public/index.html`, `app.js`, `app.css`) |
+| `GET /docs/` | API reference (Swagger UI rendering `/openapi.yaml`) |
+| `GET /openapi.yaml` | The OpenAPI 3.1 specification (`docs/openapi.yaml`) |
 | Anything else | `404 {"error":"not_found",...}` |
 
 API request bodies over 4 KB get `413`, and malformed JSON gets `400`.
@@ -111,7 +123,7 @@ validation errors. Programs should branch on `error`; `message` is for people.
 
 `POST /v1/sessions` returns a random bearer token such as `irs_...` (47 characters). **This token is a
 limited demo credential, not a user account.** There is no username, password, or recovery. It only
-scopes your own sandbox data (from later stages) and expires after 24 hours. The server stores only a
+scopes your own sandbox data (events, receiver mode, replays) and expires after 24 hours. The server stores only a
 SHA-256 hash of it, so the token can't be shown again. Lose it and you simply create a new session.
 Tokens are never logged.
 
@@ -139,12 +151,12 @@ unset TOKEN
 
 ### Try it with Postman
 
-1. Create an environment with a variable `demoToken` and set its type to **secret**.
-2. `POST {{base}}/v1/sessions`. In the request's **Scripts → Post-response** tab add:
-   `pm.environment.set("demoToken", pm.response.json().token);`
-3. `GET {{base}}/v1/session` with **Authorization → Bearer Token** = `{{demoToken}}`.
+Import `postman/integration-reliability-sandbox.postman_collection.json` and the environment template
+`postman/integration-reliability-sandbox.postman_environment.json`, select the environment, and set `base_url`.
+The *Create session* request stores the token in the secret variable `session_token`. The step-by-step guide,
+including how to wait for asynchronous delivery, is [`docs/postman-walkthrough.md`](docs/postman-walkthrough.md).
 
-Don't paste real tokens into shared collections, screenshots, or docs.
+Don't paste real tokens into shared collections, screenshots, or docs, and don't share an environment export after a run.
 
 ## Events
 
@@ -648,6 +660,8 @@ On Windows PowerShell, type `curl.exe` instead of `curl` (`curl` is an alias for
 | `401 missing_token` / `invalid_token` | No `Authorization: Bearer` header / token unknown, malformed, or expired |
 | `404` on `/v1/events/{id}` | No such event **for your session**. Other sessions' events look identical to missing ones. |
 | `409 idempotency_key_conflict` | You reused an Idempotency-Key for a different event. Generate a new key. |
+| `413 payload_too_large` / `415 unsupported_media_type` / `400 invalid_json` | Body over 4 KB / missing `Content-Type: application/json` / malformed JSON |
+| `422 validation_failed` | The body parsed but breaks a rule; `details` lists every problem |
 | `401 receiver_unauthorized` | Call to `/internal/receiver/...` without the server-side secret. Expected for any browser or visitor. |
 | curl `Failed to connect` / exit code 7, browser "can't be reached" | **Nothing is listening** (server not running, wrong port/host) |
 | curl exit 6 `Could not resolve host` | Wrong hostname / typo in URL |
@@ -683,6 +697,10 @@ then listens. Check `/health` and `/ready` once the deploy shows **Live**.
 
 If migrations fail at startup, the process exits with `Startup failed: Migration ... failed: ...` in the
 Render logs. The deploy never goes live, and the previous version keeps serving.
+
+After every deploy, run the smoke checklist in [`docs/release-checklist.md`](docs/release-checklist.md). It also
+describes rollback: the application can be rolled back from the Render dashboard (which turns auto-deploy off),
+but **database migrations are forward-only** and are never rolled back with it.
 
 ### Free plan limits
 

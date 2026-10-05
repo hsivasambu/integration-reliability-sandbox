@@ -1,0 +1,2152 @@
+{
+  "info": {
+    "_postman_id": "3f7d1c52-8a1e-4b5e-9c2a-11a000000011",
+    "name": "Integration Reliability Sandbox",
+    "description": "Requests for the Integration Reliability Sandbox API, in learning order. Select the \"Integration Reliability Sandbox\" environment and set base_url first.\n\nDelivery is asynchronous. The \"Poll ...\" requests wait poll_interval_ms before each send and, in the Collection Runner, repeat themselves until the work is done. When sending by hand, click Send again on a Poll request until its test says it finished.\n\nScripts store tokens and IDs as CURRENT values in your environment. Do not share an environment export after running, and never paste tokens into shared places. Full guide: docs/postman-walkthrough.md. API reference: /docs/ on the server.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{session_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Fail early with a clear message if no environment (or no base_url) is selected.",
+          "const base = pm.variables.get('base_url');",
+          "if (!base) throw new Error('base_url is empty. Select the \"Integration Reliability Sandbox\" environment (top right) and set base_url.');",
+          "if (base.endsWith('/')) throw new Error('base_url must not end with \"/\". Example: http://localhost:3000');"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Helps match this request with the server log line.",
+          "console.log(pm.info.requestName, '->', pm.response.code, '| X-Request-Id', pm.response.headers.get('X-Request-Id'));"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health and readiness",
+      "description": "No token needed. If /health is slow the first time, the free instance is waking up (about a minute). That is not a failure.",
+      "item": [
+        {
+          "name": "Health (liveness)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 and status ok', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql('ok');",
+                  "});",
+                  "pm.test('this process runs the delivery worker (needed for folders 3-7)', () => {",
+                  "  pm.expect(pm.response.json().inProcessWorker, 'inProcessWorker is false: run \"npm run dev:worker\" locally or deliveries stay pending').to.be.true;",
+                  "});",
+                  "console.log('version', pm.response.json().version, '| X-Request-Id', pm.response.headers.get('X-Request-Id'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Readiness (database reachable and migrated)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 ready', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql('ready');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/ready",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ready"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Create an anonymous session",
+      "description": "Creates a demo session and stores its token in the secret environment variable session_token. The token is shown once, expires after 24 hours, and is not a user account. Never paste it into shared places.",
+      "item": [
+        {
+          "name": "Create session (stores session_token)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('token looks like a demo token', () => pm.expect(body.token).to.match(/^irs_[A-Za-z0-9_-]{43}$/));",
+                  "// Stored as the CURRENT value of a secret variable. The token itself is never logged.",
+                  "pm.environment.set('session_token', body.token);",
+                  "console.log('Session created; expires at', body.expiresAt);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/sessions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "sessions"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Check session",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200: the token works', () => pm.response.to.have.status(200));",
+                  "console.log('expires at', pm.response.json().expiresAt);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/session",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "session"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Successful event delivery and status polling",
+      "description": "Submit one event, then poll its status URL until it is delivered. 202 means accepted, not delivered.",
+      "item": [
+        {
+          "name": "Set receiver mode: success",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 and mode is success', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().mode).to.eql('success');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver"
+              ]
+            },
+            "description": "Changes only your session's mock receiver. Deliveries that reach it from now on (including retries already scheduled) see `success`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"mode\":\"success\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Submit event (new Idempotency-Key)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A new Idempotency-Key for a new logical request. Reuse it only to retry the SAME request.",
+                  "pm.environment.set('idempotency_key', pm.variables.replaceIn('{{$guid}}'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: stored and queued, NOT delivered yet', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  pm.expect(pm.response.headers.get('Location')).to.match(/^\\/v1\\/events\\/.+\\/deliveries$/);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test('delivery starts pending with 0 attempts', () => {",
+                  "  pm.expect(body.event.delivery.state).to.eql('pending');",
+                  "  pm.expect(body.event.delivery.attemptCount).to.eql(0);",
+                  "});",
+                  "// Capture IDs for the following requests.",
+                  "pm.environment.set('event_id', body.eventId);",
+                  "pm.environment.set('delivery_id', body.event.delivery.id);",
+                  "console.log('event_id =', body.eventId, '| statusUrl =', body.statusUrl);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotency_key}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/events",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ]
+            },
+            "description": "Generates a new idempotency_key, submits the event, and stores event_id and delivery_id.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"demo.notification\",\n  \"payload\": {\n    \"title\": \"Synthetic title\",\n    \"message\": \"Synthetic message\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Poll status until delivered",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Give the background worker time before asking again.",
+                  "const waitMs = Number(pm.environment.get('poll_interval_ms') || 2000);",
+                  "setTimeout(() => {}, waitMs);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "const d = body.delivery;",
+                  "const done = ((b) => b.delivery.state === 'delivered' || b.delivery.state === 'failed')(body);",
+                  "const tries = Number(pm.collectionVariables.get('poll_tries') || 0) + 1;",
+                  "const maxTries = Number(pm.environment.get('poll_max_tries') || 20);",
+                  "const progress = 'latest delivery: ' + d.state + ', attempt ' + d.attemptCount + ' of ' + d.maxAttempts +",
+                  "  (d.nextAttemptAt ? ', next attempt due ' + d.nextAttemptAt : '');",
+                  "if (!done && tries < maxTries) {",
+                  "  pm.collectionVariables.set('poll_tries', tries);",
+                  "  pm.test('Not finished yet (' + progress + '). Polling again (' + tries + '/' + maxTries + '). By hand: click Send again.', () => {});",
+                  "  const again = pm.info.requestName;",
+                  "  if (pm.execution && typeof pm.execution.setNextRequest === 'function') pm.execution.setNextRequest(again);",
+                  "  else postman.setNextRequest(again);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('poll_tries');",
+                  "  pm.test('Finished waiting for: the delivery is delivered', () => {",
+                  "    pm.expect(done, 'still not done after ' + tries + ' polls (' + progress + ')').to.be.true;",
+                  "  });",
+                  "  if (done) {",
+                  "    pm.test('delivered on attempt 1 with HTTP 200', () => {",
+                  "      pm.expect(d.state).to.eql('delivered');",
+                  "      pm.expect(d.attempts[0].responseStatus).to.eql(200);",
+                  "    });",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events/{{event_id}}/deliveries",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events",
+                "{{event_id}}",
+                "deliveries"
+              ]
+            },
+            "description": "Polls the status URL until the delivery is delivered. Delivery is asynchronous: nothing waits for it automatically. Each send first pauses for `poll_interval_ms` (default 2000). In the Collection Runner this request repeats itself (up to `poll_max_tries` times); when sending by hand, click **Send** again until the test says it finished."
+          }
+        },
+        {
+          "name": "Receiver view: processed once",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test('processed: true', () => pm.expect(r.processed).to.eql(true));",
+                  "pm.test('duplicates recognized: 0', () => pm.expect(r.duplicateCount).to.eql(0));",
+                  "if (r.result) console.log('confirmation code', r.result.confirmationCode, '| deliveries received', r.deliveriesReceived);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver/receipts/{{event_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver",
+                "receipts",
+                "{{event_id}}"
+              ]
+            },
+            "description": "The receiver's side of the story: did it process the event, and how many duplicate deliveries did it recognize?"
+          }
+        },
+        {
+          "name": "Get the event",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 and delivery summary is delivered', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().event.delivery.state).to.eql('delivered');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events/{{event_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events",
+                "{{event_id}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Identical submission and conflicting key reuse",
+      "description": "Reuses the idempotency_key from folder 3. Same key + same payload returns the original event; same key + different payload is rejected.",
+      "item": [
+        {
+          "name": "Identical submission (same key, same payload)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 (not 202): nothing new was created', () => pm.response.to.have.status(200));",
+                  "pm.test('Idempotent-Replayed: true', () => pm.expect(pm.response.headers.get('Idempotent-Replayed')).to.eql('true'));",
+                  "pm.test('same event as before, with its current delivery state', () => {",
+                  "  pm.expect(pm.response.json().eventId).to.eql(pm.environment.get('event_id'));",
+                  "  pm.expect(pm.response.json().event.delivery.state).to.eql('delivered');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotency_key}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/events",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ]
+            },
+            "description": "Same key and the same content (field order differs on purpose; it does not matter). Nothing new is stored or sent.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"payload\": {\n    \"message\": \"Synthetic message\",\n    \"title\": \"Synthetic title\"\n  },\n  \"type\": \"demo.notification\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Conflicting reuse (same key, different payload)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 idempotency_key_conflict', () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  pm.expect(pm.response.json().error).to.eql('idempotency_key_conflict');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotency_key}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/events",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"demo.notification\",\n  \"payload\": {\n    \"title\": \"Synthetic title\",\n    \"message\": \"A different message\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Temporary server error and recovery",
+      "description": "The receiver answers 503 at first. After the first failed attempt we switch it to success; the next scheduled retry is delivered. Retries run about 2 s, 4 s and 8 s after each failure, so there are about 14 seconds before the 4th (last) attempt.",
+      "item": [
+        {
+          "name": "Set receiver mode: server_error",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 and mode is server_error', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().mode).to.eql('server_error');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver"
+              ]
+            },
+            "description": "Changes only your session's mock receiver. Deliveries that reach it from now on (including retries already scheduled) see `server_error`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"mode\":\"server_error\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Submit event",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A new Idempotency-Key for a new logical request. Reuse it only to retry the SAME request.",
+                  "pm.environment.set('idempotency_key', pm.variables.replaceIn('{{$guid}}'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: stored and queued, NOT delivered yet', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  pm.expect(pm.response.headers.get('Location')).to.match(/^\\/v1\\/events\\/.+\\/deliveries$/);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test('delivery starts pending with 0 attempts', () => {",
+                  "  pm.expect(body.event.delivery.state).to.eql('pending');",
+                  "  pm.expect(body.event.delivery.attemptCount).to.eql(0);",
+                  "});",
+                  "// Capture IDs for the following requests.",
+                  "pm.environment.set('event_id', body.eventId);",
+                  "pm.environment.set('delivery_id', body.event.delivery.id);",
+                  "console.log('event_id =', body.eventId, '| statusUrl =', body.statusUrl);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotency_key}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/events",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ]
+            },
+            "description": "New key; stores event_id and delivery_id.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"demo.notification\",\n  \"payload\": {\n    \"title\": \"Synthetic title\",\n    \"message\": \"Synthetic message\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Poll until the first attempt has failed",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Give the background worker time before asking again.",
+                  "const waitMs = Number(pm.environment.get('poll_interval_ms') || 2000);",
+                  "setTimeout(() => {}, waitMs);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "const d = body.delivery;",
+                  "const done = ((b) => b.delivery.attempts.some((a) => a.outcome === 'failed') || b.delivery.state === 'failed')(body);",
+                  "const tries = Number(pm.collectionVariables.get('poll_tries') || 0) + 1;",
+                  "const maxTries = Number(pm.environment.get('poll_max_tries') || 20);",
+                  "const progress = 'latest delivery: ' + d.state + ', attempt ' + d.attemptCount + ' of ' + d.maxAttempts +",
+                  "  (d.nextAttemptAt ? ', next attempt due ' + d.nextAttemptAt : '');",
+                  "if (!done && tries < maxTries) {",
+                  "  pm.collectionVariables.set('poll_tries', tries);",
+                  "  pm.test('Not finished yet (' + progress + '). Polling again (' + tries + '/' + maxTries + '). By hand: click Send again.', () => {});",
+                  "  const again = pm.info.requestName;",
+                  "  if (pm.execution && typeof pm.execution.setNextRequest === 'function') pm.execution.setNextRequest(again);",
+                  "  else postman.setNextRequest(again);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('poll_tries');",
+                  "  pm.test('Finished waiting for: attempt 1 failed with 503 and a retry is scheduled', () => {",
+                  "    pm.expect(done, 'still not done after ' + tries + ' polls (' + progress + ')').to.be.true;",
+                  "  });",
+                  "  if (done) {",
+                  "    pm.test('attempt 1: HTTP 503, retryable', () => {",
+                  "      pm.expect(d.attempts[0].responseStatus).to.eql(503);",
+                  "      pm.expect(d.attempts[0].retryable).to.be.true;",
+                  "    });",
+                  "    pm.test('not final yet: a retry is coming', () => pm.expect(d.state).to.be.oneOf(['retry_scheduled', 'in_progress', 'pending']));",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events/{{event_id}}/deliveries",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events",
+                "{{event_id}}",
+                "deliveries"
+              ]
+            },
+            "description": "Polls the status URL until attempt 1 failed with 503 and a retry is scheduled. Delivery is asynchronous: nothing waits for it automatically. Each send first pauses for `poll_interval_ms` (default 2000). In the Collection Runner this request repeats itself (up to `poll_max_tries` times); when sending by hand, click **Send** again until the test says it finished."
+          }
+        },
+        {
+          "name": "Set receiver mode: success",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 and mode is success', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().mode).to.eql('success');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver"
+              ]
+            },
+            "description": "Changes only your session's mock receiver. Deliveries that reach it from now on (including retries already scheduled) see `success`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"mode\":\"success\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Poll until delivered",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Give the background worker time before asking again.",
+                  "const waitMs = Number(pm.environment.get('poll_interval_ms') || 2000);",
+                  "setTimeout(() => {}, waitMs);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "const d = body.delivery;",
+                  "const done = ((b) => b.delivery.state === 'delivered' || b.delivery.state === 'failed')(body);",
+                  "const tries = Number(pm.collectionVariables.get('poll_tries') || 0) + 1;",
+                  "const maxTries = Number(pm.environment.get('poll_max_tries') || 20);",
+                  "const progress = 'latest delivery: ' + d.state + ', attempt ' + d.attemptCount + ' of ' + d.maxAttempts +",
+                  "  (d.nextAttemptAt ? ', next attempt due ' + d.nextAttemptAt : '');",
+                  "if (!done && tries < maxTries) {",
+                  "  pm.collectionVariables.set('poll_tries', tries);",
+                  "  pm.test('Not finished yet (' + progress + '). Polling again (' + tries + '/' + maxTries + '). By hand: click Send again.', () => {});",
+                  "  const again = pm.info.requestName;",
+                  "  if (pm.execution && typeof pm.execution.setNextRequest === 'function') pm.execution.setNextRequest(again);",
+                  "  else postman.setNextRequest(again);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('poll_tries');",
+                  "  pm.test('Finished waiting for: a retry is delivered', () => {",
+                  "    pm.expect(done, 'still not done after ' + tries + ' polls (' + progress + ')').to.be.true;",
+                  "  });",
+                  "  if (done) {",
+                  "    pm.test('delivered after at least one failed attempt', () => {",
+                  "      pm.expect(d.state).to.eql('delivered');",
+                  "      pm.expect(d.attempts.length).to.be.at.least(2);",
+                  "      pm.expect(d.attempts.at(-1).responseStatus).to.eql(200);",
+                  "    });",
+                  "    console.log('attempts:', d.attempts.map((a) => a.attemptNumber + ':' + (a.responseStatus || a.errorCategory)).join(' '));",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events/{{event_id}}/deliveries",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events",
+                "{{event_id}}",
+                "deliveries"
+              ]
+            },
+            "description": "Polls the status URL until a retry is delivered. Delivery is asynchronous: nothing waits for it automatically. Each send first pauses for `poll_interval_ms` (default 2000). In the Collection Runner this request repeats itself (up to `poll_max_tries` times); when sending by hand, click **Send** again until the test says it finished."
+          }
+        },
+        {
+          "name": "Receiver view: processed once",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test('processed: true', () => pm.expect(r.processed).to.eql(true));",
+                  "pm.test('duplicates recognized: 0', () => pm.expect(r.duplicateCount).to.eql(0));",
+                  "if (r.result) console.log('confirmation code', r.result.confirmationCode, '| deliveries received', r.deliveriesReceived);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver/receipts/{{event_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver",
+                "receipts",
+                "{{event_id}}"
+              ]
+            },
+            "description": "The receiver's side of the story: did it process the event, and how many duplicate deliveries did it recognize?"
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Retry exhaustion and replay",
+      "description": "All 4 attempts fail (about 15 seconds), so the delivery is failed for good. Then we fix the receiver and replay it: a new delivery of the same event with a fresh attempt budget.",
+      "item": [
+        {
+          "name": "Set receiver mode: server_error",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 and mode is server_error', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().mode).to.eql('server_error');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver"
+              ]
+            },
+            "description": "Changes only your session's mock receiver. Deliveries that reach it from now on (including retries already scheduled) see `server_error`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"mode\":\"server_error\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Submit event",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A new Idempotency-Key for a new logical request. Reuse it only to retry the SAME request.",
+                  "pm.environment.set('idempotency_key', pm.variables.replaceIn('{{$guid}}'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: stored and queued, NOT delivered yet', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  pm.expect(pm.response.headers.get('Location')).to.match(/^\\/v1\\/events\\/.+\\/deliveries$/);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test('delivery starts pending with 0 attempts', () => {",
+                  "  pm.expect(body.event.delivery.state).to.eql('pending');",
+                  "  pm.expect(body.event.delivery.attemptCount).to.eql(0);",
+                  "});",
+                  "// Capture IDs for the following requests.",
+                  "pm.environment.set('event_id', body.eventId);",
+                  "pm.environment.set('delivery_id', body.event.delivery.id);",
+                  "console.log('event_id =', body.eventId, '| statusUrl =', body.statusUrl);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotency_key}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/events",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ]
+            },
+            "description": "New key; stores event_id and delivery_id.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"demo.notification\",\n  \"payload\": {\n    \"title\": \"Synthetic title\",\n    \"message\": \"Synthetic message\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Poll until failed for good (about 15 s)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Give the background worker time before asking again.",
+                  "const waitMs = Number(pm.environment.get('poll_interval_ms') || 2000);",
+                  "setTimeout(() => {}, waitMs);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "const d = body.delivery;",
+                  "const done = ((b) => b.delivery.state === 'failed' || b.delivery.state === 'delivered')(body);",
+                  "const tries = Number(pm.collectionVariables.get('poll_tries') || 0) + 1;",
+                  "const maxTries = 25;",
+                  "const progress = 'latest delivery: ' + d.state + ', attempt ' + d.attemptCount + ' of ' + d.maxAttempts +",
+                  "  (d.nextAttemptAt ? ', next attempt due ' + d.nextAttemptAt : '');",
+                  "if (!done && tries < maxTries) {",
+                  "  pm.collectionVariables.set('poll_tries', tries);",
+                  "  pm.test('Not finished yet (' + progress + '). Polling again (' + tries + '/' + maxTries + '). By hand: click Send again.', () => {});",
+                  "  const again = pm.info.requestName;",
+                  "  if (pm.execution && typeof pm.execution.setNextRequest === 'function') pm.execution.setNextRequest(again);",
+                  "  else postman.setNextRequest(again);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('poll_tries');",
+                  "  pm.test('Finished waiting for: all 4 attempts failed', () => {",
+                  "    pm.expect(done, 'still not done after ' + tries + ' polls (' + progress + ')').to.be.true;",
+                  "  });",
+                  "  if (done) {",
+                  "    pm.test('failed / attempts_exhausted after 4 attempts', () => {",
+                  "      pm.expect(d.state).to.eql('failed');",
+                  "      pm.expect(d.failureReason).to.eql('attempts_exhausted');",
+                  "      pm.expect(d.attemptCount).to.eql(4);",
+                  "    });",
+                  "    pm.environment.set('delivery_id', d.id);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events/{{event_id}}/deliveries",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events",
+                "{{event_id}}",
+                "deliveries"
+              ]
+            },
+            "description": "Polls the status URL until all 4 attempts failed. Delivery is asynchronous: nothing waits for it automatically. Each send first pauses for `poll_interval_ms` (default 2000). In the Collection Runner this request repeats itself (up to 25 times); when sending by hand, click **Send** again until the test says it finished."
+          }
+        },
+        {
+          "name": "Set receiver mode: success",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 and mode is success', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().mode).to.eql('success');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver"
+              ]
+            },
+            "description": "Changes only your session's mock receiver. Deliveries that reach it from now on (including retries already scheduled) see `success`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"mode\":\"success\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Replay the failed delivery (stores replay_delivery_id)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A new Idempotency-Key for a new logical request. Reuse it only to retry the SAME request.",
+                  "pm.environment.set('replay_idempotency_key', pm.variables.replaceIn('{{$guid}}'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202: replay scheduled', () => pm.response.to.have.status(202));",
+                  "const r = pm.response.json();",
+                  "pm.test('new delivery linked to the failed one, fresh budget', () => {",
+                  "  pm.expect(r.delivery.replayOf).to.eql(pm.environment.get('delivery_id'));",
+                  "  pm.expect(r.delivery.attemptCount).to.eql(0);",
+                  "});",
+                  "pm.environment.set('replay_delivery_id', r.delivery.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{replay_idempotency_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/deliveries/{{delivery_id}}/replay",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "deliveries",
+                "{{delivery_id}}",
+                "replay"
+              ]
+            },
+            "description": "No body. Uses a new replay_idempotency_key."
+          }
+        },
+        {
+          "name": "Same replay request again (same key)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 + Idempotent-Replayed: nothing new scheduled', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.headers.get('Idempotent-Replayed')).to.eql('true');",
+                  "  pm.expect(pm.response.json().delivery.id).to.eql(pm.environment.get('replay_delivery_id'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{replay_idempotency_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/deliveries/{{delivery_id}}/replay",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "deliveries",
+                "{{delivery_id}}",
+                "replay"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Replay again with a different key",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 already_replayed', () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  pm.expect(pm.response.json().error).to.eql('already_replayed');",
+                  "});",
+                  "pm.test('points at the existing replay', () => pm.expect(pm.response.json().replayDeliveryId).to.eql(pm.environment.get('replay_delivery_id')));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/deliveries/{{delivery_id}}/replay",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "deliveries",
+                "{{delivery_id}}",
+                "replay"
+              ]
+            },
+            "description": "A delivery can be replayed only once. A different key cannot create a second replay."
+          }
+        },
+        {
+          "name": "Poll until the replay is delivered",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Give the background worker time before asking again.",
+                  "const waitMs = Number(pm.environment.get('poll_interval_ms') || 2000);",
+                  "setTimeout(() => {}, waitMs);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "const d = body.delivery;",
+                  "const done = ((b) => b.deliveries.length > 1 && ['delivered', 'failed'].includes(b.delivery.state))(body);",
+                  "const tries = Number(pm.collectionVariables.get('poll_tries') || 0) + 1;",
+                  "const maxTries = Number(pm.environment.get('poll_max_tries') || 20);",
+                  "const progress = 'latest delivery: ' + d.state + ', attempt ' + d.attemptCount + ' of ' + d.maxAttempts +",
+                  "  (d.nextAttemptAt ? ', next attempt due ' + d.nextAttemptAt : '');",
+                  "if (!done && tries < maxTries) {",
+                  "  pm.collectionVariables.set('poll_tries', tries);",
+                  "  pm.test('Not finished yet (' + progress + '). Polling again (' + tries + '/' + maxTries + '). By hand: click Send again.', () => {});",
+                  "  const again = pm.info.requestName;",
+                  "  if (pm.execution && typeof pm.execution.setNextRequest === 'function') pm.execution.setNextRequest(again);",
+                  "  else postman.setNextRequest(again);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('poll_tries');",
+                  "  pm.test('Finished waiting for: the replay is delivered', () => {",
+                  "    pm.expect(done, 'still not done after ' + tries + ' polls (' + progress + ')').to.be.true;",
+                  "  });",
+                  "  if (done) {",
+                  "    pm.test('replay delivered; original kept failed with its 4 attempts', () => {",
+                  "      pm.expect(d.id).to.eql(pm.environment.get('replay_delivery_id'));",
+                  "      pm.expect(d.state).to.eql('delivered');",
+                  "      pm.expect(body.deliveries[0].state).to.eql('failed');",
+                  "      pm.expect(body.deliveries[0].attempts.length).to.eql(4);",
+                  "    });",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events/{{event_id}}/deliveries",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events",
+                "{{event_id}}",
+                "deliveries"
+              ]
+            },
+            "description": "Polls the status URL until the replay is delivered. Delivery is asynchronous: nothing waits for it automatically. Each send first pauses for `poll_interval_ms` (default 2000). In the Collection Runner this request repeats itself (up to `poll_max_tries` times); when sending by hand, click **Send** again until the test says it finished."
+          }
+        },
+        {
+          "name": "Receiver view: processed once",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test('processed: true', () => pm.expect(r.processed).to.eql(true));",
+                  "pm.test('duplicates recognized: 0', () => pm.expect(r.duplicateCount).to.eql(0));",
+                  "if (r.result) console.log('confirmation code', r.result.confirmationCode, '| deliveries received', r.deliveriesReceived);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver/receipts/{{event_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver",
+                "receipts",
+                "{{event_id}}"
+              ]
+            },
+            "description": "The receiver's side of the story: did it process the event, and how many duplicate deliveries did it recognize?"
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. process_then_timeout and duplicate-safe processing",
+      "description": "The receiver processes the event, then replies too late. The sender sees a timeout and retries; the receiver recognizes the event ID and does not process it again.",
+      "item": [
+        {
+          "name": "Set receiver mode: process_then_timeout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 and mode is process_then_timeout', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().mode).to.eql('process_then_timeout');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver"
+              ]
+            },
+            "description": "Changes only your session's mock receiver. Deliveries that reach it from now on (including retries already scheduled) see `process_then_timeout`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"mode\":\"process_then_timeout\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Submit event",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A new Idempotency-Key for a new logical request. Reuse it only to retry the SAME request.",
+                  "pm.environment.set('idempotency_key', pm.variables.replaceIn('{{$guid}}'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: stored and queued, NOT delivered yet', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  pm.expect(pm.response.headers.get('Location')).to.match(/^\\/v1\\/events\\/.+\\/deliveries$/);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.test('delivery starts pending with 0 attempts', () => {",
+                  "  pm.expect(body.event.delivery.state).to.eql('pending');",
+                  "  pm.expect(body.event.delivery.attemptCount).to.eql(0);",
+                  "});",
+                  "// Capture IDs for the following requests.",
+                  "pm.environment.set('event_id', body.eventId);",
+                  "pm.environment.set('delivery_id', body.event.delivery.id);",
+                  "console.log('event_id =', body.eventId, '| statusUrl =', body.statusUrl);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotency_key}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/events",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ]
+            },
+            "description": "New key; stores event_id and delivery_id.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"demo.notification\",\n  \"payload\": {\n    \"title\": \"Synthetic title\",\n    \"message\": \"Synthetic message\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Poll until delivered (after a timeout)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Give the background worker time before asking again.",
+                  "const waitMs = Number(pm.environment.get('poll_interval_ms') || 2000);",
+                  "setTimeout(() => {}, waitMs);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "const d = body.delivery;",
+                  "const done = ((b) => b.delivery.state === 'delivered' || b.delivery.state === 'failed')(body);",
+                  "const tries = Number(pm.collectionVariables.get('poll_tries') || 0) + 1;",
+                  "const maxTries = Number(pm.environment.get('poll_max_tries') || 20);",
+                  "const progress = 'latest delivery: ' + d.state + ', attempt ' + d.attemptCount + ' of ' + d.maxAttempts +",
+                  "  (d.nextAttemptAt ? ', next attempt due ' + d.nextAttemptAt : '');",
+                  "if (!done && tries < maxTries) {",
+                  "  pm.collectionVariables.set('poll_tries', tries);",
+                  "  pm.test('Not finished yet (' + progress + '). Polling again (' + tries + '/' + maxTries + '). By hand: click Send again.', () => {});",
+                  "  const again = pm.info.requestName;",
+                  "  if (pm.execution && typeof pm.execution.setNextRequest === 'function') pm.execution.setNextRequest(again);",
+                  "  else postman.setNextRequest(again);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('poll_tries');",
+                  "  pm.test('Finished waiting for: the retry after the timeout is delivered', () => {",
+                  "    pm.expect(done, 'still not done after ' + tries + ' polls (' + progress + ')').to.be.true;",
+                  "  });",
+                  "  if (done) {",
+                  "    pm.test('attempt 1 timed out with no response; a later attempt delivered', () => {",
+                  "      pm.expect(d.attempts[0].errorCategory).to.eql('timeout');",
+                  "      pm.expect(d.attempts[0].responseStatus).to.eql(null);",
+                  "      pm.expect(d.state).to.eql('delivered');",
+                  "    });",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events/{{event_id}}/deliveries",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events",
+                "{{event_id}}",
+                "deliveries"
+              ]
+            },
+            "description": "Polls the status URL until the retry after the timeout is delivered. Delivery is asynchronous: nothing waits for it automatically. Each send first pauses for `poll_interval_ms` (default 2000). In the Collection Runner this request repeats itself (up to `poll_max_tries` times); when sending by hand, click **Send** again until the test says it finished."
+          }
+        },
+        {
+          "name": "Receiver view: processed once, 1 duplicate",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test('processed: true', () => pm.expect(r.processed).to.eql(true));",
+                  "pm.test('duplicates recognized: 1', () => pm.expect(r.duplicateCount).to.eql(1));",
+                  "if (r.result) console.log('confirmation code', r.result.confirmationCode, '| deliveries received', r.deliveriesReceived);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver/receipts/{{event_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver",
+                "receipts",
+                "{{event_id}}"
+              ]
+            },
+            "description": "The receiver's side of the story: did it process the event, and how many duplicate deliveries did it recognize?"
+          }
+        },
+        {
+          "name": "Set receiver mode: success",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 and mode is success', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().mode).to.eql('success');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver"
+              ]
+            },
+            "description": "Changes only your session's mock receiver. Deliveries that reach it from now on (including retries already scheduled) see `success`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"mode\":\"success\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "8. Validation, expired credential, and session isolation checks",
+      "description": "Error responses. Every error body is {\"error\": \"<code>\", \"message\": \"...\"}; programs branch on error.",
+      "item": [
+        {
+          "name": "Invalid event (422, every problem listed)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 validation_failed', () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  pm.expect(pm.response.json().error).to.eql('validation_failed');",
+                  "});",
+                  "pm.test('details lists both problems', () => {",
+                  "  const fields = pm.response.json().details.map((x) => x.field);",
+                  "  pm.expect(fields).to.include.members(['payload.title', 'payload.priority']);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/events",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"demo.notification\",\n  \"payload\": {\n    \"title\": \"   \",\n    \"message\": \"Synthetic message\",\n    \"priority\": \"high\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Missing Idempotency-Key (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 idempotency_key_required', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  pm.expect(pm.response.json().error).to.eql('idempotency_key_required');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/events",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"demo.notification\",\n  \"payload\": {\n    \"title\": \"Synthetic title\",\n    \"message\": \"Synthetic message\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "Invalid list query (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 invalid_query', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  pm.expect(pm.response.json().error).to.eql('invalid_query');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events?limit=0",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "0"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "No token (401 missing_token)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 missing_token', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().error).to.eql('missing_token');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/session",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "session"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Expired or unknown token (401 invalid_token)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Built at run time so no token-shaped string is stored in this file.",
+                  "pm.variables.set('unknown_token', 'irs_' + 'x'.repeat(43));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 invalid_token', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().error).to.eql('invalid_token');",
+                  "});",
+                  "pm.test('WWW-Authenticate says invalid_token', () => pm.expect(pm.response.headers.get('WWW-Authenticate')).to.include('invalid_token'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/session",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "session"
+              ]
+            },
+            "description": "Uses a well-formed token that was never issued. The API deliberately answers expired and unknown tokens identically, so this is the same response an expired token gets. (Real expiry takes 24 hours; the automated tests cover it.)",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{unknown_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Create a second session (stores other_session_token)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.environment.set('other_session_token', pm.response.json().token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/sessions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "sessions"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Other session reads your event (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 not_found', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.json().error).to.eql('not_found');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events/{{event_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events",
+                "{{event_id}}"
+              ]
+            },
+            "description": "Another session's event looks exactly like a missing one.",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{other_session_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Other session reads your receipt (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 not_found', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.json().error).to.eql('not_found');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/receiver/receipts/{{event_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "receiver",
+                "receipts",
+                "{{event_id}}"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{other_session_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Other session replays your delivery (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 not_found', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.json().error).to.eql('not_found');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/deliveries/{{delivery_id}}/replay",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "deliveries",
+                "{{delivery_id}}",
+                "replay"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{other_session_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Other session lists events (empty)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 with no events', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().data).to.have.length(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{other_session_token}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Your events, page 1 (limit=2, stores next_cursor)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 with 2 events and a nextCursor', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().data).to.have.length(2);",
+                  "  pm.expect(pm.response.json().nextCursor).to.be.a('string');",
+                  "});",
+                  "pm.environment.set('next_cursor', pm.response.json().nextCursor);",
+                  "pm.collectionVariables.set('page1_ids', JSON.stringify(pm.response.json().data.map((e) => e.id)));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events?limit=2",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "2"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Your events, page 2 (cursor)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 with older events, none repeated from page 1', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  const page1 = JSON.parse(pm.collectionVariables.get('page1_ids') || '[]');",
+                  "  const ids = pm.response.json().data.map((e) => e.id);",
+                  "  pm.expect(ids.length).to.be.at.least(1);",
+                  "  ids.forEach((id) => pm.expect(page1).to.not.include(id));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/v1/events?limit=2&cursor={{next_cursor}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "events"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "2"
+                },
+                {
+                  "key": "cursor",
+                  "value": "{{next_cursor}}"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
