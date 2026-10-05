@@ -118,3 +118,7 @@ Migrations rebuild the empty schema automatically, but existing sessions are los
   three-page pagination with session isolation; bad query params.
 - Live curl: 201 → 200 (replayed) → 409 → 422 → 400 → 401 → 200 own GET → 404 other session → list.
   Tokens absent from the server log. The README PowerShell example was run as written: 201, then 200 + replay header.
+
+**Deployed check (2026-10-04, by Claude, after pushing d75e263).** Live in about 45 s. Migration 002 was
+applied at startup, and /ready returned 200. Results: first submit 201, repeat 200, conflicting reuse 409,
+invalid 422, own GET 200, other session's GET 404, list 1 item, no token 401, /demo.js 200.
