@@ -381,3 +381,12 @@ second deploy. `/ready` 200.
     2007 ms while the receiver already showed `processed=true RCPT-1D25DC5D`. At about 6 s, sender
     `delivered` (#2 200 in 16 ms); receiver the same code, `deliveriesReceived=2`, `duplicates=1`.
     Server log: 2 lines total (no per-duplicate logging).
+
+**Deployed check (2026-10-05, by Claude, after pushing bdaf243).** 0.7.0 was live with the worker in about 30 s; migration 006 applied
+(`/ready` 200).
+- process_then_timeout: at about 3 s, sender `retry_scheduled` (#1 timeout, 2003 ms, no status) while the receiver already
+  showed `processed=true RCPT-478885EB`. At about 6.5 s, sender `delivered` (#2 200 in 22 ms); receiver the same code, 2
+  deliveries, 1 duplicate.
+- process_then_timeout, then switched to success before the retry: delivered on #2; receiver processed once, 1 duplicate.
+- Plain timeout: after about 6 s, #1 timeout, #2 in progress; receiver `processed=false`.
+- Session totals: processedCount 2, duplicateCount 2. Another session reading a receipt: 404.
