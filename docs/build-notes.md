@@ -835,3 +835,84 @@ All of these are recorded in `docs/frontend-notes.md` → *Known gaps*.
 - Screenshots were reviewed at 1440 px and 390 px.
 - The check created 2 sessions and 6 synthetic alerts.
 
+## Stage 13: Alert composer connected to the event API (2026-10-05)
+
+**Before starting.** Clean tree at `737a629`. Findings that shaped the design:
+- The previous UI kept the unsent key only in memory, so a reload lost it.
+- `GET /v1/events` returns each event's `idempotencyKey`, so an unconfirmed send can be *confirmed by reading* (never
+  disproved).
+- Keys are scoped per session.
+- The browser's `maxlength` counts UTF-16 units, while the API counts Unicode characters.
+
+**Decisions** (details in `docs/frontend-notes.md` → *Composer*)
+- **Three sample cards**, labelled *Sample alerts*, as given: Service request / Equipment notification / Team update.
+  They use `demo.notification` with `title` + `message` only. The first is preselected so a visitor can send without
+  typing, and choosing a sample never touches the receiver.
+- Editable fields with live character counts and validation that matches the server (no `maxlength`). A
+  text-node-only message-card preview, and a collapsed *View request JSON* (token shown only as a placeholder).
+- **One *Send alert* button.** It starts a session only when there is none, and only on that click. Its order is:
+  1. validate
+  2. disable the button synchronously
+  3. save `{key, body}` to `sessionStorage` (`irs.pendingSubmit`)
+  4. POST
+- Answers:
+  - 202/200 shows the alert in the journey at once, from the response, with "Delivery may still be pending".
+  - 4xx settles the key. 401 explains that nothing was saved, and a new session comes only on the next click.
+    Quota errors give a plain message, plus a *Start a fresh session* button for `event_limit_reached`.
+  - Network failure, timeout, or 5xx → "We could not confirm whether your alert was accepted" with *Check again*
+    (same key and payload) and *Stop checking*.
+- **While unconfirmed:** *Send alert* and *Start fresh session* are paused, and the draft is kept separately. A
+  reload restores the uncertain state without resending. A routine refresh may confirm the alert by finding its key
+  in the list.
+- **No backend change, no API change, no new dependency.** No visual effect delays the request.
+- The receiver is shown as one line in the composer. The four mode choices moved below the experiments (*Set the
+  test receiver yourself*) until Stage 16. The Stage 12 *Try another example* button and the separate *Start demo
+  session* button were removed; *Send alert* covers both.
+
+**Verification (local, worker on, `MAX_EVENTS_PER_SESSION=8` to reach the quota; real API data, headless Edge)**
+- `npm test`: 131/131, `skipped 0`.
+- **Stage 13 browser suite: 58/58.**
+  - **Preset send:** sample 1 preselected; fields filled; the first click created exactly 1 session and sent 1 POST;
+    "Alert accepted … may still be pending"; the journey shows the alert at once. Switching samples made 0 receiver
+    changes.
+  - **Edited message:** a message containing `<b>` and `<img onerror>` showed as plain text in the preview (no
+    elements created, no script ran) and was stored exactly as typed, including a line break. The preview was
+    marked "edited".
+  - **Validation:** blank title → error and focus on the field; 101 characters → blocked, counter flagged. Invalid
+    drafts sent 0 requests. 100 emoji counted as 100 and were accepted by the server.
+  - **Rapid double click:** with the POST held at the network layer, 3 scripted clicks + a double click + Enter
+    produced **exactly 1 request**. The button stayed disabled with "Sending…".
+    - A first version of this check had the last click land after a fast local answer, which is a legitimate
+      second send, so it failed once. It was rewritten to hold the request; the behaviour itself didn't change.
+  - **Ambiguous failure, answer lost after the server processed it** (DevTools `Fetch` failed the response; the
+    server had answered 202):
+    - The "could not confirm" message appeared, with *Send alert* paused.
+    - The key and payload were in `sessionStorage`.
+    - Editing the draft didn't change the saved submission.
+    - *Check again* sent the **same key and payload** → "Confirmed: your alert was accepted", and exactly one
+      alert exists. The edited draft was kept.
+  - **Request lost before reaching the server, then reload:** the uncertain state came back after the reload with
+    the same key, **0 automatic resends** in 2.5 s, and the request view showed the unconfirmed request. *Check
+    again* (same key) → 202 "had not arrived, so this check sent it", and exactly one alert.
+  - **Answer lost, then reload:** confirmed by reading the list, 0 resends, one alert.
+  - **Expired session:**
+    - On load: explained, 0 sessions created without a click; one click → 1 session + accepted.
+    - During a send: the request's Authorization header was swapped for a never-issued token, which the API
+      answers like an expired one. Result: "Your demo session has ended. Nothing was saved", 0 automatic sessions,
+      no unconfirmed state left; the next click → 1 session + accepted.
+  - **Quota:** "reached its limit of alerts" plus a *Start a fresh session* button, with 0 sessions created
+    automatically.
+  - No horizontal scroll at 1440 and 390 px, composer before journey on phones, axe-core 0 violations on desktop
+    and mobile, no script errors.
+- **Stage 12 suite, updated for the new session flow:** 35/36. The only "failure" is the browser's own log of the
+  deliberate offline and 401 requests, as before.
+- Screenshots reviewed. Fixed: the receiver label wrapped into three ragged lines with the icon alone (now an
+  icon + text grid), and a missing space in its text ("receiver:Works").
+
+**Not verified**
+- The 90 s request timeout itself (too slow to wait for). It uses the same code path as the network failure that was
+  tested.
+- Real screen readers; browsers other than Chromium-based Edge; real phones.
+- The quota on Render (100 per session there; tested locally with 8).
+
+

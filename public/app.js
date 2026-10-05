@@ -8,7 +8,14 @@ const MAX_BACKOFF_MS = 30000;       // longest wait between refreshes after API 
 const SLOW_NOTICE_MS = 4000;        // after this, explain that the server may be waking up
 const REQUEST_TIMEOUT_MS = 90000;   // a request is only treated as failed after this
 const ACTIVE_STATES = new Set(['pending', 'retry_scheduled', 'in_progress']);
-const KEYS = { token: 'irs.token', selected: 'irs.selectedEvent', replayKeys: 'irs.replayKeys' };
+const KEYS = {
+  token: 'irs.token',
+  selected: 'irs.selectedEvent',
+  replayKeys: 'irs.replayKeys',
+  pending: 'irs.pendingSubmit', // { key, body, status, lastError }: the submission whose result is not yet known
+  draft: 'irs.draft',           // { preset, title, message }: what is in the composer
+};
+const LIMITS = { title: 100, message: 500 }; // same limits as the API (counted in Unicode characters)
 
 // --- small helpers -----------------------------------------------------------
 
@@ -45,6 +52,9 @@ const ICON_PATHS = {
   offline: ['M3 3l18 18', 'M8.5 8.8A11 11 0 0 0 2.5 12', 'M12 5a11 11 0 0 1 9.5 7', 'M8 15.5a6 6 0 0 1 7.5-.8', 'M12 19.5v.2'],
   replay: ['M4 12a8 8 0 1 0 2.4-5.7', 'M4 4v4.5h4.5', 'M10.5 9.5v5l4-2.5z'],
   hourglass: ['M7 3h10', 'M7 21h10', 'M8 3c0 5 8 5 8 9s-8 4-8 9', 'M16 3c0 5-8 5-8 9s8 4 8 9'],
+  bell: ['M6 16v-5a6 6 0 1 1 12 0v5l1.5 2h-15z', 'M10 20.5a2 2 0 0 0 4 0'],
+  wrench: ['M5 19l8-8', 'M12.5 6.5a4 4 0 0 1 5.5-1.5l-2.5 2.5 1 2 2 1 2.5-2.5a4 4 0 0 1-5.5 5.5'],
+  list: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M4.5 6h.01', 'M4.5 12h.01', 'M4.5 18h.01'],
 };
 function icon(name, extraClass = '') {
   const NS = 'http://www.w3.org/2000/svg';
@@ -78,13 +88,18 @@ const secondsUntil = (iso) => Math.max(0, Math.round((new Date(iso) - Date.now()
 const shortId = (id) => id.slice(0, 8);
 const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-// Synthetic, non-clinical examples that fit the API payload (a title and a message only).
-const EXAMPLES = [
-  ['Practice alert: storage almost full', 'Synthetic test: the demo storage volume is at 92% of its practice limit.'],
-  ['Practice alert: nightly report ready', 'Synthetic test: the nightly practice report finished and is ready to read.'],
-  ['Practice alert: door sensor check', 'Synthetic test: the demo door sensor reported an open door during a drill.'],
-  ['Practice alert: maintenance window', 'Synthetic test: a practice maintenance window starts at 22:00 tonight.'],
+// Sample alerts. Each fits the API's only event type (demo.notification) and its two fields:
+// a title and a message. No urgency, recipients or routing exist in the API, so none are implied.
+const PRESETS = [
+  { id: 'service', icon: 'bell', title: 'Service request', message: 'Synthetic room A needs assistance.' },
+  { id: 'equipment', icon: 'wrench', title: 'Equipment notification', message: 'Demo device reports a maintenance issue.' },
+  { id: 'team', icon: 'list', title: 'Team update', message: 'A sample task is ready for review.' },
 ];
+const chars = (text) => [...text].length;
+
+function readJson(key) {
+  try { return JSON.parse(storage.get(key) ?? 'null'); } catch { return null; }
+}
 
 // --- state -------------------------------------------------------------------
 
@@ -101,7 +116,15 @@ const state = {
   techOpen: false,         // the journey's technical view stays open across refreshes
   receiver: null,
   summary: null,
-  pendingSubmit: null,     // { key, body } kept until the server answers, so a retry reuses the key
+  // The submission whose outcome is unknown, saved before sending. If the page is reloaded while it was being
+  // sent, nobody knows whether it arrived, so it comes back as 'uncertain'. It is never resent automatically.
+  pendingSubmit: (() => {
+    const saved = readJson(KEYS.pending);
+    return saved?.key && saved.body ? { ...saved, status: 'uncertain' } : null;
+  })(),
+  submitting: false,       // a send or check is in flight: the button is disabled
+  preset: null,            // index of the chosen sample alert (null after an experiment fills the fields)
+  submitNote: null,        // the result of the last send, shown under the composer
   poll: { timer: null, running: false, again: false, failures: 0, lastError: null },
   slowRequests: 0,
   service: { status: 'checking', detail: null }, // checking | ready | not_ready | unreachable | offline
@@ -242,6 +265,17 @@ async function refresh() {
   state.hasMoreEvents = Boolean(events.data.nextCursor);
   state.receiver = receiver.data;
   if (summary.status === 200) state.summary = summary.data;
+  // An unconfirmed submission can be confirmed by reading: if an alert with its Idempotency-Key is in the
+  // list, it was accepted. Not finding it proves nothing, so that never resolves anything.
+  const pending = state.pendingSubmit;
+  const found = pending?.status === 'uncertain' && state.events.find((e) => e.idempotencyKey === pending.key);
+  if (found) {
+    setPending(null);
+    selectEvent(found.id);
+    state.submitNote = h('div', { class: 'notice is-done' }, h('strong', {}, 'Confirmed: your alert was accepted. '),
+      'It appears in your recent alerts, so there is nothing to check again. Delivery may still be pending.',
+      techLine('found by reading GET /v1/events', `Idempotency-Key ${pending.key}`));
+  }
   if (state.selectedId) await loadDetail(state.selectedId);
   render();
 }
@@ -282,7 +316,13 @@ function sessionExpired() {
   state.receiver = null;
   state.summary = null;
   selectEvent(null);
-  state.sessionNote = 'Your demo session has ended or is no longer valid. Start a new one to continue.';
+  state.sessionNote = 'Your demo session has ended or is no longer valid. Sending an alert starts a new one.';
+  if (state.pendingSubmit) {
+    // Idempotency-Keys belong to one session, so the unconfirmed alert can't be checked from a new one.
+    setPending(null);
+    state.submitNote = h('div', { class: 'notice is-waiting' }, h('strong', {}, 'Your demo session has ended. '),
+      'An alert was still unconfirmed. It belonged to that session, so it can no longer be checked.');
+  }
   render();
 }
 
@@ -339,62 +379,178 @@ function selectEvent(eventId) {
   state.detailNote = null;
 }
 
-function fillExample() {
-  const current = $('title').value;
-  const choices = EXAMPLES.filter(([title]) => title !== current);
-  const [title, message] = choices[Math.floor(Math.random() * choices.length)];
-  $('title').value = title;
-  $('message').value = message;
+// --- composer --------------------------------------------------------------------
+
+const draftBody = () => ({ type: 'demo.notification', payload: { title: $('title').value, message: $('message').value } });
+
+function saveDraft() {
+  storage.set(KEYS.draft, JSON.stringify({ preset: state.preset, title: $('title').value, message: $('message').value }));
+}
+
+// Choosing a sample fills the editable fields. It never changes the receiver.
+function choosePreset(index) {
+  state.preset = index;
+  $('title').value = PRESETS[index].title;
+  $('message').value = PRESETS[index].message;
+  for (const id of ['title', 'message']) showFieldError(id, null);
+  saveDraft();
+  renderComposer();
+}
+
+// The draft survives a reload, separately from any unconfirmed submission.
+function restoreDraft() {
+  const saved = readJson(KEYS.draft);
+  if (saved && typeof saved.title === 'string' && typeof saved.message === 'string') {
+    state.preset = Number.isInteger(saved.preset) && PRESETS[saved.preset] ? saved.preset : null;
+    $('title').value = saved.title;
+    $('message').value = saved.message;
+  } else {
+    choosePreset(0); // a first-time visitor can send without typing
+  }
+}
+
+// Same rules as the API: required, not blank, length in Unicode characters, no control characters
+// (the message may contain line breaks).
+function fieldProblem(id, value) {
+  if (value.trim() === '') return 'Please fill this in.';
+  if (chars(value) > LIMITS[id]) return `Please keep it to ${LIMITS[id]} characters or fewer.`;
+  if (id === 'title' && /[\u0000-\u001F\u007F]/.test(value)) return 'Please use a single line without special characters.';
+  if (id === 'message' && /[\u0000-\u0009\u000B-\u001F\u007F]/.test(value)) return 'Please remove special characters (line breaks are fine).';
+  return null;
+}
+
+function showFieldError(id, problem) {
+  const error = $(`${id}-error`);
+  error.textContent = problem ?? '';
+  error.hidden = !problem;
+  $(id).setAttribute('aria-invalid', problem ? 'true' : 'false');
 }
 
 function validateForm() {
-  let ok = true;
-  for (const [id, max] of [['title', 100], ['message', 500]]) {
-    const value = $(id).value;
-    const error = $(`${id}-error`);
-    let problem = null;
-    if (value.trim() === '') problem = 'Please fill this in.';
-    else if ([...value].length > max) problem = `Please keep it to ${max} characters or fewer.`;
-    else if (id === 'title' && /[\u0000-\u001F\u007F]/.test(value)) problem = 'Please use a single line without special characters.';
-    error.textContent = problem ?? '';
-    error.hidden = !problem;
-    $(id).setAttribute('aria-invalid', problem ? 'true' : 'false');
-    ok &&= !problem;
+  let firstInvalid = null;
+  for (const id of ['title', 'message']) {
+    const problem = fieldProblem(id, $(id).value);
+    showFieldError(id, problem);
+    if (problem && !firstInvalid) firstInvalid = id;
   }
-  return ok;
+  if (firstInvalid) $(firstInvalid).focus();
+  return !firstInvalid;
 }
 
-// Submits an event. The Idempotency-Key is reused if the previous attempt got no answer.
-async function submitEvent(title, message) {
-  const body = { type: 'demo.notification', payload: { title, message } };
-  const same = state.pendingSubmit && JSON.stringify(state.pendingSubmit.body) === JSON.stringify(body);
-  const key = same ? state.pendingSubmit.key : crypto.randomUUID();
-  state.pendingSubmit = { key, body };
-  const result = $('submit-result');
-  result.replaceChildren(h('p', { class: 'hint' }, 'Sending to the sandbox…'));
+function setPending(pending) {
+  state.pendingSubmit = pending;
+  storage.set(KEYS.pending, pending ? JSON.stringify(pending) : null);
+}
+
+// "Send alert": validate, start a session only if there is none (and only because of this click),
+// save the key and payload, then send once. A new send always gets a new Idempotency-Key.
+async function sendDraft() {
+  if (state.submitting || state.pendingSubmit) return null;
+  if (!validateForm()) return null;
+  state.submitting = true; // disables the button before anything is awaited, so double clicks do nothing
+  state.submitNote = null;
+  renderComposer();
   try {
-    const { status, data } = await api('POST', '/v1/events', { body, headers: { 'Idempotency-Key': key } });
-    state.pendingSubmit = null; // the server answered; this key is settled
-    if (status === 202) {
-      result.replaceChildren(h('div', { class: 'notice is-done' },
-        h('strong', {}, 'Alert accepted. '),
-        'The sandbox saved it and will now deliver it to the test receiver. Follow its journey.',
-        techLine('HTTP 202 Accepted', 'stored and queued, not yet delivered')));
-      selectEvent(data.eventId);
-      await pollNow();
-      return data.eventId;
+    if (!state.token) {
+      if (!(await startSession())) {
+        state.submitNote = h('div', { class: 'notice is-waiting' }, h('strong', {}, 'Could not start a demo session. '),
+          state.sessionNote ?? '', ' Your alert was not sent.');
+        state.sessionNote = null;
+        return null;
+      }
     }
-    result.replaceChildren(status === 200
-      ? h('div', { class: 'notice is-idle' }, h('strong', {}, 'Already sent. '),
-        'This exact alert was accepted earlier, so nothing new was created.',
-        techLine('HTTP 200', 'Idempotent-Replayed: true'))
-      : errorBox(status, data));
-    return status === 200 ? data.eventId : null;
+    setPending({ key: crypto.randomUUID(), body: draftBody(), status: 'sending' }); // saved before the request
+    renderComposer();
+    return await sendPending(false);
+  } finally {
+    state.submitting = false;
+    render();
+  }
+}
+
+// "Check again": the same key and the same payload as the unconfirmed submission. If the first
+// request arrived, the API answers 200 with that alert; if it did not, this request creates it once.
+async function checkAgain() {
+  if (state.submitting || !state.pendingSubmit) return;
+  state.submitting = true;
+  setPending({ ...state.pendingSubmit, status: 'sending' });
+  state.submitNote = null;
+  renderComposer();
+  try {
+    await sendPending(true);
+  } finally {
+    state.submitting = false;
+    render();
+  }
+}
+
+function stopChecking() {
+  setPending(null);
+  state.submitNote = h('div', { class: 'notice is-idle' }, h('strong', {}, 'Stopped checking. '),
+    'If that alert was accepted, it will still appear in Recent alerts.');
+  render();
+}
+
+async function sendPending(isCheck) {
+  const pending = state.pendingSubmit;
+  const uncertain = (reason) => {
+    if (state.pendingSubmit === pending) setPending({ ...pending, status: 'uncertain', lastError: reason });
+    return null;
+  };
+  let res;
+  try {
+    res = await api('POST', '/v1/events', { body: pending.body, headers: { 'Idempotency-Key': pending.key } });
   } catch (err) {
-    result.replaceChildren(h('div', { class: 'notice is-waiting' }, h('strong', {}, 'No reply from the service. '), err.message,
-      ' Your alert may or may not have been saved. Pressing Send alert again is safe: it reuses the same request identifier, so it cannot create a second copy.'));
+    return uncertain(err.message); // timeout or network failure after sending: the outcome is unknown
+  }
+  if (res.status >= 500) return uncertain(`The service answered HTTP ${res.status}.`);
+
+  // Any other answer settles this key.
+  if (state.pendingSubmit === pending) setPending(null);
+  const { status, data } = res;
+  if (status === 202 || status === 200) {
+    showAccepted(data, status, isCheck);
+    return data.eventId;
+  }
+  if (status === 401) {
+    state.submitNote = h('div', { class: 'notice is-waiting' }, h('strong', {}, 'Your demo session has ended. '),
+      isCheck
+        ? 'The unconfirmed alert belonged to that session, so it can no longer be checked.'
+        : 'Nothing was saved. Press Send alert to start a new session and send it.',
+      techLine('HTTP 401', data?.error));
     return null;
   }
+  if (status === 422 && Array.isArray(data?.details)) {
+    for (const d of data.details) {
+      const id = d.field === 'payload.title' ? 'title' : d.field === 'payload.message' ? 'message' : null;
+      if (id) showFieldError(id, `This ${d.issue}.`);
+    }
+  }
+  const box = errorBox(status, data);
+  if (data?.error === 'event_limit_reached') {
+    box.append(h('button', { type: 'button', class: 'btn-link', onclick: () => startSession() }, 'Start a fresh session'));
+  }
+  state.submitNote = box;
+  return null;
+}
+
+// Shows the accepted alert at once, from the API's own answer; later refreshes replace it.
+function showAccepted(data, status, isCheck) {
+  if (!state.events.some((e) => e.id === data.event.id)) state.events = [data.event, ...state.events];
+  selectEvent(data.eventId);
+  state.submitNote = h('div', { class: 'notice is-done' },
+    status === 200 && isCheck
+      ? [h('strong', {}, 'Confirmed: your alert was accepted. '),
+        'The earlier request did reach the sandbox. Checking again did not create a second alert.']
+      : status === 200
+        ? [h('strong', {}, 'Already accepted. '), 'This exact request was accepted earlier, so nothing new was created.']
+        : [h('strong', {}, 'Alert accepted. '),
+          isCheck ? 'The earlier request had not arrived, so this check sent it. There is still only one alert. ' : '',
+          'Delivery may still be pending: the journey shows each step as it happens.'],
+    techLine(`HTTP ${status}`, status === 200 ? 'Idempotent-Replayed: true' : 'stored and queued, not yet delivered',
+      `Idempotency-Key ${data.event.idempotencyKey}`));
+  render();
+  pollNow();
 }
 
 async function setReceiverMode(mode) {
@@ -515,12 +671,18 @@ const SCENARIOS = [
 async function runScenario(scenario, button) {
   button.disabled = true;
   try {
+    if (state.pendingSubmit || state.submitting) {
+      state.submitNote = h('div', { class: 'notice is-waiting' }, 'Please resolve the unconfirmed alert in the composer first.');
+      renderComposer();
+      return;
+    }
     if (!state.token && !(await startSession())) return;
     if (!(await setReceiverMode(scenario.mode))) return;
-    const message = 'Synthetic data for a sandbox experiment.';
+    state.preset = null;
     $('title').value = scenario.eventTitle;
-    $('message').value = message;
-    const eventId = await submitEvent(scenario.eventTitle, message);
+    $('message').value = 'Synthetic data for a sandbox experiment.';
+    saveDraft();
+    const eventId = await sendDraft();
     if (eventId) {
       const box = $('journey').getBoundingClientRect();
       if (box.top < 0 || box.top > window.innerHeight * 0.6) {
@@ -644,8 +806,7 @@ function render() {
   keepFocus($('event-list'), renderEvents);
   keepFocus($('detail'), renderDetail);
   renderSummary();
-  const signedIn = Boolean(state.token);
-  for (const id of ['submit-event', 'new-example']) $(id).disabled = !signedIn;
+  renderComposer();
 }
 
 function setService(status, detail = null) {
@@ -688,13 +849,11 @@ function renderSession() {
     children.push(h('div', { class: 'session-box' },
       h('p', { class: 'status-pill is-done' }, icon('check'), 'Demo session active'),
       state.expiresAt ? h('p', { class: 'hint' }, `until ${new Date(state.expiresAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}`) : null,
-      h('button', { type: 'button', class: 'btn-link small', onclick: () => startSession(), disabled: state.creatingSession },
-        state.creatingSession ? 'Starting…' : 'Start fresh session')));
-  } else {
-    children.push(h('div', { class: 'session-start' },
-      h('p', {}, 'Start a private demo session to send alerts. No sign-up: it is anonymous and ends after 24 hours.'),
-      h('button', { type: 'button', class: 'btn btn-primary', onclick: () => startSession(), disabled: state.creatingSession },
-        state.creatingSession ? 'Starting…' : (state.sessionNote ? 'Start a new session' : 'Start demo session'))));
+      // A fresh session would make an unconfirmed alert impossible to check, so wait until it is resolved.
+      h('button', {
+        type: 'button', class: 'btn-link small', onclick: () => startSession(),
+        disabled: state.creatingSession || state.submitting || Boolean(state.pendingSubmit),
+      }, state.creatingSession ? 'Starting…' : 'Start fresh session')));
   }
   area.replaceChildren(...children);
 }
@@ -718,6 +877,89 @@ function renderReceiver() {
   else if (state.receiver && !$('receiver-status').textContent) {
     $('receiver-status').textContent = `Currently: ${MODE_INFO[current]?.[0] ?? current}.`;
   }
+}
+
+function renderComposer() {
+  // Sample cards: created once, then only updated, so refreshes never move keyboard focus.
+  const list = $('preset-list');
+  if (!list.firstChild) {
+    list.append(...PRESETS.map((p, i) => {
+      const input = h('input', { type: 'radio', name: 'preset', value: p.id, id: `preset-${p.id}` });
+      input.addEventListener('change', () => choosePreset(i));
+      return h('label', { for: `preset-${p.id}`, class: 'preset' }, input,
+        icon(p.icon, 'preset-icon'),
+        h('span', { class: 'preset-text' }, h('strong', {}, p.title), h('span', {}, p.message)));
+    }));
+  }
+  list.querySelectorAll('input').forEach((input, i) => { input.checked = state.preset === i; });
+
+  const title = $('title').value;
+  const message = $('message').value;
+  for (const [id, value] of [['title', title], ['message', message]]) {
+    const counter = $(`${id}-count`);
+    const n = chars(value);
+    counter.textContent = `${n} of ${LIMITS[id]} characters`;
+    counter.classList.toggle('over', n > LIMITS[id]);
+  }
+
+  const preset = PRESETS[state.preset];
+  const edited = !preset || preset.title !== title || preset.message !== message;
+  $('preview').replaceChildren(
+    h('p', { class: 'message-card-tag' }, icon(preset?.icon ?? 'bell'), preset && !edited ? 'Sample alert' : 'Sample alert, edited'),
+    h('p', { class: 'message-card-title' }, title.trim() ? title : '(no title yet)'),
+    h('p', { class: 'message-card-body' }, message.trim() ? message : '(no message yet)'));
+
+  const pending = state.pendingSubmit;
+  // While an alert is unconfirmed, show the exact request that "Check again" repeats.
+  $('request-json').textContent = [
+    pending ? '# The unconfirmed request, repeated exactly by "Check again"' : '# What "Send alert" will send',
+    'POST /v1/events',
+    'Content-Type: application/json',
+    'Authorization: Bearer <your demo token, never shown>',
+    `Idempotency-Key: ${pending ? pending.key : '<a new random key, created when you press Send alert>'}`,
+    '',
+    JSON.stringify(pending ? pending.body : draftBody(), null, 2),
+  ].join('\n');
+
+  const button = $('submit-event');
+  button.disabled = state.submitting || Boolean(pending);
+  const firstSend = state.submitting && !pending?.lastError; // not a "Check again"
+  button.textContent = state.creatingSession ? 'Starting session…' : firstSend ? 'Sending…' : 'Send alert';
+  $('send-hint').textContent = pending
+    ? 'Send alert is paused until the unconfirmed alert below is resolved.'
+    : state.token ? '' : 'Sending starts a private demo session: anonymous, no sign-up, and it ends after 24 hours.';
+
+  renderPending();
+  $('submit-result').replaceChildren(...[state.submitNote].filter(Boolean));
+
+  const mode = state.token ? state.receiver?.mode : 'success';
+  $('receiver-label').replaceChildren(icon('inbox'),
+    h('span', {}, 'Test receiver: ', h('strong', {}, MODE_INFO[mode]?.[0] ?? 'checking…'),
+      state.token ? '' : ' (the default for a new session)',
+      h('span', { class: 'hint receiver-hint' }, 'Experiments below can change this.')));
+}
+
+// The unconfirmed submission, shown apart from the draft so editing the draft never changes it.
+function renderPending() {
+  const area = $('pending-area');
+  const pending = state.pendingSubmit;
+  if (!pending || (pending.status === 'sending' && !pending.lastError)) {
+    area.replaceChildren();
+    return;
+  }
+  const checking = state.submitting;
+  const draftDiffers = JSON.stringify(pending.body) !== JSON.stringify(draftBody());
+  area.replaceChildren(h('div', { class: 'notice is-waiting pending', role: 'alert' },
+    h('p', {}, h('strong', {}, checking ? 'Checking…' : 'We could not confirm whether your alert was accepted.')),
+    h('p', {}, 'The connection failed or timed out after the alert was sent. ',
+      'Check again repeats the exact same request, so it cannot create a second alert.'),
+    h('p', { class: 'pending-alert' }, 'Unconfirmed alert: ', h('q', {}, pending.body.payload.title)),
+    draftDiffers ? h('p', { class: 'hint' }, 'Your edited draft is kept separately and is not affected.') : null,
+    h('div', { class: 'button-row' },
+      h('button', { type: 'button', class: 'btn btn-primary', 'data-focus-key': 'check-again', onclick: () => checkAgain(), disabled: checking },
+        checking ? 'Checking…' : 'Check again'),
+      h('button', { type: 'button', class: 'btn btn-quiet', onclick: () => stopChecking(), disabled: checking }, 'Stop checking')),
+    techLine(pending.lastError, `Idempotency-Key ${pending.key}`)));
 }
 
 function renderEvents() {
@@ -924,21 +1166,20 @@ async function checkStatus() {
 // --- wiring ------------------------------------------------------------------------
 
 $('check-status').addEventListener('click', checkStatus);
-$('new-example').addEventListener('click', fillExample);
+for (const id of ['title', 'message']) {
+  $(id).addEventListener('input', () => {
+    // Re-check a field only once it is showing an error, so typing is not interrupted.
+    if ($(id).getAttribute('aria-invalid') === 'true') showFieldError(id, fieldProblem(id, $(id).value));
+    saveDraft();
+    renderComposer();
+  });
+}
 $('event-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  if (!state.token) return;
-  if (!validateForm()) return;
-  const button = $('submit-event');
-  button.disabled = true;
-  try {
-    await submitEvent($('title').value, $('message').value);
-  } finally {
-    button.disabled = !state.token;
-  }
+  await sendDraft();
 });
 
-fillExample();
+restoreDraft();
 renderScenarios();
 renderService();
 render();

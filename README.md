@@ -2,7 +2,7 @@
 
 A learning sandbox that accepts synthetic JSON events (shown in the browser as practice *alerts*), persists them, and delivers them
 reliably to a controlled mock receiver.
-**Current stage: 12. Visitor-facing frontend: visual foundation ("Follow an Alert").**
+**Current stage: 13. Visitor-facing frontend: alert composer connected to the event API.**
 
 | Want to… | Go to |
 |---|---|
@@ -219,7 +219,7 @@ curl.exe -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/events?limit=5"         
 Remove-Item event.json; Remove-Variable TOKEN
 ```
 
-The landing page has the same flow: **Start demo session**, **Send alert**, and, in the alert journey, **Send an exact copy**.
+The landing page has the same flow: **Send alert** (which starts a session if needed) and, in the alert journey, **Send an exact copy**. If an answer is lost, **Check again** repeats the same key and payload.
 
 ## Browser UI: Follow an Alert
 
@@ -230,10 +230,10 @@ JavaScript, HTML, CSS and inline SVG; no framework or build step. Design notes a
 | Area | What it shows |
 |---|---|
 | Header | *Follow an Alert*, a **Demo** label, service availability (`/health` + `/ready`; *You are offline* only for the visitor's own connection), and a *Technical details* link |
-| Compose an alert (left) | Start / restart the anonymous session; alert title and message with a synthetic example (*Send alert*); how the test receiver responds (the four modes, in plain words, per session) |
+| Compose an alert (left) | Three **sample alerts** (Service request, Equipment notification, Team update) that fill an editable title and message with live character counts, a message-card preview, *View request JSON*, and one **Send alert** button (it starts the anonymous session when needed). If the answer is lost: *We could not confirm whether your alert was accepted* with **Check again** (same Idempotency-Key and payload). Also shows the current test receiver as one line |
 | Alert journey (right, navy) | Three steps for the selected alert: **1 · Sandbox** (accepted), **2 · Delivery** (*Waiting to send*, *Sending*, *Trying again*, *Delivery confirmed*, *Delivery stopped*, with every try), **3 · Receiver** (*Receiver processed alert*, with repeats recognized). Actions: *Send an exact copy* (same Idempotency-Key and payload) and *Deliver again* (manual replay, only after delivery stopped). A collapsible **technical view** shows IDs, status codes and the raw API JSON |
 | Recent alerts | The 20 newest alerts with their delivery state; selecting one shows its journey |
-| Try an experiment | Three cards; each sets the receiver mode and sends one alert |
+| Try an experiment | Three cards; each sets the receiver mode and sends one alert. Below them, *Set the test receiver yourself* holds the four modes (per session) |
 | Technical details | Service status with versions, session summary and delivery-time metric, how the token is stored, API docs links |
 
 Delivery confirmation (the receiver acknowledged with a 2xx) and receiver processing (the receipt) are shown as separate

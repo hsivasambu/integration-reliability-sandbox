@@ -27,6 +27,52 @@ same strict CSP (`script-src 'self'`, `style-src 'self'`, no inline code).
 4. Three experiment cards.
 5. Technical details: service check with versions, session summary, token storage note, API docs links.
 
+## Composer (Stage 13)
+
+- **Sample alerts.** Three selectable cards (Service request, Equipment notification, Team update). Each one fills
+  the editable title and message. Every sample uses the API's only type, `demo.notification`, and its only fields,
+  `title` and `message`. No urgency, recipients or routing are implied, because none exist. The first sample is
+  selected by default, so a visitor can send without typing. Choosing a sample never changes the receiver.
+- **Limits** match the server: title 1–100 and message 1–500 *Unicode characters*, not blank, no control
+  characters (line breaks allowed in the message). There's no `maxlength`, because the browser counts UTF-16 units
+  and would cut emoji short. A live counter turns red instead, and validation blocks the send.
+- **Preview.** A small message card, built with text nodes only.
+- **View request JSON** (collapsed). It shows the method, path, headers (the token is shown only as a placeholder)
+  and body. While an alert is unconfirmed, it shows that request instead of the draft.
+- **One primary action, *Send alert*.** If there's no session, this click starts one. Sessions are never created
+  any other way, and never automatically after a 401 or a quota error.
+- **The draft** (`irs.draft`) is kept in `sessionStorage` and restored on reload.
+
+### Sending and the unconfirmed state
+
+1. *Send alert* validates first, then disables itself **before** anything is awaited, so double clicks or Enter
+   can't send twice.
+2. It creates a **new** Idempotency-Key and saves `{ key, body, status: 'sending' }` to `sessionStorage`
+   (`irs.pendingSubmit`) **before** the POST.
+3. Then it handles the answer:
+   - **202/200** → accepted. The alert from the response is shown in the journey at once, with "Delivery may
+     still be pending". The saved submission is cleared.
+   - **A 4xx answer** → settled (nothing was stored). Validation details go to the fields. On 401 the session has
+     ended: the page explains that nothing was saved, and a new session starts only on the next click.
+     `event_limit_reached` offers *Start a fresh session* as a button.
+   - **Timeout, network failure, or a 5xx** → *uncertain*: "We could not confirm whether your alert was
+     accepted." *Check again* repeats the **same key and the same payload**. The API then answers 200 if the first
+     request arrived, or 202 if it didn't, so there is one alert either way.
+4. While an alert is uncertain:
+   - *Send alert* is paused, with the reason shown.
+   - The draft can still be edited, and it's kept separately from the unconfirmed submission.
+   - *Stop checking* forgets the submission and explains that an accepted alert would still appear in Recent
+     alerts.
+   - *Start fresh session* is disabled, because Idempotency-Keys are scoped to a session.
+5. A reload during sending or uncertainty brings back the uncertain state. **Nothing is resent automatically.**
+6. A routine refresh can confirm the alert by *reading*: if `GET /v1/events` lists an alert with the saved key, it
+   was accepted. Not finding it proves nothing, so that never resolves the state.
+7. If the session ends while an alert is unconfirmed, the submission is dropped with an explanation, because it
+   can no longer be checked.
+
+The receiver mode is shown as one line ("Test receiver: Works normally"). The four mode choices moved under the
+experiments, into *Set the test receiver yourself*, until the experiment controls are redesigned (Stage 16).
+
 ## Visual tokens (`:root` in `app.css`)
 
 | Group | Tokens |

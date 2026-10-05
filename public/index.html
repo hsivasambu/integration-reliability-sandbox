@@ -38,27 +38,42 @@
         <div id="session-area" aria-live="polite"></div>
 
         <form id="event-form" novalidate>
-          <label for="title">Alert title <span class="hint">up to 100 characters</span></label>
-          <input id="title" name="title" maxlength="100" required aria-describedby="title-error" autocomplete="off">
+          <fieldset class="presets">
+            <legend>Sample alerts</legend>
+            <p class="hint">Pick one to start. You can edit the words before sending.</p>
+            <div id="preset-list" class="preset-list"></div>
+          </fieldset>
+
+          <label for="title">Alert title</label>
+          <input id="title" name="title" required aria-describedby="title-count title-error" autocomplete="off" spellcheck="true">
+          <p class="field-meta"><span id="title-count" class="counter"></span></p>
           <p id="title-error" class="field-error" hidden></p>
-          <label for="message">Alert message <span class="hint">up to 500 characters</span></label>
-          <textarea id="message" name="message" maxlength="500" rows="3" required aria-describedby="message-error"></textarea>
+
+          <label for="message">Alert message</label>
+          <textarea id="message" name="message" rows="3" required aria-describedby="message-count message-error"></textarea>
+          <p class="field-meta"><span id="message-count" class="counter"></span></p>
           <p id="message-error" class="field-error" hidden></p>
+
+          <div class="preview" role="group" aria-labelledby="preview-label">
+            <p id="preview-label" class="preview-label">Preview</p>
+            <div id="preview" class="message-card"></div>
+          </div>
+
+          <details id="request-details" class="tech">
+            <summary>View request JSON</summary>
+            <pre id="request-json"></pre>
+            <p class="hint">The demo token is sent in the Authorization header but is never shown on this page.
+               The Idempotency-Key lets the sandbox recognize a repeated request, so checking again can never create a second alert.</p>
+          </details>
+
           <div class="button-row">
             <button type="submit" id="submit-event" class="btn btn-primary">Send alert</button>
-            <button type="button" id="new-example" class="btn btn-quiet">Try another example</button>
           </div>
+          <p id="send-hint" class="hint"></p>
         </form>
+        <div id="pending-area"></div>
         <div id="submit-result" class="result" role="status" aria-live="polite"></div>
-
-        <form id="receiver-form" class="receiver-form">
-          <fieldset>
-            <legend>How should the test receiver respond?</legend>
-            <p class="hint">Applies to every alert in your session, including tries that are already waiting.</p>
-            <div id="receiver-modes" class="choice-list"></div>
-          </fieldset>
-        </form>
-        <p id="receiver-status" class="result small" role="status" aria-live="polite"></p>
+        <p id="receiver-label" class="receiver-label"></p>
       </section>
 
       <div class="journey-column">
@@ -81,6 +96,17 @@
       <h2 id="experiments-heading">Try an experiment</h2>
       <p class="hint">Each experiment sets how your test receiver responds and sends one alert. Then watch the journey.</p>
       <div id="scenarios" class="experiment-grid"></div>
+      <details class="card receiver-details">
+        <summary>Set the test receiver yourself</summary>
+        <form id="receiver-form">
+          <fieldset>
+            <legend>How should the test receiver respond?</legend>
+            <p class="hint">Applies to every alert in your session, including tries that are already waiting.</p>
+            <div id="receiver-modes" class="choice-list"></div>
+          </fieldset>
+        </form>
+        <p id="receiver-status" class="result small" role="status" aria-live="polite"></p>
+      </details>
     </section>
 
     <section id="technical" class="card technical" aria-labelledby="technical-heading" tabindex="-1">
