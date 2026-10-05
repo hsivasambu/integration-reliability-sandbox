@@ -607,3 +607,13 @@ second deploy. `/ready` 200.
       in Render logs on each deploy).
     - Single run, single machine. The numbers show behaviour (lease wait ≈ lease length; overdue work picked
       up within one poll), not performance.
+
+**Deployed check (2026-10-05, by Claude, after pushing 8ca83bd).** 0.10.0 was live with the worker in about 45 s; migration 008
+applied (`/ready` 200).
+- `/internal/ops/worker` returned 401 with no token and with a guessed token. That shows Render generated `OPS_TOKEN`.
+  I can't read that value, so the authorized ops call is for the owner to run.
+- `X-Request-Id` is present on responses.
+- `/v1/summary` after 3 events: 3 delivered, 3 attempts, receiver processed 3; delivery time n=3, median 766 ms,
+  max 1233 ms.
+- jsdom UI regression on Render: 27/27.
+- Not verified by me: the Render log stream itself (dashboard access), and the authorized ops response.
