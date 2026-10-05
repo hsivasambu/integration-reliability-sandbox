@@ -53,6 +53,15 @@ function loadConfig(env = process.env) {
     receiverSlowResponseMs: intSetting(env, 'RECEIVER_SLOW_RESPONSE_MS', 4000, 1000, 10_000, problems),
   };
 
+  // Background delivery worker.
+  config.workerEnabled = env.WORKER_ENABLED === 'true';
+  config.workerPollIntervalMs = intSetting(env, 'WORKER_POLL_INTERVAL_MS', 1000, 200, 60_000, problems);
+  config.deliveryLeaseMs = intSetting(env, 'DELIVERY_LEASE_MS', 15_000, 1000, 300_000, problems);
+  config.deliveryMaxAttempts = intSetting(env, 'DELIVERY_MAX_ATTEMPTS', 3, 1, 10, problems);
+  if (config.deliveryLeaseMs < config.deliveryTimeoutMs + 1000) {
+    problems.push('DELIVERY_LEASE_MS must be at least DELIVERY_TIMEOUT_MS + 1000, or healthy attempts would lose their lease');
+  }
+
   if (config.receiverSlowResponseMs <= config.deliveryTimeoutMs) {
     problems.push('RECEIVER_SLOW_RESPONSE_MS must be longer than DELIVERY_TIMEOUT_MS, or timeouts cannot be simulated');
   }

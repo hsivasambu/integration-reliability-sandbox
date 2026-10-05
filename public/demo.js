@@ -3,6 +3,7 @@ let token = null;
 // The key for the current submission; kept until the server gives a definite answer.
 let pendingKey = null;
 let lastRequest = null; // { key, body } of the most recent submission, for "send again"
+let lastStatusUrl = null; // delivery status URL of the most recent accepted event
 
 const $ = (id) => document.getElementById(id);
 
@@ -45,8 +46,9 @@ async function send(key, body) {
     pendingKey = null;
     $('idem-key').textContent = key;
     const lines = [`HTTP ${response.status}`];
-    if (response.status === 201) lines.push('Created: stored as PENDING. Not delivered (delivery is a later stage).');
+    if (response.status === 202) lines.push('Accepted: stored and queued for delivery. Not delivered yet. Click "Check delivery".');
     if (response.status === 200) lines.push('Repeat of an earlier request: original event returned, nothing new stored.');
+    if (data?.statusUrl) lastStatusUrl = data.statusUrl;
     lines.push(JSON.stringify(data, null, 2));
     $('event-result').textContent = lines.join('\n');
   } catch (err) {
@@ -89,7 +91,7 @@ $('refresh').addEventListener('click', async () => {
     return;
   }
   const items = data.data.map((e) => Object.assign(document.createElement('li'), {
-    textContent: `${e.payload.title} | status: ${e.status} (not delivered) | ${new Date(e.createdAt).toLocaleString()}`,
+    textContent: `${e.payload.title} | delivery: ${e.delivery.state} (${e.delivery.attemptCount} attempt(s)) | ${new Date(e.createdAt).toLocaleString()}`,
   }));
   if (items.length === 0) items.push(Object.assign(document.createElement('li'), { textContent: 'No events yet.' }));
   if (data.nextCursor) {
@@ -115,4 +117,23 @@ $('save-mode').addEventListener('click', async () => {
   if (!token) return void ($('receiver-status').textContent = 'Start a demo session first.');
   const { response, data } = await api('PUT', '/v1/receiver', { body: { mode: $('receiver-mode').value } });
   showReceiver(response, data);
+});
+
+$('check-delivery').addEventListener('click', async () => {
+  if (!lastStatusUrl) return void ($('event-result').textContent = 'Submit an event first.');
+  const { response, data } = await api('GET', lastStatusUrl);
+  if (response.status !== 200) {
+    $('event-result').textContent = `HTTP ${response.status}: ${data?.message ?? 'error'}`;
+    return;
+  }
+  const { delivery } = data;
+  const lines = [`Delivery state: ${delivery.state}`];
+  if (delivery.state === 'pending') lines.push('Waiting for the worker to pick it up.');
+  for (const a of delivery.attempts) {
+    lines.push(`Attempt ${a.attemptNumber}: ${a.outcome}`
+      + (a.responseStatus ? ` | HTTP ${a.responseStatus}` : '')
+      + (a.errorCategory ? ` | ${a.errorCategory}` : '')
+      + (a.durationMs !== null ? ` | ${a.durationMs} ms` : ''));
+  }
+  $('event-result').textContent = lines.join('\n');
 });

@@ -124,7 +124,7 @@ function receiverSettingsRoutes(pool) {
       availableModes: MODES,
       updatedAt: settings.updated_at,
       receivedCount: count,
-      notice: 'The receiver is not connected to event delivery yet. Submitted events stay pending.',
+      notice: 'The delivery worker sends your events here. Each event gets one attempt (no automatic retries yet).',
     };
   }
 

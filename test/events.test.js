@@ -46,17 +46,22 @@ describe('event API', { skip }, () => {
   beforeEach(async () => { token = await newSession(); });
 
   describe('POST /v1/events', () => {
-    test('creates a pending event and says it was not delivered', async () => {
+    test('accepts a new event with 202, a status URL, and a pending delivery created with it', async () => {
       const res = await submit(validEvent());
-      assert.equal(res.status, 201);
-      assert.equal(res.body.event.status, 'pending');
+      assert.equal(res.status, 202);
+      assert.equal(res.body.eventId, res.body.event.id);
+      assert.equal(res.body.statusUrl, `/v1/events/${res.body.eventId}/deliveries`);
+      assert.equal(res.body.event.delivery.state, 'pending');
+      assert.equal(res.body.event.status, undefined, 'no separate event status field');
       assert.equal(res.body.event.type, 'demo.notification');
       assert.deepEqual(res.body.event.payload, validEvent().payload);
-      assert.match(res.body.notice, /NOT been delivered/);
-      assert.equal(res.headers.location, `/v1/events/${res.body.event.id}`);
+      assert.match(res.body.notice, /not been delivered yet/);
+      assert.equal(res.headers.location, res.body.statusUrl);
 
-      const { rows } = await pool.query('SELECT session_id, status FROM events WHERE id = $1', [res.body.event.id]);
-      assert.equal(rows[0].status, 'pending');
+      const { rows } = await pool.query(
+        `SELECT e.session_id, d.state FROM events e JOIN deliveries d ON d.event_id = e.id WHERE e.id = $1`,
+        [res.body.eventId]);
+      assert.equal(rows[0].state, 'pending');
       assert.ok(rows[0].session_id, 'event is linked to its session');
     });
 
@@ -64,7 +69,7 @@ describe('event API', { skip }, () => {
       const res = await submit(validEvent({
         payload: { title: 'é'.repeat(100), message: `line one\n${'🙂'.repeat(491)}` },
       }));
-      assert.equal(res.status, 201);
+      assert.equal(res.status, 202);
     });
 
     test('rejects invalid payloads with a consistent 422 error listing every problem', async () => {
@@ -128,7 +133,7 @@ describe('event API', { skip }, () => {
       const repeat = await submit(
         { payload: { message: 'Synthetic message', title: 'Synthetic title' }, type: 'demo.notification' },
         { key: 'retry-1' });
-      assert.equal(first.status, 201);
+      assert.equal(first.status, 202);
       assert.equal(repeat.status, 200);
       assert.equal(repeat.headers['idempotent-replayed'], 'true');
       assert.deepEqual(repeat.body.event, first.body.event);
@@ -136,7 +141,7 @@ describe('event API', { skip }, () => {
     });
 
     test('same key with a different payload returns 409', async () => {
-      await submit(validEvent(), { key: 'reuse-1' }).expect(201);
+      await submit(validEvent(), { key: 'reuse-1' }).expect(202);
       const res = await submit(validEvent({ payload: { title: 'Different', message: 'Synthetic message' } }),
         { key: 'reuse-1' });
       assert.equal(res.status, 409);
@@ -144,17 +149,17 @@ describe('event API', { skip }, () => {
     });
 
     test('keys are scoped per session: another session can reuse the same key', async () => {
-      await submit(validEvent(), { key: 'shared-key' }).expect(201);
+      await submit(validEvent(), { key: 'shared-key' }).expect(202);
       const other = await newSession();
       const res = await submit(validEvent(), { key: 'shared-key', auth: other });
-      assert.equal(res.status, 201);
+      assert.equal(res.status, 202);
     });
 
     test('concurrent identical submissions create exactly one event', async () => {
       const results = await Promise.all(
         Array.from({ length: 10 }, () => submit(validEvent(), { key: 'race-1' })));
       const statuses = results.map((r) => r.status).sort();
-      assert.deepEqual(statuses, [200, 200, 200, 200, 200, 200, 200, 200, 200, 201]);
+      assert.deepEqual(statuses, [200, 200, 200, 200, 200, 200, 200, 200, 200, 202]);
       assert.equal(new Set(results.map((r) => r.body.event.id)).size, 1, 'all responses name one event');
       const { rows: [{ count }] } = await pool.query(
         "SELECT count(*)::int AS count FROM events WHERE idempotency_key = 'race-1'");
@@ -165,11 +170,11 @@ describe('event API', { skip }, () => {
       const results = await Promise.all(Array.from({ length: 6 }, (_, i) =>
         submit(validEvent({ payload: { title: `Title ${i}`, message: 'm' } }), { key: 'race-2' })));
       const statuses = results.map((r) => r.status).sort();
-      assert.deepEqual(statuses, [201, 409, 409, 409, 409, 409]);
+      assert.deepEqual(statuses, [202, 409, 409, 409, 409, 409]);
     });
 
     test('per-session cap returns 429, but repeats of existing keys still replay', async () => {
-      for (let i = 0; i < 5; i++) await submit(validEvent(), { key: `cap-${i}` }).expect(201);
+      for (let i = 0; i < 5; i++) await submit(validEvent(), { key: `cap-${i}` }).expect(202);
       const over = await submit(validEvent(), { key: 'cap-5' });
       assert.equal(over.status, 429);
       assert.equal(over.body.error, 'event_limit_reached');
@@ -179,7 +184,7 @@ describe('event API', { skip }, () => {
 
     test('concurrent submissions cannot exceed the per-session cap', async () => {
       const results = await Promise.all(Array.from({ length: 8 }, () => submit(validEvent())));
-      const created = results.filter((r) => r.status === 201).length;
+      const created = results.filter((r) => r.status === 202).length;
       assert.equal(created, 5);
       assert.equal(results.filter((r) => r.status === 429).length, 3);
     });
@@ -187,7 +192,7 @@ describe('event API', { skip }, () => {
 
   describe('database constraint', () => {
     test('rejects a duplicate (session_id, idempotency_key) written directly', async () => {
-      const created = await submit(validEvent(), { key: 'direct-1' }).expect(201);
+      const created = await submit(validEvent(), { key: 'direct-1' }).expect(202);
       const { rows: [row] } = await pool.query(
         'SELECT session_id, request_hash FROM events WHERE id = $1', [created.body.event.id]);
       await assert.rejects(
@@ -201,7 +206,7 @@ describe('event API', { skip }, () => {
 
   describe('GET /v1/events/:id', () => {
     test('returns the event to its owning session', async () => {
-      const created = await submit(validEvent()).expect(201);
+      const created = await submit(validEvent()).expect(202);
       const res = await request(server).get(`/v1/events/${created.body.event.id}`)
         .set('Authorization', `Bearer ${token}`);
       assert.equal(res.status, 200);
@@ -209,7 +214,7 @@ describe('event API', { skip }, () => {
     });
 
     test("another session gets 404, the same as a nonexistent ID", async () => {
-      const created = await submit(validEvent()).expect(201);
+      const created = await submit(validEvent()).expect(202);
       const other = await newSession();
       const ids = [created.body.event.id, crypto.randomUUID(), 'not-a-uuid'];
       const bodies = [];
@@ -230,10 +235,10 @@ describe('event API', { skip }, () => {
   describe('GET /v1/events', () => {
     test('pages through only the current session, newest first', async () => {
       for (let i = 0; i < 5; i++) {
-        await submit(validEvent({ payload: { title: `T${i}`, message: 'm' } })).expect(201);
+        await submit(validEvent({ payload: { title: `T${i}`, message: 'm' } })).expect(202);
       }
       const other = await newSession();
-      await submit(validEvent(), { auth: other }).expect(201);
+      await submit(validEvent(), { auth: other }).expect(202);
 
       const list = (query) => request(server).get('/v1/events').query(query)
         .set('Authorization', `Bearer ${token}`);

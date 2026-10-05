@@ -10,7 +10,7 @@ test('GET /health returns 200 with status and version', async () => {
   const res = await request(app).get('/health');
   assert.equal(res.status, 200);
   assert.match(res.headers['content-type'], /application\/json/);
-  assert.deepEqual(res.body, { status: 'ok', version });
+  assert.deepEqual(res.body, { status: 'ok', version, inProcessWorker: false });
 });
 
 test('HEAD /health returns 200 with no body', async () => {

@@ -35,8 +35,9 @@
 
   <section>
     <h2>Submit a synthetic event</h2>
-    <p class="note"><strong>Stored is not delivered.</strong> Submitting saves the event with status
-       <code>pending</code>. Delivery to the mock receiver arrives in a later stage, so nothing is sent yet.</p>
+    <p class="note"><strong>Accepted is not delivered.</strong> A <code>202 Accepted</code> means the event
+       is stored durably and queued. A background worker then makes one delivery attempt to the mock receiver.
+       Use <em>Check delivery</em> to see what happened.</p>
     <form id="event-form">
       <label>Title (max 100 characters)
         <input id="title" name="title" maxlength="100" required value="Synthetic test notification">
@@ -48,14 +49,15 @@
          <small>A failed or repeated submit reuses this key, so the event is stored only once.</small></p>
       <button type="submit">Submit event</button>
       <button id="resubmit" type="button">Send same request again</button>
+      <button id="check-delivery" type="button">Check delivery</button>
     </form>
     <pre id="event-result" aria-live="polite">Nothing submitted yet.</pre>
   </section>
 
   <section>
     <h2>Mock receiver mode</h2>
-    <p>Choose how this session's simulated destination behaves. It applies to your session only.
-       The receiver is not connected to event delivery yet.</p>
+    <p>Choose how this session's simulated destination behaves. It applies to your session only and
+       affects events delivered after you change it.</p>
     <label>Mode
       <select id="receiver-mode">
         <option value="success">success: answers 200 immediately</option>

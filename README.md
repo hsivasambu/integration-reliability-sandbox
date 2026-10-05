@@ -2,7 +2,7 @@
 
 A learning sandbox that will accept synthetic JSON events, persist them, and deliver them
 reliably to a controlled mock receiver.
-**Current stage: 4. Mock receiver with per-session simulated outcomes (not yet connected to delivery).**
+**Current stage: 5. Background worker makes one delivery attempt per event (no automatic retries yet).**
 
 ## Requirements
 
@@ -17,6 +17,7 @@ cp .env.example .env    # then replace the placeholder password (3 places) and R
 npm run db:up           # start local Postgres (port 5433) and wait until healthy
 npm run dev:migrate     # apply database migrations
 npm run dev             # start the app with .env loaded
+npm run dev:worker      # optional second terminal: standalone delivery worker (if WORKER_ENABLED=false)
 npm test                # all tests (database tests need TEST_DATABASE_URL)
 ```
 
@@ -44,6 +45,10 @@ The server refuses to start, and lists every problem, if required settings are m
 | `RECEIVER_URL` | `http://127.0.0.1:$PORT/internal/receiver/deliveries` | Fixed delivery destination (server config only) |
 | `DELIVERY_TIMEOUT_MS` | `2000` | How long the delivery client waits for an answer |
 | `RECEIVER_SLOW_RESPONSE_MS` | `4000` | Delay used by `timeout` mode. Must exceed `DELIVERY_TIMEOUT_MS`. |
+| `WORKER_ENABLED` | `false` | `true` runs the delivery worker inside the web process (`true` on Render) |
+| `WORKER_POLL_INTERVAL_MS` | `1000` | How often an idle worker checks for due deliveries |
+| `DELIVERY_LEASE_MS` | `15000` | How long a claim lasts before another worker may take over. At least `DELIVERY_TIMEOUT_MS` + 1000. |
+| `DELIVERY_MAX_ATTEMPTS` | `3` | Cap on claims per delivery (currently only reached through lease recovery) |
 | `TEST_DATABASE_URL` | unset | Test database. Its name must end in `_test` because tests wipe it. |
 
 ## Database migrations
@@ -67,14 +72,15 @@ database only accepts connections from Render's private network (`ipAllowList: [
 
 | Method & path | Response |
 |---|---|
-| `GET /health` | `200 {"status":"ok","version":"0.4.0"}` while the process runs (no database check) |
+| `GET /health` | `200 {"status":"ok","version":"0.5.0","inProcessWorker":true|false}` while the process runs (no database check) |
 | `HEAD /health` | `200`, headers only |
 | `GET /ready` | `200 {"status":"ready"}` if the database is reachable and migrated, otherwise `503` with `reason` |
 | `POST /v1/sessions` | `201` with a new demo token (shown once), `429` if rate limited, `503` at capacity |
 | `GET /v1/session` | `200 {"createdAt","expiresAt"}` with a valid token, otherwise `401` |
-| `POST /v1/events` | `201` new event (stored, **pending, not delivered**); `200` identical repeat; `409` key reused with different payload; see [Events](#events) |
+| `POST /v1/events` | `202` accepted for asynchronous delivery (`eventId`, `statusUrl`); `200` identical repeat; `409` key reused with different payload; see [Events](#events) |
 | `GET /v1/events?limit=&cursor=` | `200 {"data":[...],"nextCursor"}`: your session's events, newest first |
-| `GET /v1/events/{id}` | `200 {"event"}` if it belongs to your session, otherwise `404` |
+| `GET /v1/events/{id}` | `200 {"event"}` (including a `delivery` summary) if it belongs to your session, otherwise `404` |
+| `GET /v1/events/{id}/deliveries` | `200` delivery state and attempt history for your session's event, otherwise `404` |
 | `GET /v1/receiver` | `200 {"mode","availableModes","receivedCount",...}`: your session's mock receiver settings |
 | `PUT /v1/receiver` | Body `{"mode":"success"|"server_error"|"timeout"}`, which changes **your session's** mode |
 | `POST /internal/receiver/deliveries` | Mock receiver. Requires `Authorization: Bearer <RECEIVER_SECRET>`; `401` otherwise. Server-side callers only. |
@@ -144,8 +150,19 @@ One event type, `demo.notification`. Request body (no other fields allowed, anyw
 
 Invalid input returns `422 validation_failed` with every problem in `details`, and nothing is stored.
 
-**201 means stored, not delivered.** The event is saved with status `pending`. There is no delivery worker
-yet, so nothing is sent anywhere in this stage.
+**202 means accepted, not delivered.** *(Changed in Stage 5; it was `201` in Stage 3.)* The event and its
+delivery job are saved in one database transaction, and the response returns immediately:
+
+```json
+{ "eventId": "...", "statusUrl": "/v1/events/.../deliveries",
+  "event": { "id": "...", "type": "demo.notification", "payload": { "...": "..." }, "idempotencyKey": "...",
+             "createdAt": "...", "updatedAt": "...",
+             "delivery": { "state": "pending", "attemptCount": 0, "statusUrl": "..." } },
+  "notice": "Accepted: stored durably and queued for asynchronous delivery..." }
+```
+
+The `Location` header is the status URL. The event no longer has a `status` field. Delivery state lives
+only in `event.delivery` and at `statusUrl`.
 
 ### Idempotency: safe retries
 
@@ -153,8 +170,8 @@ The client chooses an `Idempotency-Key` per logical event and reuses it on every
 
 | Request | Response |
 |---|---|
-| New key | `201 Created` + `Location`, a new event |
-| Same key, same payload (field order doesn't matter) | `200 OK` + `Idempotent-Replayed: true`, the **original** event, nothing new stored |
+| New key | `202 Accepted` + `Location` (status URL), a new event and delivery job |
+| Same key, same payload (field order doesn't matter) | `200 OK` + `Idempotent-Replayed: true`, the **original** event with its **current** delivery state; nothing new stored, nothing re-sent |
 | Same key, different payload | `409 idempotency_key_conflict`, nothing stored |
 | Same key in a different session | Independent. Keys are scoped to the session. |
 
@@ -170,7 +187,7 @@ $BASE = "http://localhost:3000"
 $TOKEN = (curl.exe -s -X POST "$BASE/v1/sessions" | ConvertFrom-Json).token
 $KEY = [guid]::NewGuid().ToString()
 '{"type":"demo.notification","payload":{"title":"Synthetic title","message":"Synthetic message"}}' | Out-File -Encoding ascii event.json
-curl.exe -i -X POST "$BASE/v1/events" -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: $KEY" -H "Content-Type: application/json" --data-binary "@event.json"   # 201
+curl.exe -i -X POST "$BASE/v1/events" -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: $KEY" -H "Content-Type: application/json" --data-binary "@event.json"   # 202
 curl.exe -i -X POST "$BASE/v1/events" -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: $KEY" -H "Content-Type: application/json" --data-binary "@event.json"   # 200, Idempotent-Replayed: true
 curl.exe -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/events?limit=5"                                                                                              # your events
 Remove-Item event.json; Remove-Variable TOKEN
@@ -178,10 +195,62 @@ Remove-Item event.json; Remove-Variable TOKEN
 
 The landing page has the same flow: **Start demo session**, **Submit event**, **Send same request again**, and **Refresh list**.
 
+## Delivery worker
+
+A background worker takes each accepted event and makes **one** HTTP attempt to the mock receiver. If
+it fails, the delivery stays failed; automatic retries come in a later stage.
+
+**Where it runs.** On Render, inside the web process (`WORKER_ENABLED=true`), so there's no extra hosted
+service. Locally, either set `WORKER_ENABLED=true` or run `npm run dev:worker` (`src/worker-main.js`) next
+to `npm run dev`. Several workers can run at once safely.
+
+**How it works.** The code lives in three modules: `src/events.js` (API), `src/worker.js` (loop) +
+`src/delivery-store.js` (SQL), and `src/delivery-client.js` (HTTP).
+
+1. **Poll.** Every `WORKER_POLL_INTERVAL_MS` (1 s), or immediately after finishing a job.
+2. **Recover.** Any delivery whose lease has expired goes back to `pending`, and its unfinished attempt is
+   labelled `lease_expired` (result unknown). After `DELIVERY_MAX_ATTEMPTS` claims it fails instead.
+3. **Claim.** One SQL statement picks the oldest due `pending` delivery (`FOR UPDATE SKIP LOCKED`, so
+   competing workers never pick the same one), sets it `in_progress` with a fresh random `claim_token` and
+   a lease of `DELIVERY_LEASE_MS` (15 s), and inserts the attempt row. **The attempt is recorded before anything is sent.**
+4. **Send.** A plain HTTP request with a 2 s timeout. No database transaction is open during the request.
+5. **Complete.** One SQL statement records the outcome. It only applies `WHERE claim_token = <mine>`, so a
+   worker that lost its lease can't overwrite a newer claim's result.
+6. **Stop.** On `SIGTERM`, the worker stops claiming, lets the in-flight attempt finish and record its
+   result (at most 2 s), and then the process exits.
+
+| Delivery `state` | Meaning |
+|---|---|
+| `pending` | Waiting for a worker |
+| `in_progress` | Claimed; an attempt is under way |
+| `delivered` | The receiver answered 2xx (delivered **at the HTTP level**) |
+| `failed` | The attempt got a non-2xx, timed out, or couldn't connect (no retries yet) |
+
+Each attempt records `attemptNumber`, `outcome` (`in_progress`, `delivered`, `failed`, `lease_expired`),
+`startedAt`, `endedAt`, `responseStatus` (when a response arrived), `errorCategory` (`http_error`, `timeout`,
+`network_error`, `lease_expired`), and `durationMs`. See them at `GET /v1/events/{id}/deliveries`.
+
+**At-least-once, not exactly-once.** If a worker crashes *after* the receiver processed a delivery but
+*before* it recorded the result, the lease expires and another worker sends it again. The receiver then
+sees the event twice. No sender can rule this out, because the confirmation can be lost after the work is
+done. Duplicate handling on the receiving side comes in a later stage.
+
+**Worker disabled vs enabled** (`/health` shows `"inProcessWorker"`):
+
+| | `WORKER_ENABLED=false` (and no `dev:worker`) | `WORKER_ENABLED=true` |
+|---|---|---|
+| `POST /v1/events` | `202`, delivery `pending` | `202`, delivery `pending` |
+| A few seconds later | Still `pending`, no attempts | `delivered` / `failed`, with one attempt |
+| Start `npm run dev:worker` | Pending work is picked up and delivered | (also fine; workers share safely) |
+
+On Render's free plan the instance sleeps after 15 minutes without inbound traffic, and the worker sleeps
+with it. Pending deliveries wait in Postgres until the next request wakes the service. The worker's own
+loopback calls don't count as inbound traffic.
+
 ## Mock receiver
 
-A stand-in for the external system that events will be delivered to. It isn't connected to the
-event API yet, so events stay `pending`. It lives at `POST /internal/receiver/deliveries` in the same app.
+A stand-in for the external system that events are delivered to. The delivery worker calls it. It
+lives at `POST /internal/receiver/deliveries` in the same app.
 
 **Who can call it.** Only server-side code holding `RECEIVER_SECRET`. The secret exists only in server
 environment variables. It's never sent to browsers, logged, or committed. The caller's destination is
@@ -300,6 +369,7 @@ Render logs. The deploy never goes live, and the previous version keeps serving.
 
 The web service's filesystem is temporary. It's replaced on every deploy, restart, and spin-down. All
 durable state lives in Postgres, which is a separate service, so sessions and migration history
-**survive** restarts, redeploys, and spin-downs. Rate-limit counters live in memory and reset on each restart. Events and their idempotency keys
-are in Postgres and survive. When an expired session is cleaned up, its events are deleted with it.
+**survive** restarts, redeploys, and spin-downs. Rate-limit counters live in memory and reset on each restart. Events, idempotency keys, delivery
+jobs, and attempt history are in Postgres and survive. A worker killed mid-attempt leaves a lease that
+expires, and the delivery is then picked up again. When an expired session is cleaned up, its events are deleted with it.
 Deleting the database (or letting the free one expire) loses everything.

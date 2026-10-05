@@ -1,6 +1,6 @@
 {
   "name": "integration-reliability-sandbox",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Synthetic event delivery sandbox for learning integration reliability.",
   "main": "src/server.js",
@@ -12,7 +12,9 @@
     "db:up": "docker compose up -d --wait",
     "db:down": "docker compose down",
     "test": "node --env-file-if-exists=.env --test --test-concurrency=1 \"test/**/*.test.js\"",
-    "receiver:try": "node --env-file-if-exists=.env scripts/try-receiver.js"
+    "receiver:try": "node --env-file-if-exists=.env scripts/try-receiver.js",
+    "worker": "node src/worker-main.js",
+    "dev:worker": "node --env-file-if-exists=.env src/worker-main.js"
   },
   "engines": {
     "node": ">=22.9 <25"

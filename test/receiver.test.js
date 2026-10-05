@@ -10,8 +10,8 @@ const { createDeliveryClient } = require('../src/delivery-client');
 const { skip, freshDatabase } = require('./helpers/db');
 
 const SECRET = 'test-receiver-secret-0123456789abcdefghijkl';
-const SLOW_MS = 800;      // receiver 'timeout' mode delay (4000 in production)
-const TIMEOUT_MS = 300;   // client timeout (2000 in production)
+const SLOW_MS = 1600;     // receiver 'timeout' mode delay (4000 in production)
+const TIMEOUT_MS = 800;   // client timeout (2000 in production)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe('mock receiver', { skip }, () => {

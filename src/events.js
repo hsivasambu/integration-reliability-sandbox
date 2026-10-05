@@ -1,5 +1,5 @@
 // Session-scoped event API: validation, idempotent creation, and pagination.
-// Events are stored as 'pending'. Nothing is delivered in this stage.
+// Each new event is created together with its delivery job; the worker (src/worker.js) delivers it.
 
 const crypto = require('node:crypto');
 const express = require('express');
@@ -19,7 +19,11 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const TITLE_FORBIDDEN = /[\u0000-\u001F\u007F]/;
 const MESSAGE_FORBIDDEN = /[\u0000-\u0009\u000B-\u001F\u007F]/;
 
-const COLUMNS = 'id, seq, type, payload, status, idempotency_key, request_hash, created_at, updated_at';
+// Event data plus a summary of its delivery job (delivery state lives only in `deliveries`).
+const EVENT_SELECT = `
+  SELECT e.id, e.seq, e.type, e.payload, e.idempotency_key, e.request_hash,
+         e.created_at, e.updated_at, d.state AS delivery_state, d.attempt_count
+  FROM events e JOIN deliveries d ON d.event_id = e.id`;
 
 const isPlainObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -80,12 +84,18 @@ function toResource(row) {
     id: row.id,
     type: row.type,
     payload: row.payload,
-    status: row.status,
     idempotencyKey: row.idempotency_key,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    delivery: {
+      state: row.delivery_state,
+      attemptCount: row.attempt_count,
+      statusUrl: statusUrl(row.id),
+    },
   };
 }
+
+const statusUrl = (eventId) => `/v1/events/${eventId}/deliveries`;
 
 function compareExisting(row, hash) {
   return row.request_hash.equals(hash) ? { outcome: 'replayed', row } : { outcome: 'conflict' };
@@ -109,7 +119,7 @@ async function createEvent(pool, { sessionId, idempotencyKey, event, maxEvents }
 
     // A repeated key returns the original result, even if the session is now at its cap.
     const existing = await client.query(
-      `SELECT ${COLUMNS} FROM events WHERE session_id = $1 AND idempotency_key = $2`,
+      `${EVENT_SELECT} WHERE e.session_id = $1 AND e.idempotency_key = $2`,
       [sessionId, idempotencyKey]);
     if (existing.rows[0]) {
       await client.query('COMMIT');
@@ -127,16 +137,21 @@ async function createEvent(pool, { sessionId, idempotencyKey, event, maxEvents }
       `INSERT INTO events (session_id, type, payload, idempotency_key, request_hash)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT ON CONSTRAINT events_session_idempotency_key_unique DO NOTHING
-       RETURNING ${COLUMNS}`,
+       RETURNING id, seq, type, payload, idempotency_key, request_hash, created_at, updated_at`,
       [sessionId, event.type, event.payload, idempotencyKey, hash]);
     if (inserted.rows[0]) {
+      // The delivery job is created in the same transaction: either both exist or neither does.
+      const { rows: [delivery] } = await client.query(
+        `INSERT INTO deliveries (event_id) VALUES ($1)
+         RETURNING state AS delivery_state, attempt_count`,
+        [inserted.rows[0].id]);
       await client.query('COMMIT');
-      return { outcome: 'created', row: inserted.rows[0] };
+      return { outcome: 'created', row: { ...inserted.rows[0], ...delivery } };
     }
 
     // The constraint rejected the insert: another writer stored this key first.
     const winner = await client.query(
-      `SELECT ${COLUMNS} FROM events WHERE session_id = $1 AND idempotency_key = $2`,
+      `${EVENT_SELECT} WHERE e.session_id = $1 AND e.idempotency_key = $2`,
       [sessionId, idempotencyKey]);
     await client.query('COMMIT');
     return compareExisting(winner.rows[0], hash);
@@ -202,16 +217,21 @@ function eventRoutes(pool, { maxEventsPerSession }) {
     });
     switch (result.outcome) {
       case 'created':
-        res.set('Location', `/v1/events/${result.row.id}`);
-        return res.status(201).json({
+        // 202 Accepted: durably stored and queued; delivery happens asynchronously.
+        res.set('Location', statusUrl(result.row.id));
+        return res.status(202).json({
+          eventId: result.row.id,
+          statusUrl: statusUrl(result.row.id),
           event: toResource(result.row),
-          notice: 'Stored as pending. It has NOT been delivered. Delivery is added in a later stage.',
+          notice: 'Accepted: stored durably and queued for asynchronous delivery. It has not been delivered yet; check statusUrl.',
         });
       case 'replayed':
         res.set('Idempotent-Replayed', 'true');
         return res.status(200).json({
+          eventId: result.row.id,
+          statusUrl: statusUrl(result.row.id),
           event: toResource(result.row),
-          notice: 'This Idempotency-Key was already used with the same payload. Returning the original event; nothing new was stored.',
+          notice: 'This Idempotency-Key was already used with the same payload. Returning the original event and its current delivery state; nothing new was stored.',
         });
       case 'conflict':
         return sendError(res, 409, 'idempotency_key_conflict',
@@ -231,9 +251,9 @@ function eventRoutes(pool, { maxEventsPerSession }) {
 
     // Fetch one extra row to know whether another page exists.
     const { rows } = await pool.query(
-      `SELECT ${COLUMNS} FROM events
-       WHERE session_id = $1 AND ($2::bigint IS NULL OR seq < $2)
-       ORDER BY seq DESC LIMIT $3`,
+      `${EVENT_SELECT}
+       WHERE e.session_id = $1 AND ($2::bigint IS NULL OR e.seq < $2)
+       ORDER BY e.seq DESC LIMIT $3`,
       [req.session.id, afterSeq, limit + 1]);
     const page = rows.slice(0, limit);
     res.json({
@@ -242,19 +262,55 @@ function eventRoutes(pool, { maxEventsPerSession }) {
     });
   });
 
+  // Unknown, malformed, and other sessions' IDs all look the same: 404.
+  const notFound = (res) => sendError(res, 404, 'not_found', 'No event with this ID exists for your session.');
+
   router.get('/events/:id', auth, async (req, res) => {
-    // Unknown, malformed, and other sessions' IDs all look the same: 404.
-    const notFound = () => sendError(res, 404, 'not_found', 'No event with this ID exists for your session.');
-    if (!UUID_PATTERN.test(req.params.id)) return notFound();
+    if (!UUID_PATTERN.test(req.params.id)) return notFound(res);
     const { rows } = await pool.query(
-      `SELECT ${COLUMNS} FROM events WHERE id = $1 AND session_id = $2`,
+      `${EVENT_SELECT} WHERE e.id = $1 AND e.session_id = $2`,
       [req.params.id, req.session.id]);
-    if (!rows[0]) return notFound();
+    if (!rows[0]) return notFound(res);
     res.json({ event: toResource(rows[0]) });
+  });
+
+  // Delivery state and full attempt history for one of this session's events.
+  router.get('/events/:id/deliveries', auth, async (req, res) => {
+    if (!UUID_PATTERN.test(req.params.id)) return notFound(res);
+    const { rows: [delivery] } = await pool.query(
+      `SELECT d.id, d.state, d.attempt_count, d.created_at, d.updated_at, d.completed_at
+       FROM deliveries d JOIN events e ON e.id = d.event_id
+       WHERE e.id = $1 AND e.session_id = $2`,
+      [req.params.id, req.session.id]);
+    if (!delivery) return notFound(res);
+    const { rows: attempts } = await pool.query(
+      `SELECT attempt_number, outcome, started_at, ended_at, response_status, error_category, duration_ms
+       FROM delivery_attempts WHERE delivery_id = $1 ORDER BY attempt_number`,
+      [delivery.id]);
+    res.json({
+      eventId: req.params.id,
+      delivery: {
+        state: delivery.state,
+        attemptCount: delivery.attempt_count,
+        createdAt: delivery.created_at,
+        updatedAt: delivery.updated_at,
+        completedAt: delivery.completed_at,
+        attempts: attempts.map((a) => ({
+          attemptNumber: a.attempt_number,
+          outcome: a.outcome,
+          startedAt: a.started_at,
+          endedAt: a.ended_at,
+          responseStatus: a.response_status,
+          errorCategory: a.error_category,
+          durationMs: a.duration_ms,
+        })),
+      },
+    });
   });
 
   router.all('/events', methodNotAllowed(['GET', 'HEAD', 'POST']));
   router.all('/events/:id', methodNotAllowed(['GET', 'HEAD']));
+  router.all('/events/:id/deliveries', methodNotAllowed(['GET', 'HEAD']));
   return router;
 }
 

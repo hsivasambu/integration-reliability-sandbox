@@ -172,3 +172,74 @@ returned the default `success`. A PUT of `timeout` on session A returned 200; A 
 session B still read `success`. Invalid mode 422; no token 401. Not verified on Render: the loopback
 self-call (`http://127.0.0.1:10000/...`). There's no shell on free instances, so it will first be
 exercised by the delivery worker stage.
+
+## Stage 5: One delivery attempt per event in a background worker (2026-10-04)
+
+**Decisions**
+- **Data model (migration 004).**
+  - `deliveries` is the job: `pending → in_progress → delivered | failed`, plus `available_at`,
+    `claim_token`, `lease_expires_at`, `attempt_count`, and `completed_at`.
+  - `delivery_attempts` is the history: attempt number, claim token, start/end, outcome, response
+    status, error category, and duration.
+  - `events.status` was **dropped**, so delivery state exists in one place only. Existing events were
+    backfilled with a pending delivery.
+  - CHECK constraints make contradictory rows impossible: a claim exists iff in progress; `completed_at`
+    is set iff finished; `error_category` is set iff failed or lease expired.
+- **API.** A new event returns `202` with `eventId`, `statusUrl`, and `Location: statusUrl`. The event and its
+  delivery are inserted in the same transaction. An identical repeat stays `200` with
+  `Idempotent-Replayed: true` and now shows the current delivery state. The event resource gains a
+  `delivery` summary and loses `status`. New: `GET /v1/events/{id}/deliveries`, scoped by session
+  (others get 404).
+- **Modules.** `events.js` (API), `worker.js` (loop/lifecycle), `delivery-store.js` (SQL), and
+  `delivery-client.js` (HTTP) are kept separate. The worker runs in-process behind `WORKER_ENABLED`
+  (true on Render) or standalone via `npm run dev:worker` (`src/worker-main.js`). No extra hosted service.
+- **Queue mechanics.** Each operation is a single SQL statement, so no transaction is open during HTTP.
+  - Claim = `FOR UPDATE SKIP LOCKED` + set `in_progress`, `claim_token = gen_random_uuid()`, a lease of
+    `DELIVERY_LEASE_MS` (15 s, validated ≥ timeout + 1 s), and insert the attempt row. The attempt is
+    recorded **before** sending.
+  - Complete = update only `WHERE claim_token = mine AND state = 'in_progress'`. A stale worker gets
+    `false` and its result is discarded and logged.
+  - Recovery runs before each claim. Expired leases return to `pending` and the attempt is labelled
+    `lease_expired` with `ended_at` left NULL (unknown, not invented). After `DELIVERY_MAX_ATTEMPTS` (3)
+    claims the delivery fails, so a crash loop is bounded.
+  - If a lease expires but nobody has recovered it yet, the original worker can still complete. Its
+    claim is still current.
+- 2xx = `delivered` (HTTP level). Anything else = `failed` with category `http_error`, `timeout`, or
+  `network_error`. No retries.
+- **Shutdown.** SIGTERM → `worker.stop()` (no new claims, in-flight attempt finishes and records, ≤ 2 s)
+  → `server.close()` → `pool.end()`.
+- **Delivery guarantee: at-least-once.** A crash between the receiver processing a delivery and the
+  completion update causes a second delivery after the lease expires. A test demonstrates this.
+- `/health` adds `inProcessWorker: true|false` so worker-enabled and worker-disabled deployments are visible.
+- Free-plan caveat: the worker sleeps with the instance (15 min without inbound traffic). Pending jobs
+  wait in Postgres.
+
+**Verification (local, Node 22.18.0, Postgres 18.6)**
+- `npm test`: 81/81 pass (13 new worker tests; Stage 3 tests updated for 202 and `event.delivery`).
+  Worker tests cover:
+  - success, 503, and timeout attempts with all recorded fields
+  - worker disabled: events stay pending
+  - restart: a fresh pool and worker deliver 3 pending events
+  - graceful stop: the attempt row is `in_progress` mid-flight; after `stop()` it is recorded as a
+    timeout; nothing new is claimed
+  - lease expiry before sending (attempt `lease_expired` with `endedAt` null, then delivered)
+  - crash after receiver processing: 2 receipts (at-least-once)
+  - stale worker's completion rejected
+  - recovery cap reached → failed
+  - two workers racing for one job, 5 rounds: exactly one claim each round
+  - two running workers draining 12 jobs: 12 attempts, 12 receipts
+  - deliveries endpoint scoping
+- Mutation checks: removing `FOR UPDATE SKIP LOCKED` fails the competing-workers test; removing the
+  claim-token condition fails the stale-worker test.
+- Flakiness found and fixed: with a 300 ms test client timeout, an occasional slow local request
+  (one test took about 1.9 s on this Windows/Docker host) turned a success into a timeout. Test timings were
+  widened to 800 ms timeout / 1600 ms slow response / 3 s lease (production stays 2 s / 4 s / 15 s). After
+  that: 25 consecutive worker-file runs and 6 full-suite runs were clean.
+- Live demonstration (port 3129):
+  - A. `WORKER_ENABLED=false`: `/health` shows `inProcessWorker: false`; event 202, still `pending` with
+    no attempts after 3 s.
+  - B. `npm run dev:worker` started separately: the same event became `delivered` (HTTP 200, 8 ms).
+  - C. `WORKER_ENABLED=true`: `inProcessWorker: true`; server_error → failed/503/http_error (81 ms);
+    timeout → failed/timeout, no status (2015 ms); success → delivered/200 (10 ms).
+- Not run live: SIGTERM shutdown (Windows can't send SIGTERM to a native process this way). It's
+  covered by the graceful-stop test, and Render's deploy logs show it.

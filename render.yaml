@@ -38,6 +38,15 @@ services:
       - key: RECEIVER_SLOW_RESPONSE_MS
         value: "4000"
       # RECEIVER_URL is not set: the app calls its own receiver at http://127.0.0.1:$PORT.
+      # Run the delivery worker inside this web process (no separate worker service).
+      - key: WORKER_ENABLED
+        value: "true"
+      - key: WORKER_POLL_INTERVAL_MS
+        value: "1000"
+      - key: DELIVERY_LEASE_MS
+        value: "15000"
+      - key: DELIVERY_MAX_ATTEMPTS
+        value: "3"
     # PORT is set by Render (default 10000); HOST defaults to 0.0.0.0 in code.
     # Node version comes from .node-version (24).
 

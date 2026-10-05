@@ -17,6 +17,7 @@ const DEFAULTS = {
   maxEventsPerSession: 100,
   receiverSecret: undefined, // without a secret, every receiver call is rejected
   receiverSlowResponseMs: 4000,
+  workerEnabled: false,
 };
 
 function createApp({ pool, config = {} } = {}) {
@@ -31,7 +32,8 @@ function createApp({ pool, config = {} } = {}) {
   // GET handler's status and headers but no body.
   app.get('/health', (req, res) => {
     res.set('Cache-Control', 'no-store');
-    res.json({ status: 'ok', version });
+    // inProcessWorker says whether this process runs the delivery worker (WORKER_ENABLED).
+    res.json({ status: 'ok', version, inProcessWorker: settings.workerEnabled });
   });
   // Any other method on /health is a wrong-method error, not a missing route.
   app.all('/health', methodNotAllowed(['GET', 'HEAD']));
