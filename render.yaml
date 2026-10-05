@@ -1,4 +1,5 @@
 # Render Blueprint: https://render.com/docs/blueprint-spec
+# Pushing changes to this file makes Render create/update the resources below.
 services:
   - type: web
     name: integration-reliability-sandbox
@@ -13,5 +14,27 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: integration-reliability-sandbox-db
+          property: connectionString   # internal (private network) URL
+      # Free instances have no pre-deploy command, so migrations run at startup.
+      # On a paid instance, remove this and add: preDeployCommand: npm run migrate
+      - key: MIGRATE_ON_START
+        value: "true"
+      # Render's proxy sits in front of the app; trust one hop for client IPs.
+      - key: TRUST_PROXY
+        value: "1"
+      - key: SESSION_TTL_HOURS
+        value: "24"
     # PORT is set by Render (default 10000); HOST defaults to 0.0.0.0 in code.
     # Node version comes from .node-version (24).
+
+databases:
+  - name: integration-reliability-sandbox-db
+    plan: free            # no cost; expires 30 days after creation, no backups
+    region: oregon        # same region as the web service for the private network
+    postgresMajorVersion: "18"
+    databaseName: sandbox
+    user: sandbox
+    ipAllowList: []       # no external connections; only Render services can connect

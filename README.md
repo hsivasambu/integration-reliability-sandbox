@@ -1,49 +1,125 @@
 # Integration Reliability Sandbox
 
 A learning sandbox that will accept synthetic JSON events, persist them, and deliver them
-reliably to a controlled mock receiver. **Current stage: 1. A deployable service with a health check.**
+reliably to a controlled mock receiver.
+**Current stage: 2. PostgreSQL connectivity and anonymous demo sessions.**
 
 ## Requirements
 
 - Node.js 24 LTS (22.9+ also works locally). Render uses `.node-version`.
-- npm (ships with Node)
+- Docker Desktop (runs the local PostgreSQL 18 database)
 
 ## Local setup
 
 ```sh
-npm ci                     # install exact versions from package-lock.json
-cp .env.example .env       # optional; sets PORT=3000, HOST=127.0.0.1
-npm run dev                # starts with .env loaded
-# or: npm start            # no .env; defaults PORT=3000, HOST=0.0.0.0
-npm test                   # smoke tests
+npm ci                  # install exact versions from package-lock.json
+cp .env.example .env    # then replace the placeholder password (3 places, same value)
+npm run db:up           # start local Postgres (port 5433) and wait until healthy
+npm run dev:migrate     # apply database migrations
+npm run dev             # start the app with .env loaded
+npm test                # all tests (database tests need TEST_DATABASE_URL)
 ```
 
 Open http://localhost:3000 and click **Check health**.
 
+`npm run db:down` stops the database and keeps its data. To delete local data completely:
+`docker compose down -v`. That's the only destructive command, and nothing runs it automatically.
+
+### Configuration
+
+The server refuses to start, and lists every problem, if required settings are missing or invalid.
+
 | Variable | Default | Purpose |
 |---|---|---|
+| `DATABASE_URL` | **required** | PostgreSQL connection string |
 | `PORT` | `3000` (Render sets `10000`) | Port to listen on |
 | `HOST` | `0.0.0.0` | Listen address. Use `127.0.0.1` locally. Hosting needs `0.0.0.0`. |
-| `NODE_ENV` | unset | Set to `production` on Render |
+| `MIGRATE_ON_START` | `false` | `true` applies pending migrations before the server listens |
+| `SESSION_TTL_HOURS` | `24` | Demo session lifetime (1–168) |
+| `SESSION_RATE_LIMIT_MAX` / `_WINDOW_MINUTES` | `10` / `60` | Session creations allowed per client IP per window |
+| `MAX_ACTIVE_SESSIONS` | `1000` | Cap on unexpired sessions across all clients |
+| `TRUST_PROXY` | `0` | Number of reverse proxies in front of the app (`1` on Render) |
+| `TEST_DATABASE_URL` | unset | Test database. Its name must end in `_test` because tests wipe it. |
+
+## Database migrations
+
+SQL files in `migrations/` (`001_...sql`, `002_...sql`, …) are applied in order. Each runs once inside
+a transaction and is recorded in the `schema_migrations` table, so running the command again is
+harmless and existing data is never reset. A database lock stops two instances from migrating at once.
+Applied migration files are never edited. Changes go in a new numbered file.
+
+| Where | Command |
+|---|---|
+| Local | `npm run dev:migrate` (reads `.env`) |
+| Anywhere with `DATABASE_URL` set | `npm run migrate` |
+| Render free instance | Runs automatically at startup (`MIGRATE_ON_START=true`), because free instances have no pre-deploy step |
+| Render paid instance | Set **Pre-Deploy Command** to `npm run migrate` and remove `MIGRATE_ON_START` |
+
+Migrations must run somewhere that can reach the database. On Render, that means **on Render**: the
+database only accepts connections from Render's private network (`ipAllowList: []`).
 
 ## Routes
 
 | Method & path | Response |
 |---|---|
-| `GET /health` | `200 {"status":"ok","version":"0.1.0"}` |
-| `HEAD /health` | `200`, headers only, no body |
-| Other methods on `/health` | `405` with `Allow: GET, HEAD` |
+| `GET /health` | `200 {"status":"ok","version":"0.2.0"}` while the process runs (no database check) |
+| `HEAD /health` | `200`, headers only |
+| `GET /ready` | `200 {"status":"ready"}` if the database is reachable and migrated, otherwise `503` with `reason` |
+| `POST /v1/sessions` | `201` with a new demo token (shown once), `429` if rate limited, `503` at capacity |
+| `GET /v1/session` | `200 {"createdAt","expiresAt"}` with a valid token, otherwise `401` |
+| Wrong method on any route above | `405` with an `Allow` header |
 | `GET /` | Landing page |
 | Anything else | `404 {"error":"not_found",...}` |
+
+API request bodies over 1 KB get `413`, and malformed JSON gets `400`.
+
+## Demo sessions
+
+`POST /v1/sessions` returns a random bearer token such as `irs_...` (47 characters). **This token is a
+limited demo credential, not a user account.** There is no username, password, or recovery. It only
+scopes your own sandbox data (from later stages) and expires after 24 hours. The server stores only a
+SHA-256 hash of it, so the token can't be shown again. Lose it and you simply create a new session.
+Tokens are never logged.
+
+### Try it with curl
+
+PowerShell (keeps the token in a variable instead of on screen):
+
+```powershell
+$BASE = "http://localhost:3000"
+$TOKEN = (curl.exe -s -X POST "$BASE/v1/sessions" | ConvertFrom-Json).token
+curl.exe -i -H "Authorization: Bearer $TOKEN" "$BASE/v1/session"   # expect 200
+curl.exe -i "$BASE/v1/session"                                     # expect 401 missing_token
+curl.exe -i -H "Authorization: Bearer wrong" "$BASE/v1/session"    # expect 401 invalid_token
+Remove-Variable TOKEN
+```
+
+Bash:
+
+```sh
+BASE=http://localhost:3000
+TOKEN=$(curl -s -X POST "$BASE/v1/sessions" | node -pe 'JSON.parse(require("fs").readFileSync(0)).token')
+curl -i -H "Authorization: Bearer $TOKEN" "$BASE/v1/session"
+unset TOKEN
+```
+
+### Try it with Postman
+
+1. Create an environment with a variable `demoToken` and set its type to **secret**.
+2. `POST {{base}}/v1/sessions`. In the request's **Scripts → Post-response** tab add:
+   `pm.environment.set("demoToken", pm.response.json().token);`
+3. `GET {{base}}/v1/session` with **Authorization → Bearer Token** = `{{demoToken}}`.
+
+Don't paste real tokens into shared collections, screenshots, or docs.
 
 ## Checks (replace BASE with `http://localhost:3000` or your Render URL)
 
 ```sh
 curl -i  BASE/health            # expect HTTP 200 and JSON body
 curl -I  BASE/health            # expect HTTP 200, headers only
+curl -i  BASE/ready             # expect HTTP 200 {"status":"ready"}
 curl -i -X POST BASE/health     # expect HTTP 405, Allow: GET, HEAD
 curl -i  BASE/nope              # expect HTTP 404 JSON
-curl -s -o /dev/null -w "%{http_code}\n" BASE/   # expect 200
 ```
 
 On Windows PowerShell, type `curl.exe` instead of `curl` (`curl` is an alias for `Invoke-WebRequest`).
@@ -54,39 +130,52 @@ On Windows PowerShell, type `curl.exe` instead of `curl` (`curl` is an alias for
 |---|---|
 | `404` + `{"error":"not_found"}` | Server is up; the **path** is wrong |
 | `405` + `Allow` header | Server is up, path exists; the **HTTP method** is wrong |
+| `/health` 200 but `/ready` 503 | App is running, **database** is unreachable or not migrated (see `reason`) |
+| `401 missing_token` / `invalid_token` | No `Authorization: Bearer` header / token unknown, malformed, or expired |
 | curl `Failed to connect` / exit code 7, browser "can't be reached" | **Nothing is listening** (server not running, wrong port/host) |
 | curl exit 6 `Could not resolve host` | Wrong hostname / typo in URL |
-| Render `502`/`503` or HTML "service waking up" page | Render can reach its proxy but not a healthy app (crashed, still starting, or free instance spinning up) |
-| `404` with a non-JSON body on Render | Request didn't reach this app (e.g. wrong service URL) |
+| Render `502`/`503` or HTML "service waking up" page | Render can't reach a healthy app (crashed, still starting, or free instance spinning up) |
+| Browser Network tab shows `(blocked:other)` or `(blocked:client)` | The browser, an extension, or security software blocked the request. It never reached the server. |
 
 ## Deploying to Render
 
-Prerequisite: the code is in a GitHub/GitLab/Bitbucket repository that Render can access.
+`render.yaml` defines the web service and a free Render Postgres database. It wires the database's
+**internal** connection string into `DATABASE_URL`, so no secret is typed or committed.
 
-**Option A: Blueprint (uses `render.yaml`)**
-1. Render Dashboard → **New** → **Blueprint**.
-2. Pick the repository and branch `main`. Render reads `render.yaml`.
-3. Confirm the free web service `integration-reliability-sandbox` and click **Apply**.
+**Blueprint-managed service (recommended).** Push to `main`. Render syncs the Blueprint, creates
+`integration-reliability-sandbox-db`, sets the env vars, and redeploys. At startup the app applies migrations,
+then listens. Check `/health` and `/ready` once the deploy shows **Live**.
 
-**Option B: manual Web Service** (same settings by hand)
+**Service created by hand** (the Blueprint isn't connected):
+1. **New → Postgres**: name `integration-reliability-sandbox-db`, PostgreSQL 18, region **Oregon** (same as the
+   web service), plan **Free**.
+2. Copy its **Internal Database URL**.
+3. Web service → **Environment**: add `DATABASE_URL` (paste the URL; Render keeps it secret),
+   `MIGRATE_ON_START=true`, `TRUST_PROXY=1`. Save, and Render redeploys.
 
 | Setting | Value | Why |
 |---|---|---|
-| Language/Runtime | Node | Native Node runtime, no Docker needed |
-| Branch | `main` | Pushes to this branch trigger deploys |
 | Build Command | `npm ci` | Clean install pinned to `package-lock.json` |
-| Start Command | `npm start` | Runs `node src/server.js` |
-| Instance Type | Free | No cost; see cold starts below |
-| Health Check Path | `/health` | Render GETs it; 2xx/3xx within 5 s = healthy. New deploys get traffic only after passing. |
-| Env var `NODE_ENV` | `production` | Standard production mode for Express |
-| Env var `PORT` | *don't set* | Render provides it (10000); the app reads it |
-| Env var `NODE_VERSION` | *optional* | Overrides `.node-version` if set |
+| Start Command | `npm start` | Runs `node src/server.js` (which migrates first when `MIGRATE_ON_START=true`) |
+| Health Check Path | `/health` | Liveness only. Render restarts instances that fail it, and a database blip shouldn't trigger restarts. Use `/ready` for monitoring and post-deploy checks. |
+| `DATABASE_URL` | Internal URL from the Render database | Private network, no public exposure |
+| `MIGRATE_ON_START` | `true` | Free instances can't run a pre-deploy command |
+| `TRUST_PROXY` | `1` | So rate limiting sees the client IP, not Render's proxy |
+| `PORT` | *don't set* | Render provides it |
 
-No secrets are needed for this stage.
+If migrations fail at startup, the process exits with `Startup failed: Migration ... failed: ...` in the
+Render logs. The deploy never goes live, and the previous version keeps serving.
 
-### Free plan cold starts
+### Free plan limits
 
-Free web services spin down after **15 minutes with no inbound traffic**. The next request waits
-**about one minute** while the service starts, and the browser may show a Render loading page. Health checks
-do not keep it awake. The workspace gets 750 free instance-hours per month. The filesystem is
-temporary and is wiped on each restart or deploy. For no spin-down, choose a paid instance type (costs money).
+- **Web service:** spins down after **15 minutes with no inbound traffic**. The next request waits **about
+  one minute**, and health checks don't keep it awake. 750 free instance-hours per workspace per month.
+- **Postgres (free):** expires **30 days after creation** (14-day grace period to upgrade before deletion),
+  1 GB storage, **no backups**, one free database per workspace, and it may restart for maintenance.
+
+### What survives a restart or redeploy
+
+The web service's filesystem is temporary. It's replaced on every deploy, restart, and spin-down. All
+durable state lives in Postgres, which is a separate service, so sessions and migration history
+**survive** restarts, redeploys, and spin-downs. Rate-limit counters live in memory and reset on each restart.
+Deleting the database (or letting the free one expire) loses everything.
