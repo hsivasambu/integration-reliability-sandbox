@@ -164,3 +164,11 @@ invalid 422, own GET 200, other session's GET 404, list 1 item, no token 401, /d
   success 200 (225 ms), server_error 503 (21 ms), timeout after 2007 ms with no status, 1 receipt.
   During a pending timeout delivery, `/health` answered 200 in 6 ms. Unauthenticated external POST got 401.
   Secret absent from the server log.
+
+**Deployed check (2026-10-04, by Claude, after pushing f277014).** Live in about 60 s with version 0.4.0.
+Startup succeeded, which confirms the Blueprint generated `RECEIVER_SECRET`. Migration 003 was applied,
+and /ready returned 200. The receiver rejected both no secret and a wrong secret with 401. `GET /v1/receiver`
+returned the default `success`. A PUT of `timeout` on session A returned 200; A then read `timeout` while
+session B still read `success`. Invalid mode 422; no token 401. Not verified on Render: the loopback
+self-call (`http://127.0.0.1:10000/...`). There's no shell on free instances, so it will first be
+exercised by the delivery worker stage.
