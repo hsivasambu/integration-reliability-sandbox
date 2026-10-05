@@ -19,12 +19,19 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const TITLE_FORBIDDEN = /[\u0000-\u001F\u007F]/;
 const MESSAGE_FORBIDDEN = /[\u0000-\u0009\u000B-\u001F\u007F]/;
 
-// Event data plus a summary of its delivery job (delivery state lives only in `deliveries`).
+// Event data plus a summary of its latest delivery (delivery state lives only in `deliveries`;
+// an event has its original delivery plus any manual replays).
 const EVENT_SELECT = `
   SELECT e.id, e.seq, e.type, e.payload, e.idempotency_key, e.request_hash,
-         e.created_at, e.updated_at, d.state AS delivery_state, d.attempt_count,
-         d.next_attempt_at, d.failure_reason
-  FROM events e JOIN deliveries d ON d.event_id = e.id`;
+         e.created_at, e.updated_at,
+         d.id AS delivery_id, d.state AS delivery_state, d.attempt_count,
+         d.next_attempt_at, d.failure_reason, d.replay_of,
+         (SELECT count(*)::int FROM deliveries r
+          WHERE r.event_id = e.id AND r.replay_of IS NOT NULL) AS replay_count
+  FROM events e
+  CROSS JOIN LATERAL (
+    SELECT * FROM deliveries WHERE event_id = e.id ORDER BY created_at DESC, id DESC LIMIT 1
+  ) d`;
 
 const isPlainObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -88,16 +95,19 @@ function toResource(row, maxAttempts) {
     idempotencyKey: row.idempotency_key,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    delivery: deliverySummary(row.delivery_state, row, maxAttempts, row.id),
+    delivery: { ...deliverySummary(row, maxAttempts, row.id), replayCount: row.replay_count },
   };
 }
 
 const statusUrl = (eventId) => `/v1/events/${eventId}/deliveries`;
 
-// Delivery fields shared by the event resource and the deliveries endpoint.
+// Delivery fields shared by the event resource, the deliveries endpoint, and replay responses.
 // nextAttemptAt is only shown while the delivery is waiting for an attempt.
-function deliverySummary(state, row, maxAttempts, eventId) {
+function deliverySummary(row, maxAttempts, eventId) {
+  const state = row.delivery_state;
   return {
+    id: row.delivery_id,
+    replayOf: row.replay_of ?? null,
     state,
     attemptCount: row.attempt_count,
     maxAttempts,
@@ -153,10 +163,11 @@ async function createEvent(pool, { sessionId, idempotencyKey, event, maxEvents }
       // The delivery job is created in the same transaction: either both exist or neither does.
       const { rows: [delivery] } = await client.query(
         `INSERT INTO deliveries (event_id) VALUES ($1)
-         RETURNING state AS delivery_state, attempt_count, next_attempt_at, failure_reason`,
+         RETURNING id AS delivery_id, state AS delivery_state, attempt_count,
+                   next_attempt_at, failure_reason, replay_of`,
         [inserted.rows[0].id]);
       await client.query('COMMIT');
-      return { outcome: 'created', row: { ...inserted.rows[0], ...delivery } };
+      return { outcome: 'created', row: { ...inserted.rows[0], ...delivery, replay_count: 0 } };
     }
 
     // The constraint rejected the insert: another writer stored this key first.
@@ -285,40 +296,43 @@ function eventRoutes(pool, { maxEventsPerSession, deliveryMaxAttempts }) {
     res.json({ event: resource(rows[0]) });
   });
 
-  // Delivery state and full attempt history for one of this session's events.
+  // Every delivery of one of this session's events (the original, then any replays, oldest
+  // first), each with its own attempt history. `delivery` is the latest one.
   router.get('/events/:id/deliveries', auth, async (req, res) => {
     if (!UUID_PATTERN.test(req.params.id)) return notFound(res);
-    const { rows: [delivery] } = await pool.query(
-      `SELECT d.id, d.state, d.attempt_count, d.next_attempt_at, d.failure_reason,
-              d.created_at, d.updated_at, d.completed_at
+    const { rows: deliveries } = await pool.query(
+      `SELECT d.id AS delivery_id, d.state AS delivery_state, d.attempt_count, d.next_attempt_at,
+              d.failure_reason, d.replay_of, d.created_at, d.updated_at, d.completed_at,
+              (SELECT r.id FROM deliveries r WHERE r.replay_of = d.id) AS replayed_by
        FROM deliveries d JOIN events e ON e.id = d.event_id
-       WHERE e.id = $1 AND e.session_id = $2`,
+       WHERE e.id = $1 AND e.session_id = $2
+       ORDER BY d.created_at, d.id`,
       [req.params.id, req.session.id]);
-    if (!delivery) return notFound(res);
+    if (deliveries.length === 0) return notFound(res);
     const { rows: attempts } = await pool.query(
-      `SELECT attempt_number, outcome, started_at, ended_at, response_status, error_category,
-              retryable, duration_ms
-       FROM delivery_attempts WHERE delivery_id = $1 ORDER BY attempt_number`,
-      [delivery.id]);
-    res.json({
-      eventId: req.params.id,
-      delivery: {
-        ...deliverySummary(delivery.state, delivery, deliveryMaxAttempts, req.params.id),
-        createdAt: delivery.created_at,
-        updatedAt: delivery.updated_at,
-        completedAt: delivery.completed_at,
-        attempts: attempts.map((a) => ({
-          attemptNumber: a.attempt_number,
-          outcome: a.outcome,
-          startedAt: a.started_at,
-          endedAt: a.ended_at,
-          responseStatus: a.response_status,
-          errorCategory: a.error_category,
-          retryable: a.retryable,
-          durationMs: a.duration_ms,
-        })),
-      },
-    });
+      `SELECT delivery_id, attempt_number, outcome, started_at, ended_at, response_status,
+              error_category, retryable, duration_ms
+       FROM delivery_attempts WHERE delivery_id = ANY($1) ORDER BY attempt_number`,
+      [deliveries.map((d) => d.delivery_id)]);
+
+    const history = deliveries.map((d) => ({
+      ...deliverySummary(d, deliveryMaxAttempts, req.params.id),
+      replayedBy: d.replayed_by,
+      createdAt: d.created_at,
+      updatedAt: d.updated_at,
+      completedAt: d.completed_at,
+      attempts: attempts.filter((a) => a.delivery_id === d.delivery_id).map((a) => ({
+        attemptNumber: a.attempt_number,
+        outcome: a.outcome,
+        startedAt: a.started_at,
+        endedAt: a.ended_at,
+        responseStatus: a.response_status,
+        errorCategory: a.error_category,
+        retryable: a.retryable,
+        durationMs: a.duration_ms,
+      })),
+    }));
+    res.json({ eventId: req.params.id, delivery: history.at(-1), deliveries: history });
   });
 
   router.all('/events', methodNotAllowed(['GET', 'HEAD', 'POST']));
@@ -327,4 +341,7 @@ function eventRoutes(pool, { maxEventsPerSession, deliveryMaxAttempts }) {
   return router;
 }
 
-module.exports = { eventRoutes, validateEvent, canonicalJson, LIMITS };
+module.exports = {
+  eventRoutes, validateEvent, canonicalJson, deliverySummary, statusUrl, LIMITS,
+  IDEMPOTENCY_KEY_PATTERN, UUID_PATTERN,
+};

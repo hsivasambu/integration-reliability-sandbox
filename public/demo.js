@@ -4,6 +4,8 @@ let token = null;
 let pendingKey = null;
 let lastRequest = null; // { key, body } of the most recent submission, for "send again"
 let lastStatusUrl = null; // delivery status URL of the most recent accepted event
+let lastDeliveryId = null; // latest delivery of that event (set by "Check delivery")
+let replayKey = null; // Idempotency-Key for the replay request in progress
 
 const $ = (id) => document.getElementById(id);
 
@@ -127,20 +129,26 @@ $('check-delivery').addEventListener('click', async () => {
     $('event-result').textContent = `HTTP ${response.status}: ${data?.message ?? 'error'}`;
     return;
   }
-  const { delivery } = data;
-  const lines = [`Delivery state: ${delivery.state} (attempt ${delivery.attemptCount} of ${delivery.maxAttempts})`];
-  if (delivery.state === 'pending') lines.push('Waiting for the worker to pick it up.');
-  if (delivery.nextAttemptAt && delivery.state === 'retry_scheduled') {
-    lines.push(`Next retry at ${new Date(delivery.nextAttemptAt).toLocaleTimeString()}`);
-  }
-  if (delivery.failureReason) lines.push(`Failed permanently: ${delivery.failureReason}`);
-  for (const a of delivery.attempts) {
-    lines.push(`Attempt ${a.attemptNumber}: ${a.outcome}`
-      + (a.responseStatus ? ` | HTTP ${a.responseStatus}` : '')
-      + (a.errorCategory ? ` | ${a.errorCategory}` : '')
-      + (a.retryable === true ? ' | retryable' : a.retryable === false ? ' | not retryable' : '')
-      + (a.durationMs !== null ? ` | ${a.durationMs} ms` : ''));
-  }
+  const lines = [];
+  // The original delivery first, then any replays, each with its own attempts.
+  data.deliveries.forEach((delivery, index) => {
+    lines.push(`${index === 0 ? 'Original delivery' : `Replay ${index}`}: ${delivery.state} `
+      + `(attempt ${delivery.attemptCount} of ${delivery.maxAttempts})`);
+    if (delivery.state === 'pending') lines.push('  Waiting for the worker to pick it up.');
+    if (delivery.nextAttemptAt && delivery.state === 'retry_scheduled') {
+      lines.push(`  Next retry at ${new Date(delivery.nextAttemptAt).toLocaleTimeString()}`);
+    }
+    if (delivery.failureReason) lines.push(`  Failed permanently: ${delivery.failureReason}`);
+    for (const a of delivery.attempts) {
+      lines.push(`  Attempt ${a.attemptNumber}: ${a.outcome}`
+        + (a.responseStatus ? ` | HTTP ${a.responseStatus}` : '')
+        + (a.errorCategory ? ` | ${a.errorCategory}` : '')
+        + (a.retryable === true ? ' | retryable' : a.retryable === false ? ' | not retryable' : '')
+        + (a.durationMs !== null ? ` | ${a.durationMs} ms` : ''));
+    }
+  });
+  lastDeliveryId = data.delivery.id;
+  if (data.delivery.state === 'failed') lines.push('', 'This delivery failed permanently; you can replay it.');
   // The receiver's side of the story, which the sender cannot see directly.
   const eventId = lastStatusUrl.split('/')[3];
   const receipt = await api('GET', `/v1/receiver/receipts/${eventId}`);
@@ -151,4 +159,21 @@ $('check-delivery').addEventListener('click', async () => {
       : '  not processed');
   }
   $('event-result').textContent = lines.join('\n');
+});
+
+// Replays the latest delivery of the last event. The key is kept until the server answers,
+// so a retried click after a network error cannot schedule a second replay.
+$('replay').addEventListener('click', async () => {
+  if (!lastDeliveryId) return void ($('event-result').textContent = 'Click "Check delivery" first.');
+  replayKey ??= crypto.randomUUID();
+  try {
+    const { response, data } = await api('POST', `/v1/deliveries/${lastDeliveryId}/replay`,
+      { headers: { 'Idempotency-Key': replayKey } });
+    replayKey = null;
+    $('event-result').textContent = response.status === 202 || response.status === 200
+      ? `HTTP ${response.status}: ${data.notice}\nNew delivery: ${data.delivery.state}. Click "Check delivery" to follow it.`
+      : `HTTP ${response.status}: ${data?.message ?? 'error'}`;
+  } catch (err) {
+    $('event-result').textContent = `Network error: ${err.message}. Click Replay again to retry safely.`;
+  }
 });

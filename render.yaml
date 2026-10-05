@@ -52,6 +52,9 @@ services:
         value: "2000"
       - key: WORKER_CONCURRENCY
         value: "2"
+      # Manual replays allowed per event.
+      - key: MAX_REPLAYS_PER_EVENT
+        value: "3"
     # PORT is set by Render (default 10000); HOST defaults to 0.0.0.0 in code.
     # Node version comes from .node-version (24).
 

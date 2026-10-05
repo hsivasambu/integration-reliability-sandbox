@@ -2,7 +2,7 @@
 
 A learning sandbox that will accept synthetic JSON events, persist them, and deliver them
 reliably to a controlled mock receiver.
-**Current stage: 7. Receiver-side duplicate protection and the ambiguous timeout scenario.**
+**Current stage: 8. Manual replay of a failed delivery.**
 
 ## Requirements
 
@@ -51,6 +51,7 @@ The server refuses to start, and lists every problem, if required settings are m
 | `DELIVERY_MAX_ATTEMPTS` | `4` | Total attempts per delivery, including the first and any lost to crashes |
 | `RETRY_BASE_DELAY_MS` | `2000` | Retry *n* waits base × 2^(n−1): 2 s, 4 s, 8 s |
 | `WORKER_CONCURRENCY` | `2` | Deliveries one worker sends at the same time (1–10) |
+| `MAX_REPLAYS_PER_EVENT` | `3` | Manual replays allowed per event (0–10) |
 | `TEST_DATABASE_URL` | unset | Test database. Its name must end in `_test` because tests wipe it. |
 
 ## Database migrations
@@ -74,7 +75,7 @@ database only accepts connections from Render's private network (`ipAllowList: [
 
 | Method & path | Response |
 |---|---|
-| `GET /health` | `200 {"status":"ok","version":"0.5.0","inProcessWorker":true|false}` while the process runs (no database check) |
+| `GET /health` | `200 {"status":"ok","version":"0.8.0","inProcessWorker":true|false}` while the process runs (no database check) |
 | `HEAD /health` | `200`, headers only |
 | `GET /ready` | `200 {"status":"ready"}` if the database is reachable and migrated, otherwise `503` with `reason` |
 | `POST /v1/sessions` | `201` with a new demo token (shown once), `429` if rate limited, `503` at capacity |
@@ -82,7 +83,8 @@ database only accepts connections from Render's private network (`ipAllowList: [
 | `POST /v1/events` | `202` accepted for asynchronous delivery (`eventId`, `statusUrl`); `200` identical repeat; `409` key reused with different payload; see [Events](#events) |
 | `GET /v1/events?limit=&cursor=` | `200 {"data":[...],"nextCursor"}`: your session's events, newest first |
 | `GET /v1/events/{id}` | `200 {"event"}` (including a `delivery` summary) if it belongs to your session, otherwise `404` |
-| `GET /v1/events/{id}/deliveries` | `200` delivery state, `nextAttemptAt`, `failureReason`, and attempt history for your session's event, otherwise `404` |
+| `GET /v1/events/{id}/deliveries` | `200` every delivery of your event (original, then replays) with its attempts; `delivery` = the latest; otherwise `404` |
+| `POST /v1/deliveries/{id}/replay` | `202` replay scheduled; requires `Idempotency-Key`; see [Replay](#manual-replay) |
 | `GET /v1/receiver` | `200 {"mode","availableModes","processedCount","duplicateCount",...}`: your session's mock receiver settings and counts |
 | `GET /v1/receiver/receipts/{eventId}` | `200` the receiver's view of one of your events: `processed`, `result`, `deliveriesReceived`, `duplicateCount`; otherwise `404` |
 | `PUT /v1/receiver` | Body `{"mode": "<one of the four modes>"}`, which changes **your session's** mode |
@@ -286,6 +288,50 @@ receiver deduplicates by event ID (see [Duplicate protection](#duplicate-protect
 On Render's free plan the instance sleeps after 15 minutes without inbound traffic, and the worker sleeps
 with it. Pending deliveries wait in Postgres until the next request wakes the service. The worker's own
 loopback calls don't count as inbound traffic.
+
+## Manual replay
+
+When a delivery has **failed for good** (`state: "failed"`), the session that owns it can ask for it to
+be sent again:
+
+```
+POST /v1/deliveries/{deliveryId}/replay
+Authorization: Bearer <token>
+Idempotency-Key: <new UUID per replay request>
+```
+
+The delivery ID is `event.delivery.id` (or an entry in `GET /v1/events/{id}/deliveries`). The request has no body.
+
+**What happens.** The failed delivery and its attempts are **left untouched**. A **new delivery** of the same
+event is created, linked by `replayOf`, with a **fresh 4-attempt budget**, and the worker picks it up like
+any other. It sends the **same event ID**, so if the receiver had in fact already processed the event, it
+answers "duplicate" and nothing is processed twice.
+
+| Situation | Response |
+|---|---|
+| Failed delivery, new key | `202` + `Location` (event's delivery history): `{ eventId, statusUrl, delivery: { id, replayOf, state: "pending", attemptCount: 0, ... } }` |
+| Same key, same delivery again (even after the replay finished) | `200` + `Idempotent-Replayed: true`, the **same** replay delivery with its current state |
+| No / invalid token | `401` |
+| Delivery doesn't exist or belongs to another session | `404 not_found` |
+| Delivery is `pending`, `retry_scheduled`, `in_progress` or `delivered` | `409 delivery_not_failed` with `state` |
+| Delivery was already replayed (with another key) | `409 already_replayed` with `replayDeliveryId`. Replay the newer delivery if it fails too. |
+| Key already used to replay a *different* delivery | `409 idempotency_key_conflict` |
+| Event already has `MAX_REPLAYS_PER_EVENT` (3) replays | `429 replay_limit_reached` with `limit` |
+| Missing / malformed `Idempotency-Key`, or a body | `400` / `422` |
+
+**Rules enforced by the database** (migration 007), so concurrent requests can't break them:
+- `deliveries.replay_of` is **UNIQUE**: a delivery can be replayed at most once.
+- Partial unique index `deliveries_one_active_per_event`: at most **one active** (`pending`,
+  `retry_scheduled` or `in_progress`) delivery per event.
+- `replay_requests` has **UNIQUE (session_id, idempotency_key)**.
+
+The request runs in one transaction that first locks the event row, so replays of the same event
+are handled one at a time. If two requests still collide on a constraint, the loser re-checks once and
+gets the normal `200`/`409` answer.
+
+**History.** `GET /v1/events/{id}/deliveries` returns `deliveries: [original, replay 1, ...]`, each with its own
+`attempts` (numbered from 1), `replayOf` and `replayedBy`. The event summary shows the latest delivery and a
+`replayCount`.
 
 ## Mock receiver
 

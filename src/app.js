@@ -6,6 +6,7 @@ const { createRateLimiter } = require('./rate-limit');
 const { pendingMigrations } = require('./migrate');
 const { requireSession } = require('./auth');
 const { eventRoutes } = require('./events');
+const { replayRoutes } = require('./replay');
 const { receiverRoutes, receiverSettingsRoutes } = require('./receiver');
 const { sendError, methodNotAllowed } = require('./errors');
 
@@ -19,6 +20,7 @@ const DEFAULTS = {
   receiverSlowResponseMs: 4000,
   workerEnabled: false,
   deliveryMaxAttempts: 4,
+  maxReplaysPerEvent: 3,
 };
 
 function createApp({ pool, config = {} } = {}) {
@@ -89,6 +91,7 @@ function createApp({ pool, config = {} } = {}) {
   app.all('/v1/session', methodNotAllowed(['GET', 'HEAD']));
 
   app.use('/v1', eventRoutes(pool, settings));
+  app.use('/v1', replayRoutes(pool, settings));
   app.use('/v1', receiverSettingsRoutes(pool));
 
   // Mock receiver for server-side callers only (protected by RECEIVER_SECRET).

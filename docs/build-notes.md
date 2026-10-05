@@ -390,3 +390,61 @@ second deploy. `/ready` 200.
 - process_then_timeout, then switched to success before the retry: delivered on #2; receiver processed once, 1 duplicate.
 - Plain timeout: after about 6 s, #1 timeout, #2 in progress; receiver `processed=false`.
 - Session totals: processedCount 2, duplicateCount 2. Another session reading a receipt: 404.
+
+## Stage 8: Manual replay of a failed delivery (2026-10-05)
+
+**Decisions**
+- **Migration 007.**
+  - Dropped `deliveries_event_id_key`: an event can now have several deliveries.
+  - Added `deliveries.replay_of` (UNIQUE, self-FK): each delivery is replayed at most once.
+  - Added partial unique index `deliveries_one_active_per_event` on `(event_id)` where the state is
+    pending/retry_scheduled/in_progress.
+  - New `replay_requests` table with `UNIQUE (session_id, idempotency_key)`, linking the original
+    delivery to the replay.
+- **Endpoint.** `POST /v1/deliveries/{id}/replay` (`src/replay.js`) in one transaction:
+  1. find the delivery in this session (else 404) and `FOR UPDATE OF` its event row
+  2. a prior request with the same key → same delivery: 200 replay; different delivery: 409
+     `idempotency_key_conflict`
+  3. state ≠ failed → 409 `delivery_not_failed` (+ state)
+  4. already has a replay → 409 `already_replayed` (+ id)
+  5. replays for the event ≥ `MAX_REPLAYS_PER_EVENT` (3) → 429 `replay_limit_reached`
+  6. insert the delivery (`replay_of`) and the `replay_requests` row → 202
+
+  On a unique violation (a race the lock didn't cover), re-check once. The key check comes before the
+  eligibility checks so an identical request still returns its replay after it has completed.
+- The new delivery starts at `attempt_count 0` with the full 4-attempt budget; attempt numbers restart at
+  1 per delivery. The worker needed no change and sends the same `event.id`, so receiver deduplication
+  still applies.
+- **API.**
+  - The event summary now reflects the **latest** delivery (`LATERAL … ORDER BY created_at DESC LIMIT 1`)
+    and adds `id`, `replayOf`, and `replayCount`.
+  - `GET /v1/events/{id}/deliveries` returns `deliveries[]` (oldest first, each with attempts,
+    `replayOf`, `replayedBy`) plus `delivery` = latest, for compatibility.
+- Minimal UI only: a "Replay failed delivery" button (keeps its key until a server answer) and a
+  per-delivery history in "Check delivery". The full UI is deferred.
+
+**Verification (local, Node 22.18.0, Postgres 18.6)**
+- `npm test`: 106/106 pass, 3 consecutive clean runs. 8 new tests in `test/replay.test.js` (controllable
+  clock):
+  - failed → replay 202 (replayOf, attemptCount 0, max 4) → delivered; history shows 2 deliveries; the
+    original's attempts are deep-equal before and after; the receiver processed the event ID once
+  - replay of an event the receiver had already processed → duplicate recognized, original result kept
+  - same key → 202 then 200 (same id), still 200 after the replay is delivered
+  - 8 concurrent requests with the same key → one 202 and seven 200s with one id; 8 concurrent with
+    different keys → one 202 and seven 409 `already_replayed`; exactly one replay row, never more than
+    one active
+  - other session / random / malformed id → 404, no token → 401, nothing scheduled
+  - pending, delivered, and retry_scheduled → 409 with state
+  - already_replayed, key conflict, missing key 400, body 422, cap (2 in tests) → 429; chain history
+    `replayOf` links
+  - direct SQL inserts rejected by `deliveries_one_active_per_event` and `deliveries_replay_of_key`
+- Mutation checks:
+  - Without the `FOR UPDATE` lock, the concurrent test still passed: constraints plus the one re-check
+    produced exactly one replay.
+  - Removing the re-check as well made the losing requests fail with errors, instead of a clean 409/200.
+- Live (port 3132, worker on, real timing):
+  - server_error: original failed after 4 attempts (503 ×4). Switched to success; replay K1 → 202
+    (pending, 0 attempts); K1 again → 200 + `Idempotent-Replayed`; K2 → 409 `already_replayed`; other
+    session → 404.
+  - About 2.5 s later the history showed the original failed (4×503) and the replay delivered (1×200).
+    Replaying the delivered replay → 409 `delivery_not_failed`. Receiver: processed once, 0 duplicates.

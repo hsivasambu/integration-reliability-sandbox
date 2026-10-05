@@ -63,6 +63,8 @@ function loadConfig(env = process.env) {
   config.retryBaseDelayMs = intSetting(env, 'RETRY_BASE_DELAY_MS', 2000, 100, 60_000, problems);
   // Deliveries one worker sends at the same time.
   config.workerConcurrency = intSetting(env, 'WORKER_CONCURRENCY', 2, 1, 10, problems);
+  // Manual replays allowed per event (each replay gets a fresh attempt budget).
+  config.maxReplaysPerEvent = intSetting(env, 'MAX_REPLAYS_PER_EVENT', 3, 0, 10, problems);
   if (config.deliveryLeaseMs < config.deliveryTimeoutMs + 1000) {
     problems.push('DELIVERY_LEASE_MS must be at least DELIVERY_TIMEOUT_MS + 1000, or healthy attempts would lose their lease');
   }
