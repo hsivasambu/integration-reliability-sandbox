@@ -402,10 +402,10 @@ const SCENARIOS = [
     eventTitle: 'Scenario 1: temporary receiver outage',
     steps: [
       'Start: the receiver is set to server_error and one event is submitted.',
-      'Wait until attempt 1 shows "failed, HTTP 503" and a retry time (about 2 seconds).',
-      'Click "Switch receiver to success" before the retry runs.',
+      'Watch attempt 1 fail with HTTP 503 and a retry get scheduled (retries follow after 2, 4 and 8 seconds).',
+      'Click "Switch receiver to success" before the 4th attempt (you have about 14 seconds).',
     ],
-    expected: 'The next attempt is delivered (HTTP 200). History: attempt 1 failed (503, retryable), then delivered. The receiver processed the event once.',
+    expected: 'The first attempt after the switch is delivered (HTTP 200). Earlier attempts show failed, HTTP 503, retryable. The receiver processed the event once.',
     followUp: { label: 'Switch receiver to success', mode: 'success' },
   },
   {

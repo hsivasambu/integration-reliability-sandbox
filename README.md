@@ -216,8 +216,9 @@ A single page served by the same app (`public/`). It uses plain JavaScript with 
 | Event details | Three separate lanes: **1. Accepted by the API** (202, idempotency key, *Submit duplicate*), **2. HTTP delivery** (every delivery and attempt, *Replay failed delivery*), **3. Receiver processing** (processed?, confirmation code, duplicates) |
 
 **Guided scenarios** (each sets the receiver mode and submits one event):
-1. **Recover from a temporary failure** (`server_error`, then *Switch receiver to success*). Expected: attempt 1
-   failed (503, retryable), attempt 2 delivered; the receiver processed once.
+1. **Recover from a temporary failure** (`server_error`, then *Switch receiver to success* any time in the
+   ~14 s before the 4th attempt). Expected: the attempts before the switch failed (503, retryable), and the
+   first attempt after it is delivered; the receiver processed once.
 2. **Prevent duplicate processing after a timeout** (`process_then_timeout`). Expected: attempt 1 timeout with no
    response while the receiver already shows "processed"; attempt 2 delivered; the receiver shows 1 duplicate
    and the same confirmation code.
