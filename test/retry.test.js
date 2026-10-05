@@ -118,7 +118,7 @@ describe('retry scheduling (controllable clock)', { skip }, () => {
     return res.body.delivery;
   }
   const receipts = async (session) => (await pool.query(
-    'SELECT count(*)::int AS count FROM receiver_receipts WHERE session_id = $1', [session.id])).rows[0].count;
+    'SELECT count(*)::int AS count FROM mock_receiver_receipts WHERE session_id = $1', [session.id])).rows[0].count;
   const at = (ms) => new Date(ms).toISOString();
 
   test('immediate success: one attempt, delivered, nothing scheduled', async () => {

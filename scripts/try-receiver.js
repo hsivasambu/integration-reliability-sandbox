@@ -38,13 +38,23 @@ async function main() {
         payload: { title: 'Synthetic title', message: 'Synthetic message' },
       });
       const status = result.status ?? '-';
-      const detail = result.body?.error ?? result.error ?? (result.body?.received ? 'received' : '');
-      console.log(`${mode.padEnd(13)} -> ${result.outcome.padEnd(13)} HTTP ${String(status).padEnd(4)} ${String(result.durationMs).padStart(5)} ms  ${detail}`);
+      const detail = result.body?.error ?? result.error ?? (result.body?.received ? `received (duplicate=${result.body.duplicate})` : '');
+      console.log(`${mode.padEnd(20)} -> ${result.outcome.padEnd(13)} HTTP ${String(status).padEnd(4)} ${String(result.durationMs).padStart(5)} ms  ${detail}`);
     }
 
     const { rows: [{ count }] } = await pool.query(
-      'SELECT count(*)::int AS count FROM receiver_receipts WHERE session_id = $1', [session.id]);
-    console.log(`\nReceipts recorded by the receiver: ${count} (only 'success' processes deliveries)`);
+      'SELECT count(*)::int AS count FROM mock_receiver_receipts WHERE session_id = $1', [session.id]);
+    console.log(`\nEvents processed by the receiver: ${count} (success and process_then_timeout process; the others do not)`);
+
+    // Deliver one event twice: the second copy is recognized by its event ID.
+    await pool.query("UPDATE receiver_settings SET mode = 'success' WHERE session_id = $1", [session.id]);
+    const copy = {
+      sessionId: session.id, eventId: crypto.randomUUID(), type: 'demo.notification', payload: { title: 'Duplicate demo' },
+    };
+    const first = await send(copy);
+    const second = await send(copy);
+    console.log(`Same event sent twice: duplicate=${first.body.duplicate}, then duplicate=${second.body.duplicate}; `
+      + `same result both times: ${first.body.result.confirmationCode === second.body.result.confirmationCode}`);
     await pool.query('DELETE FROM demo_sessions WHERE id = $1', [session.id]);
   } finally {
     await pool.end();

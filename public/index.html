@@ -57,12 +57,14 @@
   <section>
     <h2>Mock receiver mode</h2>
     <p>Choose how this session's simulated destination behaves. It applies to your session only and
-       affects events delivered after you change it.</p>
+       affects events delivered after you change it. In every mode, an event the receiver has already
+       processed is recognized by its event ID and answered with the original result, not processed again.</p>
     <label>Mode
       <select id="receiver-mode">
         <option value="success">success: answers 200 immediately</option>
         <option value="server_error">server_error: answers 503, processes nothing</option>
-        <option value="timeout">timeout: answers too late (after the 2 s client timeout)</option>
+        <option value="timeout">timeout: answers too late (after the 2 s client timeout), processes nothing</option>
+        <option value="process_then_timeout">process_then_timeout: processes, then answers too late</option>
       </select>
     </label>
     <button id="save-mode" type="button">Save mode</button>

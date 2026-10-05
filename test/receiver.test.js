@@ -74,7 +74,7 @@ describe('mock receiver', { skip }, () => {
     payload: { title: 'Synthetic title', message: 'Synthetic message' },
   });
   const receipts = async (session) => (await pool.query(
-    'SELECT count(*)::int AS count FROM receiver_receipts WHERE session_id = $1', [session.id])).rows[0].count;
+    'SELECT count(*)::int AS count FROM mock_receiver_receipts WHERE session_id = $1', [session.id])).rows[0].count;
 
   async function waitFor(check, ms = 1000) {
     const deadline = Date.now() + ms;
@@ -91,7 +91,7 @@ describe('mock receiver', { skip }, () => {
       const res = await request(server).get('/v1/receiver').set('Authorization', `Bearer ${session.token}`);
       assert.equal(res.status, 200);
       assert.equal(res.body.mode, 'success');
-      assert.deepEqual(res.body.availableModes, ['success', 'server_error', 'timeout']);
+      assert.deepEqual(res.body.availableModes, ['success', 'server_error', 'timeout', 'process_then_timeout']);
     });
 
     test('success: 200 immediately and the delivery is processed', async () => {

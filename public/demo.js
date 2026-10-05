@@ -102,7 +102,8 @@ $('refresh').addEventListener('click', async () => {
 
 function showReceiver(response, data) {
   $('receiver-status').textContent = response.status === 200
-    ? `Mode: ${data.mode}\nDeliveries processed by the receiver: ${data.receivedCount}\n${data.notice}`
+    ? `Mode: ${data.mode}\nEvents processed by the receiver: ${data.processedCount}\n`
+      + `Duplicate deliveries recognized (not re-processed): ${data.duplicateCount}\n${data.notice}`
     : `HTTP ${response.status}: ${data?.message ?? 'error'}`;
   if (response.status === 200) $('receiver-mode').value = data.mode;
 }
@@ -139,6 +140,15 @@ $('check-delivery').addEventListener('click', async () => {
       + (a.errorCategory ? ` | ${a.errorCategory}` : '')
       + (a.retryable === true ? ' | retryable' : a.retryable === false ? ' | not retryable' : '')
       + (a.durationMs !== null ? ` | ${a.durationMs} ms` : ''));
+  }
+  // The receiver's side of the story, which the sender cannot see directly.
+  const eventId = lastStatusUrl.split('/')[3];
+  const receipt = await api('GET', `/v1/receiver/receipts/${eventId}`);
+  if (receipt.response.status === 200) {
+    const r = receipt.data;
+    lines.push('', 'Receiver view:', r.processed
+      ? `  processed once (${r.result.confirmationCode}); deliveries received: ${r.deliveriesReceived}, duplicates: ${r.duplicateCount}`
+      : '  not processed');
   }
   $('event-result').textContent = lines.join('\n');
 });

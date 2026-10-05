@@ -81,7 +81,7 @@ describe('delivery worker', { skip }, () => {
     return res.body.delivery;
   }
   const receipts = async (session) => (await pool.query(
-    'SELECT count(*)::int AS count FROM receiver_receipts WHERE session_id = $1', [session.id])).rows[0].count;
+    'SELECT count(*)::int AS count FROM mock_receiver_receipts WHERE session_id = $1', [session.id])).rows[0].count;
   const expireLeases = () => pool.query(
     "UPDATE deliveries SET lease_expires_at = now() - interval '1 second' WHERE state = 'in_progress'");
   async function waitFor(check, ms = 3000) {
@@ -225,7 +225,7 @@ describe('delivery worker', { skip }, () => {
       assert.equal(await receipts(session), 1);
     });
 
-    test('crash after the receiver processed it: the delivery is sent again (at-least-once)', async () => {
+    test('crash after the receiver processed it: sent again (at-least-once), receiver recognizes the duplicate', async () => {
       const session = await newSession();
       const eventId = await submitEvent(session);
       const job = await claimNext(pool, { leaseMs: LEASE_MS });
@@ -234,7 +234,11 @@ describe('delivery worker', { skip }, () => {
       await expireLeases();                      // ...but the worker crashed before recording that
 
       await newWorker().runOnce();
-      assert.equal(await receipts(session), 2, 'receiver processed the same event twice');
+      // The sender delivered twice; the receiver processed once and counted one duplicate.
+      assert.equal(await receipts(session), 1, 'receiver processed the event once');
+      const { rows: [row] } = await pool.query(
+        'SELECT delivery_count FROM mock_receiver_receipts WHERE event_id = $1', [eventId]);
+      assert.equal(row.delivery_count, 2, 'the receiver saw two deliveries');
       const delivery = await history(session, eventId);
       assert.deepEqual(delivery.attempts.map((a) => a.outcome), ['lease_expired', 'delivered']);
     });

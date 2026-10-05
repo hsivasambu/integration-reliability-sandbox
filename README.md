@@ -2,7 +2,7 @@
 
 A learning sandbox that will accept synthetic JSON events, persist them, and deliver them
 reliably to a controlled mock receiver.
-**Current stage: 6. Durable retry scheduling (4 attempts: 2 s, 4 s, 8 s) and terminal failure.**
+**Current stage: 7. Receiver-side duplicate protection and the ambiguous timeout scenario.**
 
 ## Requirements
 
@@ -83,8 +83,9 @@ database only accepts connections from Render's private network (`ipAllowList: [
 | `GET /v1/events?limit=&cursor=` | `200 {"data":[...],"nextCursor"}`: your session's events, newest first |
 | `GET /v1/events/{id}` | `200 {"event"}` (including a `delivery` summary) if it belongs to your session, otherwise `404` |
 | `GET /v1/events/{id}/deliveries` | `200` delivery state, `nextAttemptAt`, `failureReason`, and attempt history for your session's event, otherwise `404` |
-| `GET /v1/receiver` | `200 {"mode","availableModes","receivedCount",...}`: your session's mock receiver settings |
-| `PUT /v1/receiver` | Body `{"mode":"success"|"server_error"|"timeout"}`, which changes **your session's** mode |
+| `GET /v1/receiver` | `200 {"mode","availableModes","processedCount","duplicateCount",...}`: your session's mock receiver settings and counts |
+| `GET /v1/receiver/receipts/{eventId}` | `200` the receiver's view of one of your events: `processed`, `result`, `deliveriesReceived`, `duplicateCount`; otherwise `404` |
+| `PUT /v1/receiver` | Body `{"mode": "<one of the four modes>"}`, which changes **your session's** mode |
 | `POST /internal/receiver/deliveries` | Mock receiver. Requires `Authorization: Bearer <RECEIVER_SECRET>`; `401` otherwise. Server-side callers only. |
 | Wrong method on any route above | `405` with an `Allow` header |
 | `GET /` | Landing page |
@@ -269,9 +270,10 @@ deterministic so the timeline is easy to follow.
 responses often include one. The worker currently ignores it and uses its own schedule.
 
 **At-least-once, not exactly-once.** If a worker crashes *after* the receiver processed a delivery but
-*before* it recorded the result, the lease expires and another worker sends it again. The receiver then
-sees the event twice. No sender can rule this out, because the confirmation can be lost after the work is
-done. Duplicate handling on the receiving side comes in a later stage.
+*before* it recorded the result, the lease expires and another worker sends it again. A timed-out
+attempt that the receiver actually processed is retried too. No sender can rule this out, because the
+confirmation can be lost after the work is done. The sender therefore delivers at least once, and the
+receiver deduplicates by event ID (see [Duplicate protection](#duplicate-protection-at-the-receiver)).
 
 **Worker disabled vs enabled** (`/health` shows `"inProcessWorker"`):
 
@@ -297,11 +299,15 @@ visitors can never supply a URL. Request bodies are limited to 4 KB, and unknown
 
 **Modes, per demo session** (stored in PostgreSQL table `receiver_settings`; default `success`):
 
-| Mode | Receiver behaviour | What the delivery client reports |
+| Mode | Receiver behaviour (for an event it has *not* processed yet) | What the sender reports |
 |---|---|---|
-| `success` | Records a receipt, answers `200` immediately | `delivered`, HTTP 200 |
-| `server_error` | Answers `503` + `Retry-After: 1` immediately, records nothing | `http_error`, HTTP 503 |
-| `timeout` | Waits 4 s (asynchronously), then answers `503 simulated_slow_response`, records nothing | `timeout` after 2 s, no HTTP status |
+| `success` | Processes it, answers `200` immediately | `delivered`, HTTP 200 |
+| `server_error` | Answers `503` + `Retry-After: 1`, processes nothing | `http_error`, HTTP 503 |
+| `timeout` | Waits 4 s, then answers `503 simulated_slow_response`; processes nothing | `timeout` after 2 s |
+| `process_then_timeout` | **Processes it and commits first**, then waits 4 s before answering `200` | `timeout` after 2 s |
+
+In **every** mode, an event that's already been processed is recognized first and answered `200` with
+its original result, before any simulated failure or delay.
 
 Set the mode with `PUT /v1/receiver` (your session token) or the **Mock receiver mode** panel on the
 landing page. One visitor's mode never affects another's.
@@ -315,6 +321,53 @@ or was processed but the reply got lost. That uncertainty is why retries need id
 never writes a late response. No timers or errors are left behind. The wait uses an async timer, so
 `/health` and other requests keep being served while a slow response is pending.
 
+## Duplicate protection at the receiver
+
+Two different protections exist, and they solve different problems:
+
+| | Submission idempotency (Stage 3) | Receiver idempotency (Stage 7) |
+|---|---|---|
+| Protects against | A client submitting the same event twice | The sender delivering the same event twice |
+| Key | `Idempotency-Key` header, per session | The stable `eventId` in every delivery |
+| Enforced by | `UNIQUE (session_id, idempotency_key)` on `events` | `UNIQUE (session_id, event_id)` on `mock_receiver_receipts` |
+| Without it | Two events, two deliveries | One event, but processed twice after a retry |
+
+Submission idempotency can't help with the second problem. There is exactly one event; it's the
+**delivery** that repeats, because retries and crash recovery send the same event again. Conversely,
+receiver deduplication is by event ID, not content: two submissions with different keys are two events
+and are both processed.
+
+**How the receiver does it.** Every delivery carries the event's ID, which never changes across retries
+(and will be reused by replay). The receiver:
+1. Looks up `(session_id, event_id)` in `mock_receiver_receipts`. If it's there, it adds 1 to
+   `delivery_count` and answers `200` with `duplicate: true` and the **original** result. Nothing is redone.
+2. Otherwise, depending on the mode, it processes the event. One SQL statement (one transaction) inserts
+   the receipt **together with** its synthetic result (`confirmationCode`, `summary`). If a concurrent copy
+   inserted first, the unique constraint turns this into a duplicate count instead.
+
+Duplicates are counted on the event's single row, not logged one by one, so storage stays at one row per
+event. Read them via `GET /v1/receiver` (`processedCount`, `duplicateCount`) and
+`GET /v1/receiver/receipts/{eventId}`.
+
+**This isn't exactly-once in general.** It protects *this* receiver's own effect because the receipt and
+the result commit atomically in one database. A real external system only gets the same protection if it
+also records the event ID atomically with its side effect. An email sent or a card charged before a crash
+can't be "un-done" by a receipt table.
+
+### The ambiguous timeout: what each side knows
+
+With `process_then_timeout`, the full sequence is:
+
+| Time | Receiver (what really happened) | Sender (what it can observe) |
+|---|---|---|
+| 0 s | Receives event `E`, processes it, commits receipt `RCPT-…` | Waiting |
+| 2 s | Still delaying its reply | Timeout: attempt 1 `failed`, `timeout`, **no status**. It can't tell "never arrived" from "done, reply lost". |
+| 2 s | Notices the disconnect and stops; never replies | Schedules a retry for 4 s (2 s backoff) |
+| 4 s | Receives `E` again, finds the receipt, answers `200 duplicate` | Attempt 2 `delivered` |
+
+Final state: the sender shows **2 attempts**, the receiver shows **processed once, 1 duplicate**. Without
+receiver deduplication, the retry would have produced a second result.
+
 ### Try it locally
 
 ```sh
@@ -326,11 +379,13 @@ npm run receiver:try -- timeout
 Expected (timings vary):
 
 ```
-success       -> delivered     HTTP 200     25 ms  received
-server_error  -> http_error    HTTP 503     21 ms  simulated_server_error
-timeout       -> timeout       HTTP -     2007 ms  no response within 2000 ms
+success              -> delivered     HTTP 200     69 ms  received (duplicate=false)
+server_error         -> http_error    HTTP 503     14 ms  simulated_server_error
+timeout              -> timeout       HTTP -     2009 ms  no response within 2000 ms
+process_then_timeout -> timeout       HTTP -     2005 ms  no response within 2000 ms
 
-Receipts recorded by the receiver: 1 (only 'success' processes deliveries)
+Events processed by the receiver: 2 (success and process_then_timeout process; the others do not)
+Same event sent twice: duplicate=false, then duplicate=true; same result both times: true
 ```
 
 The script creates a throwaway session directly in the database, so it needs `DATABASE_URL` and

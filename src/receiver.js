@@ -1,5 +1,10 @@
 // Mock receiver: a controlled stand-in for an external system that receives deliveries.
 // Its behaviour is chosen per demo session and stored in PostgreSQL.
+//
+// It processes each event at most once: the event ID in every delivery is checked against
+// mock_receiver_receipts, whose UNIQUE (session_id, event_id) constraint decides which copy
+// is first. This protects only this receiver's own effect; it is not a general exactly-once
+// guarantee for arbitrary external systems.
 
 const crypto = require('node:crypto');
 const { setTimeout: delay } = require('node:timers/promises');
@@ -7,7 +12,8 @@ const express = require('express');
 const { requireSession } = require('./auth');
 const { sendError, methodNotAllowed } = require('./errors');
 
-const MODES = ['success', 'server_error', 'timeout'];
+const MODES = ['success', 'server_error', 'timeout', 'process_then_timeout'];
+const RECEIPT_COLUMNS = 'id, event_id, result, first_received_at, last_received_at, delivery_count';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isPlainObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -55,10 +61,65 @@ async function getMode(pool, sessionId) {
   return rows[0] ?? null;
 }
 
+// If the event was already processed, counts this delivery as a duplicate and returns the
+// stored receipt; otherwise returns null. Nothing is processed here.
+async function recognizeDuplicate(pool, { sessionId, eventId }) {
+  const { rows } = await pool.query(
+    `UPDATE mock_receiver_receipts
+     SET delivery_count = delivery_count + 1, last_received_at = now()
+     WHERE session_id = $1 AND event_id = $2
+     RETURNING ${RECEIPT_COLUMNS}`,
+    [sessionId, eventId]);
+  return rows[0] ?? null;
+}
+
+// Processes the event at most once. A single statement (one transaction) records the receipt
+// together with its synthetic result. If a concurrent copy got there first, the unique
+// constraint turns this into a duplicate count instead, and the original result is returned.
+async function processOnce(pool, { sessionId, eventId, payload }) {
+  const title = typeof payload.title === 'string' ? payload.title.slice(0, 100) : '(untitled)';
+  const result = {
+    confirmationCode: `RCPT-${crypto.randomBytes(4).toString('hex').toUpperCase()}`,
+    summary: `Notification recorded: ${title}`,
+  };
+  const { rows: [receipt] } = await pool.query(
+    `INSERT INTO mock_receiver_receipts (session_id, event_id, result) VALUES ($1, $2, $3)
+     ON CONFLICT ON CONSTRAINT mock_receiver_receipts_session_event_unique
+     DO UPDATE SET delivery_count = mock_receiver_receipts.delivery_count + 1, last_received_at = now()
+     RETURNING ${RECEIPT_COLUMNS}`,
+    [sessionId, eventId, result]);
+  return receipt;
+}
+
+function receiptResponse(receipt) {
+  return {
+    received: true,
+    duplicate: receipt.delivery_count > 1,
+    receiptId: receipt.id,
+    result: receipt.result,
+    firstReceivedAt: receipt.first_received_at,
+  };
+}
+
 // POST /internal/receiver/deliveries: called only by server-side code holding the secret.
 function receiverRoutes(pool, { receiverSecret, receiverSlowResponseMs }) {
   const router = express.Router();
   let pendingDelays = 0;
+
+  // Waits asynchronously (other requests such as /health keep being served).
+  // Returns false if the caller disconnected first; the timer is then already cleared.
+  async function waitUnlessDisconnected(signal) {
+    pendingDelays += 1;
+    try {
+      await delay(receiverSlowResponseMs, undefined, { signal });
+      return true;
+    } catch (err) {
+      if (err.name === 'AbortError') return false;
+      throw err;
+    } finally {
+      pendingDelays -= 1;
+    }
+  }
 
   router.post('/receiver/deliveries',
     requireReceiverSecret(receiverSecret),
@@ -75,32 +136,28 @@ function receiverRoutes(pool, { receiverSecret, receiverSlowResponseMs }) {
       const settings = await getMode(pool, req.body.sessionId);
       if (!settings) return sendError(res, 404, 'unknown_session', 'No active demo session with this ID.');
 
+      // An already-processed event is recognized before any simulated failure, in every mode.
+      const existing = await recognizeDuplicate(pool, req.body);
+      if (existing) return res.status(200).json(receiptResponse(existing));
+
       switch (settings.mode) {
-        case 'success': {
-          const { rows: [receipt] } = await pool.query(
-            `INSERT INTO receiver_receipts (session_id, event_id) VALUES ($1, $2)
-             RETURNING id, received_at`,
-            [req.body.sessionId, req.body.eventId]);
-          return res.status(200).json({ received: true, receiptId: receipt.id, receivedAt: receipt.received_at });
-        }
+        case 'success':
+          return res.status(200).json(receiptResponse(await processOnce(pool, req.body)));
         case 'server_error':
           res.set('Retry-After', '1');
           return sendError(res, 503, 'simulated_server_error',
             'Mock receiver is simulating an outage. Nothing was processed.');
-        case 'timeout': {
-          // Asynchronous wait: the event loop keeps serving other requests (such as /health).
-          pendingDelays += 1;
-          try {
-            await delay(receiverSlowResponseMs, undefined, { signal: disconnected.signal });
-          } catch (err) {
-            if (err.name === 'AbortError') return; // caller gave up; the timer is already cleared
-            throw err;
-          } finally {
-            pendingDelays -= 1;
-          }
+        case 'timeout':
+          if (!(await waitUnlessDisconnected(disconnected.signal))) return;
           // Too late for a caller using the standard timeout, and still not processed.
           return sendError(res, 503, 'simulated_slow_response',
             `Mock receiver answered after ${receiverSlowResponseMs} ms. Nothing was processed.`);
+        case 'process_then_timeout': {
+          // The work is committed first; only the reply is late. The sender times out without
+          // knowing that processing already happened.
+          const receipt = await processOnce(pool, req.body);
+          if (!(await waitUnlessDisconnected(disconnected.signal))) return;
+          return res.status(200).json(receiptResponse(receipt));
         }
       }
     });
@@ -117,13 +174,17 @@ function receiverSettingsRoutes(pool) {
 
   async function describe(sessionId) {
     const settings = await getMode(pool, sessionId);
-    const { rows: [{ count }] } = await pool.query(
-      'SELECT count(*)::int AS count FROM receiver_receipts WHERE session_id = $1', [sessionId]);
+    const { rows: [counts] } = await pool.query(
+      `SELECT count(*)::int AS processed,
+              coalesce(sum(delivery_count - 1), 0)::int AS duplicates
+       FROM mock_receiver_receipts WHERE session_id = $1`, [sessionId]);
     return {
       mode: settings.mode,
       availableModes: MODES,
       updatedAt: settings.updated_at,
-      receivedCount: count,
+      processedCount: counts.processed,   // distinct events the receiver processed
+      duplicateCount: counts.duplicates,  // extra deliveries recognized and not re-processed
+      receivedCount: counts.processed,    // kept for compatibility (same as processedCount)
       notice: 'The delivery worker sends your events here, retrying timeouts, 408, 429 and 5xx up to 4 attempts in total.',
     };
   }
@@ -131,6 +192,30 @@ function receiverSettingsRoutes(pool) {
   router.get('/receiver', auth, async (req, res) => {
     res.json(await describe(req.session.id));
   });
+
+  // The receiver's view of one of this session's events: was it processed, with what result,
+  // and how many duplicate deliveries arrived. Other sessions' events are 404.
+  router.get('/receiver/receipts/:eventId', auth, async (req, res) => {
+    const notFound = () => sendError(res, 404, 'not_found', 'No event with this ID exists for your session.');
+    if (!UUID_PATTERN.test(req.params.eventId)) return notFound();
+    const { rows: [row] } = await pool.query(
+      `SELECT e.id AS event_id, r.result, r.first_received_at, r.last_received_at, r.delivery_count
+       FROM events e
+       LEFT JOIN mock_receiver_receipts r ON r.session_id = e.session_id AND r.event_id = e.id
+       WHERE e.id = $1 AND e.session_id = $2`,
+      [req.params.eventId, req.session.id]);
+    if (!row) return notFound();
+    res.json({
+      eventId: row.event_id,
+      processed: row.delivery_count !== null,
+      result: row.result,
+      firstReceivedAt: row.first_received_at,
+      lastReceivedAt: row.last_received_at,
+      deliveriesReceived: row.delivery_count ?? 0,
+      duplicateCount: row.delivery_count ? row.delivery_count - 1 : 0,
+    });
+  });
+  router.all('/receiver/receipts/:eventId', methodNotAllowed(['GET', 'HEAD']));
 
   router.put('/receiver', auth, async (req, res) => {
     if (!req.is('application/json')) {

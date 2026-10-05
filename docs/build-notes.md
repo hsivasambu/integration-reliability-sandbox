@@ -324,3 +324,60 @@ second deploy. `/ready` 200.
 - server_error throughout: attempts at :13.9, :15.9, :20.0, :28.0 (gaps of about 2.0, 4.0, 8.1 s), then `failed` /
   `attempts_exhausted`, 4/4.
 - timeout: attempt 1 `timeout`, no status, retryable, retry scheduled 4 s after it started (2 s timeout + 2 s delay).
+
+## Stage 7: Receiver-side duplicate protection and the ambiguous timeout (2026-10-05)
+
+**Decisions**
+- **Migration 006.** New `mock_receiver_receipts` with `UNIQUE (session_id, event_id)`. Each row holds one
+  synthetic `result` (`confirmationCode`, `summary`), first/last received times, and `delivery_count`.
+  Old `receiver_receipts` rows were folded in (grouped per event, count kept) and the table dropped.
+  Mode CHECK gains `process_then_timeout`.
+- **Order of checks in the receiver:**
+  1. auth
+  2. validation
+  3. session lookup
+  4. **recognize an existing receipt** (`UPDATE … delivery_count + 1 … RETURNING`) and answer 200
+     `duplicate: true` with the original result, in every mode
+  5. only then the mode's behaviour
+
+  "Process" = one `INSERT … ON CONFLICT ON CONSTRAINT … DO UPDATE SET delivery_count + 1 RETURNING`, so
+  receipt and result commit in one statement/transaction. A concurrent copy becomes a duplicate count.
+  `duplicate = delivery_count > 1` in the returned row.
+- **`process_then_timeout`.** Processes and commits first, then waits `RECEIVER_SLOW_RESPONSE_MS` (4 s)
+  before a 200. If the sender disconnects at 2 s, the wait is cancelled and no reply is written. The
+  sender's retry then hits step 4.
+- **Bounded duplicate tracking.** A counter on the event's single row: no per-duplicate rows or log lines.
+- **Session-scoped reads.** `GET /v1/receiver` adds `processedCount` and `duplicateCount` (`receivedCount`
+  kept as an alias for compatibility). New `GET /v1/receiver/receipts/{eventId}` returns `processed`,
+  `result`, `deliveriesReceived`, and `duplicateCount`; 404 for events not owned by the session.
+- The stable event ID was already in every delivery body (`eventId` = `events.id`); retries and recovery
+  resend it unchanged, and replay will too.
+- **Explicitly not claimed:** exactly-once effects in arbitrary external systems. This works because the
+  mock's receipt and effect share one database transaction.
+- UI: the fourth mode; "Check delivery" now shows the sender view and the receiver view side by side;
+  receiver panel shows processed/duplicate counts.
+
+**Verification (local, Node 22.18.0, Postgres 18.6)**
+- `npm test`: 98/98 pass, 5 consecutive clean runs.
+  - Updated: the Stage 5 crash-after-processing test now expects 1 processed + `delivery_count` 2
+    (previously 2 receipts); mode list includes the 4th mode.
+  - 7 new tests in `test/duplicates.test.js`:
+    - 10 concurrent copies: one `duplicate:false`, nine `true`, a single confirmation code,
+      `deliveriesReceived` 10
+    - existing receipt answered 200 in `server_error` and `timeout` modes (no 503, no delay)
+    - plain `timeout` and `server_error` process nothing
+    - `process_then_timeout` with the worker: sender attempt 1 timeout/no status, receiver already
+      processed; retry → delivered; receiver duplicates 1, same code, processedCount 1
+    - the same after switching to `success` before the retry
+    - same key → one event processed once, but same content under a new key → 2 processed
+      (dedup is by event ID)
+    - receipt reads scoped (other session 404, unprocessed → `processed:false`, no token 401)
+- Mutation check: skipping the "recognize existing receipt" step fails 2 of the new tests.
+- Live (port 3131, worker on, real timing):
+  - `npm run receiver:try`: success 200 `duplicate=false`; server_error 503; timeout 2009 ms;
+    process_then_timeout 2005 ms timeout; 2 events processed; the same event sent twice was
+    `duplicate=false` then `true`, with the same result.
+  - `process_then_timeout` through the worker: at about 3 s, sender `retry_scheduled` with #1 timeout
+    2007 ms while the receiver already showed `processed=true RCPT-1D25DC5D`. At about 6 s, sender
+    `delivered` (#2 200 in 16 ms); receiver the same code, `deliveriesReceived=2`, `duplicates=1`.
+    Server log: 2 lines total (no per-duplicate logging).
