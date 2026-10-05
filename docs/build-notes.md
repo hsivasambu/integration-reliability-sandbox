@@ -1032,4 +1032,95 @@ push; `/ready` 200.
 - Stage 13 suite: 56/56. Stage 12 flow suite: 35/36 (the same expected browser network log).
 - The checks created about 7 sessions and 18 synthetic alerts.
 
+## Stage 15: Purposeful motion on the journey (2026-10-05)
+
+**Before starting.** Clean tree at `675ad64`. Findings:
+- The Stage 14 acknowledgement path drew a return arrow tinted by state even for a timeout (amber) and a
+  connection failure (red), i.e. a reply that never arrived.
+- A successful try finishes in milliseconds while polling runs every 2 s, so most successes are first *observed
+  already finished*.
+- The journey is redrawn on every refresh, so motion needs its own layer.
+- The global CSS reduced-motion rule doesn't affect Web Animations.
+
+**Decisions** (details in `docs/frontend-notes.md` → *Motion* and *Two-query race*)
+- **Adapter:**
+  - `acknowledgement.responseObserved`: a return arrow only for a 2xx or an HTTP error reply; otherwise a broken,
+    neutral line.
+  - Timeout is labelled *Timed out*, with a note that it is not proof of no processing.
+  - `delivery.waitFrom` (the last try's `endedAt`) for the wait bar.
+  - "Already processed: n repeats recognized, not processed again" from the receipt.
+- **`public/journey-motion.js`:**
+  - A pure planner (effects keyed by stable attempt keys; the first observation after the displayed alert
+    changes is silent; a try first seen already finished gets one labelled "Latest attempt (already finished)"
+    look back; receipt-driven *Processed* / *Already processed*).
+  - A player (Web Animations API, transform/opacity only, at most about 1.7 s per effect, no loops, a queue of
+    at most 2 pending effects keeping the newest, cancelled on an alert or session change, a hidden tab, Motion
+    off, or a width change).
+  - The overlay `#journey-motion` is never redrawn by refreshes.
+- **Static (always) vs motion (when on):** see the table in the frontend notes. The *Deliver again* recovery
+  action moved into the stopped delivery-service node.
+- **Motion control:** *Motion: on/off* (`aria-pressed`), defaulting to `prefers-reduced-motion`, with an explicit
+  choice kept in `sessionStorage`. A visible note says animations illustrate and aren't real transmission timing.
+  With motion off, the wait bar updates once a second without animation.
+- No backend or API change. No new dependency.
+
+**Found and fixed while verifying**
+- **A Resize observer cancelled every effect** whenever the journey's height changed, which routine refreshes do.
+  It now cancels only on width changes. A first fix based on the diagram's height would have cancelled effects
+  queued in the same render.
+- **The player deduplicated by attempt key alone**, so after a live send the same attempt's outcome (*Timed out*,
+  *Delivery confirmed*, *Error reply*) never played. It now deduplicates by effect type and key.
+- **API read race, made visible by the recordings:** `GET /v1/events/{id}/deliveries` reads delivery rows and
+  attempts in two queries. The frames showed a badge *Waiting* next to "Try 2: sending…", and on a phone *Sending*
+  next to "Try 1: timed out".
+  - The adapter now reconciles towards the newer attempt evidence (in progress → *Sending*; 2xx → *Confirmed*;
+    ended without 2xx → *Waiting*, "recording what happens next", without guessing retry vs stop). Unit-tested.
+  - The backend was not changed. A one-transaction read is suggested as a follow-up.
+- **Visual:** long moving labels ("Sending try 1", "Timed out: no reply") covered node headings and the
+  *Acknowledgement* label, so they were shortened. Paths stop short of node edges. On phones, packets go down
+  the left of the path labels and replies up the right. The "Latest attempt" label moved off the *Updated* line.
+
+**Verification (local, Node 22.18.0, Postgres 18.6, worker on; headless Edge with real receiver modes)**
+- `npm test`: **155/155**, `skipped 0`.
+  - 9 new planner tests: silent first sight; nothing recorded before the history loads; own send live (accepted
+    → send → ack + processed); quick success missed (`latest:ack` only, never `send`); several unseen attempts
+    (only the newest gets a look back); 503 then retry (a packet only when attempt 2 is observed); ptt (processed
+    from the receipt while in flight, timeout, then `duplicate`, no second `processed`); switching alerts
+    (silent on return; replay attempts keyed separately); tab resync.
+  - Adapter tests extended: `responseObserved`, *Timed out* note, `waitFrom`, the already-processed note, and
+    three two-query race shapes.
+- **Stage 15 browser suite: 49/49.** A MutationObserver recorded every effect with the state text on screen at that
+  moment.
+  - **Success:** accepted card, then a labelled look back (the try had already finished), started only after
+    *Confirmed* was on screen; *Processed* from the receipt; nothing repeated; nothing more after settling.
+  - **503:** the error reply drawn with a return arrow; the wait bar measurably filling, labelled by the
+    countdown; the attempt-2 illustration only after attempt 2 was observed; recovered to *Confirmed*.
+  - **Timeout:** a live packet drawn while the state said *Sending*; then a *Timed out* chip with nothing
+    travelling back; the acknowledgement a broken line labelled *Timed out*; never presented as "not processed".
+  - **process_then_timeout:** *Processed* while the reply was *Timed out*; then *Confirmed*; the card says "Already
+    processed: 1 repeat recognized"; exactly one *Processed* illustration plus *Already processed*.
+    - Recorded order: accepted → send → processed → timeout → latest → duplicate.
+  - **Exhaustion:** *Stopped*, *Deliver again* inside the delivery node, no motion or running animation left.
+  - **Switching:** reselecting four alerts replayed nothing; switching mid-animation cleared the layer.
+  - **Refresh:** no illustration on load.
+  - **Hidden tab** (simulated `visibilitychange`): cleared at once; when visible again, the current state (*Trying
+    again*, not *Sending*) was shown and the missed timeout was not replayed.
+  - **Reduced motion** (emulated): *Motion: off* by default; the state text still updated; the wait bar static;
+    zero illustrations. An explicit *Motion on* made them play; *Motion off* cleared the layer at once.
+  - **Phone:** packets travel downward in the stacked layout; no horizontal scroll; axe 0 violations on phone and
+    desktop; no infinite animation observed at any time; no script errors.
+- **Recordings:** frame sequences of the journey panel (every 90 ms while the layer had content) for success,
+  timeout, 503 and ptt, at 1440 px and 390 px, were inspected; the issues above came from them.
+- **Regression suites:** Stage 14 41/41, Stage 13 56/56, Stage 12 35/36 (the same expected browser network log).
+
+**Not verified**
+- Real screen readers.
+- Browsers other than Chromium-based Edge; real phones.
+- A real `visibilitychange` (it was simulated, because headless tabs don't change visibility).
+- A *live* success sequence (send → acknowledgement) in the browser: successes complete between polls, so the
+  browser showed the labelled look back instead. The live sequence is covered by the planner unit tests and by
+  the live timeout and ptt runs.
+- The two-query race fix in the backend (deliberately not done).
+
+
 

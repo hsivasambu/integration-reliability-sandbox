@@ -52,6 +52,11 @@
           detail: `Waiting for the next attempt. Try ${n + 1} of ${max} is due and starts when the delivery service picks it up.`,
         };
       }
+      case 'settling': // see reconcile(): a try just ended and the next step isn't recorded yet
+        return {
+          code: 'waiting', label: 'Waiting', tone: 'is-waiting', icon: 'clock', triesSoFar: n, max,
+          detail: `Try ${n} did not get through. The delivery service is recording what happens next.`,
+        };
       case 'delivered':
         return {
           code: 'confirmed', label: 'Confirmed', tone: 'is-done', icon: 'check', triesSoFar: n, max,
@@ -85,25 +90,36 @@
           code: 'error', tone: 'is-failed', icon: 'cross',
           text: a.retryable === false ? 'refused by the receiving system' : 'error reply from the receiving system',
         };
-      case 'timeout': return { code: 'timeout', tone: 'is-waiting', icon: 'hourglass', text: 'no reply in time' };
+      case 'timeout': return { code: 'timeout', tone: 'is-waiting', icon: 'hourglass', text: 'timed out, no reply in time' };
       case 'network_error': return { code: 'no_connection', tone: 'is-failed', icon: 'cross', text: 'could not connect to the receiving system' };
       default: return { code: 'unknown', tone: 'is-unknown', icon: 'question', text: 'did not get through' };
     }
   }
 
   // The reply path: what came back for the latest try of the delivery shown. `attempts` is null when
-  // the attempt history has not been loaded (only the list summary is known).
+  // the attempt history has not been loaded (only the list summary is known). `responseObserved` is
+  // true only when an HTTP reply actually arrived; otherwise no return arrow may be drawn.
   function acknowledgement(attempts) {
-    if (!attempts) return { code: 'unknown', label: 'Not loaded yet', tone: 'is-unknown', technical: null };
+    const none = (code, label, tone, technical = null, note = null) => ({ code, label, tone, technical, note, responseObserved: false });
+    if (!attempts) return none('unknown', 'Not loaded yet', 'is-unknown');
     const a = attempts.at(-1);
-    if (!a) return { code: 'none', label: 'No reply yet', tone: 'is-idle', technical: null };
+    if (!a) return none('none', 'No reply yet', 'is-idle');
     const http = a.responseStatus ? `HTTP ${a.responseStatus}` : 'no HTTP response';
-    if (a.outcome === 'in_progress') return { code: 'waiting', label: 'Waiting for a reply', tone: 'is-active', technical: null };
-    if (a.outcome === 'delivered') return { code: 'confirmed', label: 'Delivery confirmed', tone: 'is-done', technical: http };
-    if (a.outcome === 'lease_expired') return { code: 'unknown', label: 'Unknown', tone: 'is-unknown', technical: 'lease expired' };
+    if (a.outcome === 'in_progress') return none('waiting', 'Waiting for a reply', 'is-active');
+    if (a.outcome === 'delivered') {
+      return { code: 'confirmed', label: 'Delivery confirmed', tone: 'is-done', technical: http, note: null, responseObserved: true };
+    }
+    if (a.outcome === 'lease_expired') return none('unknown', 'Unknown', 'is-unknown', 'lease expired');
     const s = attemptStatus(a);
-    const label = { error: 'Error reply', timeout: 'No reply in time', no_connection: 'No connection' }[s.code] ?? 'Not confirmed';
-    return { code: s.code, label, tone: s.tone, technical: http };
+    if (s.code === 'error') {
+      return { code: 'error', label: 'Error reply', tone: 'is-failed', technical: http, note: null, responseObserved: Boolean(a.responseStatus) };
+    }
+    if (s.code === 'timeout') {
+      return none('timeout', 'Timed out', 'is-waiting', http,
+        'No reply arrived in time. That alone does not show whether the receiving system processed it.');
+    }
+    if (s.code === 'no_connection') return none('no_connection', 'No reply', 'is-idle', http, 'The delivery service could not connect.');
+    return none(s.code, 'Not confirmed', 'is-unknown', http);
   }
 
   // The forward path: tries sent for the delivery shown.
@@ -132,6 +148,8 @@
         code: 'processed', label: 'Processed', tone: 'is-done', icon: 'inbox',
         confirmationCode: receipt.result?.confirmationCode ?? null,
         repeats,
+        // A repeat delivery is recognized from the record; it never produces a second result.
+        alreadyProcessedNote: repeats > 0 ? `Already processed: ${plural(repeats, 'repeat', 'repeats')} recognized, not processed again` : null,
         detail: repeats > 0
           ? `Processed once. It received the alert ${receipt.deliveriesReceived} times and recognized ${plural(repeats, 'repeat', 'repeats')}.`
           : 'Processed once.',
@@ -178,6 +196,23 @@
     }
   }
 
+  // GET /v1/events/{id}/deliveries reads the delivery rows and then their attempts in two queries, not one
+  // snapshot. If a worker claims or finishes a try between those reads, the attempt list is newer than the
+  // delivery row. In that case the newer evidence wins: a recorded in-progress try means it really is being
+  // sent, and a 2xx attempt means it really was delivered. Nothing else is inferred (a failed try's next
+  // state, retry or stop, stays as the row says until the next refresh).
+  function reconcile(d) {
+    const newest = d.attempts?.at(-1);
+    if (!newest) return d;
+    const ahead = newest.attemptNumber > d.attemptCount
+      || (newest.attemptNumber === d.attemptCount && d.state === 'in_progress');
+    if (!ahead) return d;
+    if (newest.outcome === 'in_progress') return { ...d, state: 'in_progress', attemptCount: newest.attemptNumber, nextAttemptAt: null };
+    if (newest.outcome === 'delivered') return { ...d, state: 'delivered', attemptCount: newest.attemptNumber, nextAttemptAt: null };
+    // The try ended without a 2xx, but the row doesn't yet say what follows (a retry or a stop).
+    return { ...d, state: 'settling', attemptCount: newest.attemptNumber, nextAttemptAt: null };
+  }
+
   // Main entry point.
   //   local:        null | { status: 'sending' | 'uncertain', title, message }  (browser-only, before the server confirms)
   //   event:        null | event resource (GET /v1/events data[] or the POST response's `event`)
@@ -213,13 +248,16 @@
     if (!event) return null;
 
     // The delivery shown in the diagram is the latest one; the history keeps every delivery separately.
-    const latest = deliveries?.length ? deliveries.at(-1) : event.delivery;
-    const attempts = deliveries?.length ? latest.attempts : null;
+    const records = deliveries?.length ? deliveries.map(reconcile) : null;
+    const latest = records ? records.at(-1) : event.delivery;
+    const attempts = records ? latest.attempts : null;
     const status = deliveryStatus(latest, now);
+    // The retry wait runs from the end of the last try to nextAttemptAt (both from the API).
+    if (status.nextAttemptAt && attempts?.length) status.waitFrom = attempts.at(-1).endedAt ?? null;
     const ack = acknowledgement(attempts);
     const proc = processing(receipt, receiptState, latest);
     let replayNumber = 0;
-    const history = (deliveries ?? []).map((d) => {
+    const history = (records ?? []).map((d) => {
       const isReplay = d.replayOf !== null && d.replayOf !== undefined;
       if (isReplay) replayNumber += 1;
       return {

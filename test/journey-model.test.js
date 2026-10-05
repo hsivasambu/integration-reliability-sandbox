@@ -92,6 +92,8 @@ test('retry scheduled in the future: Trying again, with the next try and a count
   assert.equal(v.delivery.nextAttemptAt, at(3));
   assert.equal(v.ack.label, 'Error reply');
   assert.equal(v.ack.technical, 'HTTP 503');
+  assert.equal(v.ack.responseObserved, true, 'a 503 reply was observed');
+  assert.equal(v.delivery.waitFrom, at(-8 + 1), 'the wait starts when the last try ended');
   assert.equal(v.processing.label, 'Not processed yet');
 });
 
@@ -127,12 +129,16 @@ test('delivered but the receipt is unavailable: processing is Unknown, not "not 
 
 test('reply too late: processed while the sender retries, then a recognized repeat', () => {
   const mid = view([delivery(D1, 'retry_scheduled', [timeout(1)], { nextAttemptAt: at(2) })], receipt(true));
-  assert.equal(mid.ack.label, 'No reply in time');
+  assert.equal(mid.ack.label, 'Timed out');
+  assert.equal(mid.ack.responseObserved, false, 'no reply arrived, so no return arrow may be drawn');
+  assert.match(mid.ack.note, /does not show whether/);
   assert.equal(mid.processing.label, 'Processed');
   assert.match(mid.explanation, /already processed your alert, but its reply did not arrive in time/);
   const done = view([delivery(D1, 'delivered', [timeout(1), ok(2)])], receipt(true, { deliveriesReceived: 2, duplicateCount: 1 }));
   assert.equal(done.delivery.label, 'Confirmed');
   assert.equal(done.processing.repeats, 1);
+  assert.match(done.processing.alreadyProcessedNote, /Already processed: 1 repeat recognized, not processed again/);
+  assert.equal(done.ack.responseObserved, true);
   assert.match(done.explanation, /recognized the repeat and did not process it twice/);
 });
 
@@ -165,6 +171,25 @@ test('stale marker is carried through without changing the delivery state', () =
   const v = view([d], receipt(false), { stale: { since: at(-30) } });
   assert.deepEqual(v.stale, { since: at(-30) });
   assert.equal(v.delivery.label, 'Trying again', 'a polling failure never turns into a delivery failure');
+});
+
+test('two-query race: an attempt list newer than the delivery row wins, without guessing further', () => {
+  // Row read as "retry scheduled after try 1" while the attempt query already saw try 2 in progress
+  // (observed on a real run: GET /deliveries reads rows and attempts in two queries).
+  const rowBehind = delivery(D1, 'retry_scheduled', [err503(1), attempt(2, 'in_progress')], { attemptCount: 1, nextAttemptAt: at(-1) });
+  const v1 = view([rowBehind], receipt(false));
+  assert.equal(v1.delivery.label, 'Sending');
+  assert.equal(v1.delivery.currentTry, 2);
+  assert.equal(v1.deliveries[0].status.label, 'Sending', 'the history label agrees with the try list');
+
+  const finished = delivery(D1, 'in_progress', [err503(1), ok(2)], { attemptCount: 2 });
+  assert.equal(view([finished], receipt(true)).delivery.label, 'Confirmed', 'a 2xx try means delivered');
+
+  const failedTry = delivery(D1, 'in_progress', [err503(1), err503(2)], { attemptCount: 2 });
+  const settling = view([failedTry], receipt(false)).delivery;
+  assert.equal(settling.label, 'Waiting', 'not Sending: that try has ended');
+  assert.match(settling.detail, /recording what happens next/, 'retry or stop is not guessed');
+  assert.equal(settling.countdownSeconds, undefined, 'no countdown is invented');
 });
 
 test('unknown delivery states are shown as unknown, not guessed', () => {

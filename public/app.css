@@ -66,7 +66,7 @@
   --focus-ring: 3px solid var(--focus-color);
   --focus-offset: 2px;
 
-  /* Motion (nothing animates yet; later stages use these and the reduced-motion rule below) */
+  /* Motion tokens. Journey motion (journey-motion.js) is gated in JavaScript; this rule covers CSS animation. */
   --motion-fast: 150ms;
   --motion-base: 300ms;
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
@@ -376,6 +376,40 @@ details.tech pre {
   .jd-path-state { font-size: var(--text-sm); }
   .jd-arrow, .jd-ack .jd-arrow { transform: none; width: 100%; height: 1.5rem; }
 }
+
+/* A reply that never arrived: a broken, neutral line with no arrowhead (never a red return arrow). */
+.jd-path.is-unobserved .jd-line { color: var(--grey-on-navy); }
+.jd-path.is-unobserved .jd-arrow { transform: rotate(90deg); }
+@container (min-width: 40rem) { .jd-path.is-unobserved .jd-arrow { transform: none; } }
+
+/* Retry wait: fills from the end of the last try to the scheduled next try. */
+.jd-wait { margin-top: var(--space-2); height: 4px; border-radius: 2px; background: var(--navy-line); overflow: hidden; }
+.jd-wait-fill { display: block; height: 100%; background: var(--amber-on-navy); transform-origin: left center; transform: scaleX(0); }
+.jd-recover { margin-top: var(--space-3); min-height: 2.5rem; padding: var(--space-1) var(--space-3); }
+.jd-already { color: var(--on-navy); }
+
+/* Motion (Stage 15): an overlay that is never redrawn by refreshes. Only transform and opacity move. */
+.journey { position: relative; }
+.journey-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.motion-toggle {
+  background: transparent; color: var(--on-navy); border: 1px solid var(--navy-line); border-radius: var(--radius-pill);
+  padding: var(--space-1) var(--space-3); font-size: var(--text-xs); font-weight: 700; cursor: pointer; min-height: 2rem;
+}
+.motion-toggle:hover { border-color: var(--on-navy); }
+.motion-toggle[aria-pressed="false"] { color: var(--on-navy-soft); }
+.motion-note { margin: var(--space-1) 0 0; font-size: var(--text-xs); color: var(--on-navy-soft); }
+.jm-layer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; border-radius: var(--radius-lg); }
+.jm {
+  position: absolute; display: inline-flex; align-items: center; gap: var(--space-1); white-space: nowrap;
+  font-size: var(--text-xs); font-weight: 700; border-radius: var(--radius-pill); padding: 0.2rem 0.55rem;
+  opacity: 0; will-change: transform, opacity; box-shadow: 0 2px 8px rgb(0 0 0 / 0.35);
+}
+.jm .icon { width: 1rem; height: 1rem; }
+.jm-packet { background: var(--on-navy); color: var(--navy); border-radius: var(--radius-sm); }
+.jm-marker.is-done, .jm-chip.is-done, .jm-card.is-done { background: var(--teal-on-navy); color: var(--navy); }
+.jm-marker.is-failed, .jm-chip.is-failed { background: var(--navy); color: var(--red-on-navy); border: 1px solid var(--red-on-navy); }
+.jm-chip.is-waiting { background: var(--navy); color: var(--amber-on-navy); border: 1px dashed var(--amber-on-navy); }
+.jm-history { background: var(--navy-raised); color: var(--on-navy); border: 1px solid var(--on-navy-soft); }
 
 /* "Now" summary and history */
 .jd-stale {

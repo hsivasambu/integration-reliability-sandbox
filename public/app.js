@@ -14,6 +14,7 @@ const KEYS = {
   replayKeys: 'irs.replayKeys',
   pending: 'irs.pendingSubmit', // { key, body, status, lastError }: the submission whose result is not yet known
   draft: 'irs.draft',           // { preset, title, message }: what is in the composer
+  motion: 'irs.motion',         // 'on' | 'off': the visitor's explicit motion choice (else the system setting)
 };
 const LIMITS = { title: 100, message: 500 }; // same limits as the API (counted in Unicode characters)
 
@@ -57,6 +58,8 @@ const ICON_PATHS = {
   list: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M4.5 6h.01', 'M4.5 12h.01', 'M4.5 18h.01'],
   'arrow-right': ['M4 12h15', 'M14 7l5 5-5 5'],
   'arrow-left': ['M20 12H5', 'M10 7l-5 5 5 5'],
+  mail: ['M3.5 6.5h17v11h-17z', 'M3.5 7l8.5 6 8.5-6'],
+  gap: ['M4 12h3', 'M10.5 12h3', 'M17 12h3'],
 };
 function icon(name, extraClass = '') {
   const NS = 'http://www.w3.org/2000/svg';
@@ -311,6 +314,7 @@ async function refresh() {
   }
   if (state.selectedId) await loadDetail(state.selectedId);
   if (state.token !== token) return false;
+  if (state.motionResync) { motion.planner.resync(); state.motionResync = false; }
   render();
   return true;
 }
@@ -344,7 +348,12 @@ async function loadDetail(eventId) {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { stopPolling(); renderPollStatus('paused'); } else { pollNow(); keepFocus($('detail'), renderDetail); }
+  if (document.hidden) {
+    stopPolling();
+    renderPollStatus('paused');
+    motion.player.cancelAll();
+    state.motionResync = true; // the next fresh data is recorded without replaying what was missed
+  } else { pollNow(); keepFocus($('detail'), renderDetail); }
   syncCountdown();
 });
 window.addEventListener('pagehide', stopPolling);
@@ -432,7 +441,10 @@ async function restoreSession() {
 // --- actions ---------------------------------------------------------------------
 
 function selectEvent(eventId) {
-  if (eventId !== state.selectedId) state.detailController?.abort(); // the old alert's answers are no longer wanted
+  if (eventId !== state.selectedId) {
+    state.detailController?.abort(); // the old alert's answers are no longer wanted
+    motion?.player.cancelAll();      // and so are its illustrations
+  }
   state.selectedId = eventId;
   storage.set(KEYS.selected, eventId);
   state.detail = null;
@@ -603,6 +615,8 @@ async function sendPending(isCheck) {
 function showAccepted(data, status, isCheck) {
   if (!state.events.some((e) => e.id === data.event.id)) state.events = [data.event, ...state.events];
   selectEvent(data.eventId);
+  const acceptedEffects = motion.planner.accepted(data.eventId);
+  if (motionOn() && !document.hidden) motion.player.enqueue(acceptedEffects);
   state.submitNote = h('div', { class: 'notice is-done' },
     status === 200 && isCheck
       ? [h('strong', {}, 'Confirmed: your alert was accepted. '),
@@ -1015,10 +1029,20 @@ function journeyNode(kind, name, iconName, badge, ...extra) {
 
 // A labelled path between components. Arrows show direction; the words say what travels on it.
 function journeyPath(kind, name, direction, view) {
-  return h('div', { class: `jd-path jd-${kind} ${view.tone}${view.active ? ' is-current' : ''}` },
+  // A return arrow is drawn only when a reply actually arrived (2xx or an HTTP error reply).
+  const unobserved = kind === 'ack' && !view.responseObserved;
+  return h('div', { class: `jd-path jd-${kind} ${view.tone}${view.active ? ' is-current' : ''}${unobserved ? ' is-unobserved' : ''}` },
     h('span', { class: 'jd-path-name' }, name),
-    h('span', { class: 'jd-line' }, icon(direction === 'back' ? 'arrow-left' : 'arrow-right', 'jd-arrow')),
+    h('span', { class: 'jd-line' }, icon(unobserved ? 'gap' : direction === 'back' ? 'arrow-left' : 'arrow-right', 'jd-arrow')),
     h('span', { class: 'jd-path-state' }, view.label));
+}
+
+// The wait before the next try, from the end of the last try to nextAttemptAt (both from the API).
+// Decorative: the words next to it ("Next try in about N s") carry the meaning.
+function waitIndicator(d) {
+  if (!d.waitFrom || !d.nextAttemptAt || !['retrying', 'waiting'].includes(d.code)) return null;
+  return h('div', { class: 'jd-wait', 'aria-hidden': 'true' },
+    h('span', { class: 'jd-wait-fill', 'data-wait-from': d.waitFrom, 'data-wait-to': d.nextAttemptAt }));
 }
 
 function triesText(d) {
@@ -1040,7 +1064,7 @@ function nextTryText(d) {
   return null;
 }
 
-function journeyDiagram(v) {
+function journeyDiagram(v, recovery) {
   const d = v.delivery;
   const p = v.processing;
   return h('div', { class: 'jd', role: 'group', 'aria-label': 'Alert journey diagram' },
@@ -1051,7 +1075,9 @@ function journeyDiagram(v) {
       h('span', { class: 'jd-line' }, icon('arrow-right', 'jd-arrow')), h('span', { class: 'jd-path-state' }, v.handover.label)),
     journeyNode('delivery', 'Delivery service', 'send', d,
       triesText(d) ? h('p', { class: 'jd-meta' }, triesText(d)) : null,
-      nextTryText(d) ? h('p', { class: 'jd-meta jd-next' }, nextTryText(d)) : null),
+      nextTryText(d) ? h('p', { class: 'jd-meta jd-next' }, nextTryText(d)) : null,
+      waitIndicator(d),
+      recovery),
     h('div', { class: 'jd-link jd-paths' },
       journeyPath('forward', 'Delivery try', 'forward', v.forward),
       journeyPath('ack', 'Acknowledgement', 'back', v.ack)),
@@ -1059,7 +1085,8 @@ function journeyDiagram(v) {
       h('div', { class: `jd-card ${p.tone}` },
         h('p', { class: 'jd-card-title' }, 'Processing record'),
         h('p', { class: `jd-badge ${p.tone}` }, icon(p.icon), p.label),
-        p.confirmationCode ? h('p', { class: 'jd-meta' }, `Confirmation ${p.confirmationCode}`) : null)));
+        p.confirmationCode ? h('p', { class: 'jd-meta' }, `Confirmation ${p.confirmationCode}`) : null,
+        p.alreadyProcessedNote ? h('p', { class: 'jd-meta jd-already' }, p.alreadyProcessedNote) : null)));
 }
 
 function journeyNow(v) {
@@ -1073,6 +1100,7 @@ function journeyNow(v) {
   return h('div', { class: 'jd-now' },
     h('p', { class: 'jd-explain' }, v.explanation),
     h('dl', { class: 'jd-facts' }, facts.flatMap(([k, val]) => [h('dt', {}, k), h('dd', {}, val)])),
+    v.ack.note ? h('p', { class: 'hint' }, h('strong', {}, `Acknowledgement: ${v.ack.label}. `), v.ack.note) : null,
     v.processing.code === 'unknown' || v.processing.code === 'processed'
       ? h('p', { class: 'hint' }, v.processing.detail) : null);
 }
@@ -1175,20 +1203,21 @@ function renderDetail() {
         h('li', {}, icon(iconName), h('span', {}, h('strong', {}, name), ` · ${text}`))))));
     announce(null);
     syncCountdown();
+    motion.player.cancelAll();
     return;
   }
 
   const event = v.server ? state.events.find((e) => e.id === v.eventId) : null;
   const detail = event && state.detail?.eventId === event.id ? state.detail : null;
   const canReplay = v.server && v.delivery.code === 'stopped' && detail;
+  const recovery = canReplay
+    ? h('button', { type: 'button', class: 'btn btn-primary jd-recover', 'data-focus-key': 'replay', onclick: () => replayDelivery(v.deliveryId) },
+      icon('replay'), 'Deliver again')
+    : null;
   const actions = v.server
     ? h('div', { class: 'journey-actions' },
       h('button', { type: 'button', class: 'btn', 'data-focus-key': 'duplicate', onclick: () => submitDuplicate(event) },
-        'Send an exact copy'),
-      canReplay
-        ? h('button', { type: 'button', class: 'btn btn-primary', 'data-focus-key': 'replay', onclick: () => replayDelivery(v.deliveryId) },
-          icon('replay'), 'Deliver again')
-        : null)
+        'Send an exact copy'))
     : null;
 
   // replaceChildren() would print null as text, so empty parts are filtered out.
@@ -1198,7 +1227,7 @@ function renderDetail() {
     h('p', { class: 'journey-sub' }, v.server
       ? (v.stale ? 'Last known state' : `Updated ${fullTime(new Date(state.connection.lastUpdatedAt ?? Date.now()).toISOString())}`)
       : 'Not confirmed by the sandbox yet'),
-    journeyDiagram(v),
+    journeyDiagram(v, recovery),
     journeyNow(v),
     journeyHistory(v),
     actions,
@@ -1207,6 +1236,11 @@ function renderDetail() {
     event ? technicalView(event, detail) : null].filter(Boolean));
   announce(v);
   syncCountdown();
+  startWaitIndicators();
+  // Motion is planned from what changed, after the true state is already on screen. It never holds
+  // anything back and is skipped entirely when motion is off or the tab is hidden.
+  const effects = motion.planner.observe(v);
+  if (motionOn() && !document.hidden) motion.player.enqueue(effects);
 }
 
 // Screen readers hear a short sentence only when the delivery or processing state actually changes,
@@ -1235,8 +1269,97 @@ function tickCountdown() {
     else el.textContent = `in about ${seconds} s`;
   }
   if (reachedZero) keepFocus($('detail'), renderDetail);
-  else syncCountdown();
+  else { if (!motionOn()) startWaitIndicators(); syncCountdown(); }
 }
+
+// --- motion (Stage 15) ---------------------------------------------------------------
+// Illustrations only (public/journey-motion.js). The state text above is always current on its own.
+
+const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+// The visitor's explicit choice wins; otherwise follow the system's reduced-motion setting.
+const motionOn = () => (storage.get(KEYS.motion) ?? (motionQuery.matches ? 'off' : 'on')) === 'on';
+
+const motion = {
+  planner: JourneyMotion.createPlanner(),
+  player: JourneyMotion.createPlayer($('journey-motion'), { getGeometry: journeyGeometry, label: { icon } }),
+};
+
+// Points (relative to the motion layer) taken from the current layout each time an effect starts, so the
+// paths follow the stacked (phone) or row (desktop) layout.
+function journeyGeometry() {
+  const layer = $('journey-motion').getBoundingClientRect();
+  const box = (sel) => $('detail').querySelector(sel)?.getBoundingClientRect();
+  const del = box('.jd-delivery');
+  const rec = box('.jd-receiver');
+  const fwd = box('.jd-forward .jd-line');
+  const ack = box('.jd-ack .jd-line');
+  const diagram = box('.jd');
+  if (!del || !rec || !fwd || !ack || !diagram || layer.width === 0) return null;
+  const pt = (x, y) => ({ x: x - layer.left, y: y - layer.top });
+  const mid = (r) => pt(r.left + r.width / 2, r.top + r.height / 2);
+  const card = box('.jd-receiver .jd-card') ?? rec;
+  const row = rec.left >= del.right - 1;
+  const inset = 14; // stop short of the node edges so moving labels don't cover the node headings
+  // Stacked layout: forward packets travel down the left of the path labels, replies up the right.
+  const side = row ? 0 : Math.min(100, (rec.width / 2) - 40);
+  const f = { ...mid(fwd), x: mid(fwd).x - side };
+  const a = { ...mid(ack), x: mid(ack).x + side };
+  return {
+    alert: mid(box('.jd-alert')),
+    receiver: mid(card),
+    forwardMid: f,
+    ackMid: a,
+    top: pt(diagram.right - 120, diagram.top - 14), // right-hand side, clear of the 'Updated' line
+    forwardFrom: row ? pt(del.right + inset, f.y + layer.top) : pt(f.x + layer.left, del.bottom + inset),
+    forwardTo: row ? pt(rec.left - inset, f.y + layer.top) : pt(f.x + layer.left, rec.top - inset),
+    ackFrom: row ? pt(rec.left - inset, a.y + layer.top) : pt(a.x + layer.left, rec.top - inset),
+    ackTo: row ? pt(del.right + inset, a.y + layer.top) : pt(a.x + layer.left, del.bottom + inset),
+  };
+}
+
+// The retry wait fills from the end of the last try to nextAttemptAt. With motion on it moves smoothly;
+// with motion off it is redrawn once a second. Either way it stops (full) at the scheduled time.
+function startWaitIndicators() {
+  for (const fill of $('detail').querySelectorAll('.jd-wait-fill')) {
+    const from = Date.parse(fill.dataset.waitFrom);
+    const to = Date.parse(fill.dataset.waitTo);
+    const now = Date.now();
+    const fraction = to > from ? Math.min(1, Math.max(0, (now - from) / (to - from))) : 1;
+    fill.getAnimations().forEach((a) => a.cancel());
+    if (motionOn() && !document.hidden && fraction < 1) {
+      fill.animate([{ transform: `scaleX(${fraction})` }, { transform: 'scaleX(1)' }], { duration: to - now, fill: 'forwards', easing: 'linear' });
+    } else {
+      fill.style.transform = `scaleX(${fraction})`;
+    }
+  }
+}
+
+function renderMotionToggle() {
+  const on = motionOn();
+  const button = $('motion-toggle');
+  button.setAttribute('aria-pressed', on ? 'true' : 'false');
+  button.textContent = on ? 'Motion: on' : 'Motion: off';
+}
+
+$('motion-toggle').addEventListener('click', () => {
+  storage.set(KEYS.motion, motionOn() ? 'off' : 'on');
+  if (!motionOn()) motion.player.cancelAll(); // stop at once; the state text is unaffected
+  renderMotionToggle();
+  startWaitIndicators();
+});
+motionQuery.addEventListener('change', () => {
+  if (!motionOn()) motion.player.cancelAll();
+  renderMotionToggle();
+});
+// Illustrations follow paths measured when they start. If the journey's width changes mid-flight (window
+// resized, layout switching between row and stacked), they are dropped; the state text stays. Height
+// changes from routine refreshes or a node gaining a line don't cancel anything.
+let journeyWidth = null;
+new ResizeObserver(([entry]) => {
+  const width = Math.round(entry.contentRect.width);
+  if (journeyWidth !== null && width !== journeyWidth) motion.player.cancelAll();
+  journeyWidth = width;
+}).observe($('journey'));
 
 function renderSummary() {
   const container = $('summary');
@@ -1304,6 +1427,7 @@ $('event-form').addEventListener('submit', async (e) => {
 restoreDraft();
 state.showLocal = Boolean(state.pendingSubmit); // an unconfirmed alert from before the reload
 renderScenarios();
+renderMotionToggle();
 renderService();
 render();
 checkStatus();

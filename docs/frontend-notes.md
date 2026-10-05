@@ -83,7 +83,7 @@ experiments, into *Set the test receiver yourself*, until the experiment control
 | Type | `--font-display` (system serif: Iowan Old Style / Palatino / Georgia), `--font-body` (system UI), `--font-mono`, `--text-xs` … `--text-2xl` |
 | Space, shape, depth | `--space-1` … `--space-7`, `--radius-sm/md/lg/pill`, `--shadow-card`, `--shadow-journey` |
 | Focus | `--focus-color` (navy ring on light surfaces, light ring inside the journey), `--focus-ring`, `--focus-offset` |
-| Motion | `--motion-fast`, `--motion-base`, `--ease`. Nothing animates yet; a global `prefers-reduced-motion` rule is already in place |
+| Motion | `--motion-fast`, `--motion-base`, `--ease`, and a global `prefers-reduced-motion` rule for CSS animation. Journey motion (Stage 15) uses the Web Animations API and is gated in JavaScript (see *Motion*) |
 
 State treatments are classes that set `--state-ink`, `--state-tint` and `--state-on-navy`:
 `is-done`, `is-active`, `is-waiting`, `is-failed`, `is-idle`, `is-unknown`.
@@ -112,7 +112,7 @@ Your alert ──handed over──▶ Delivery service ──delivery try──�
 - **Below the diagram:** a plain-language explanation, then *Delivery / Tries / Next try / Processing*, then
   *What happened so far*. That list shows every delivery, original and replays, each with its tries.
 - **Layout:** stacked on phones; one row when the journey panel is at least 40rem wide (a container query).
-- **No animation in this stage.** Arrows and words show direction, and badges show state. The only thing that
+- **No animation in Stage 14** (motion came in Stage 15). Arrows and words show direction, and badges show state. The only thing that
   changes once a second is the countdown text "in about N s".
 
 ### Journey adapter (`public/journey-model.js`)
@@ -137,7 +137,7 @@ draws only what it returns.
 | Badge | API state |
 |---|---|
 | Saved | `pending`, `attemptCount = 0` |
-| Waiting | `pending`, `attemptCount > 0` (lease lost; the last try's result is unknown), **or** `retry_scheduled` whose `nextAttemptAt` has passed: "Waiting for the next attempt". No send is assumed until the API reports a try |
+| Waiting | `pending`, `attemptCount > 0` (lease lost; the last try's result is unknown); **or** `retry_scheduled` whose `nextAttemptAt` has passed: "Waiting for the next attempt" (no send is assumed until the API reports a try); **or** a try that has ended while the delivery row doesn't yet say what follows (see *Two-query race* below) |
 | Sending | `in_progress` (try *n* of `maxAttempts`) |
 | Trying again | `retry_scheduled`, `nextAttemptAt` in the future: tries used, next try time, countdown |
 | Stopped | `failed`, with the reason from `failureReason` |
@@ -145,9 +145,25 @@ draws only what it returns.
 | Unknown | Any state the page doesn't recognize |
 
 **Acknowledgement path** (latest try): *No reply yet* (no tries) · *Waiting for a reply* (`in_progress`) ·
-*Delivery confirmed* (`delivered`) · *Error reply* (`http_error`) · *No reply in time* (`timeout`) ·
-*No connection* (`network_error`) · *Unknown* (`lease_expired`) · *Not loaded yet* (only the summary is known).
+*Delivery confirmed* (`delivered`) · *Error reply* (`http_error`) · *Timed out* (`timeout`) ·
+*No reply* (`network_error`) · *Unknown* (`lease_expired`) · *Not loaded yet* (only the summary is known).
 HTTP codes are in the technical view.
+
+`responseObserved` is true only for *Delivery confirmed* and *Error reply* (an HTTP reply really arrived). Only
+then is the acknowledgement path drawn with a return arrow. Otherwise it's a broken, neutral line with no
+arrowhead: never a red return arrow for a reply that never came. *Timed out* carries a note: "No reply arrived in
+time. That alone does not show whether the receiving system processed it."
+
+**Two-query race (reconciled in the adapter).** `GET /v1/events/{id}/deliveries` reads the delivery rows and then
+their attempts in two separate queries (`src/events.js`), not one snapshot. If the worker claims or finishes a try
+between them, the attempt list is newer than the row. Stage 15's recordings caught a badge saying *Waiting* next to
+"Try 2: sending…". `reconcile()` lets the newer evidence win:
+- a recorded in-progress try → *Sending*
+- a 2xx try → *Confirmed*
+- a try that ended without a 2xx → *Waiting* ("recording what happens next")
+
+Whether that last case leads to a retry or a stop isn't guessed; the next refresh shows it. The backend fix would
+be to read both in one transaction. **Not done here:** this stage changes no backend behaviour.
 
 **Processing record:** *Processed* (`processed: true`, with the confirmation code and repeats recognized) ·
 *Not processed yet* (no receipt, delivery still active) · *No processing recorded* (no receipt, delivery finished) ·
@@ -180,8 +196,69 @@ seconds.
 - **Screen readers:** the journey region isn't `aria-live` (it's redrawn every refresh). A separate hidden live
   region announces one short sentence, only when the delivery or processing state of the shown alert changes.
 
+## Motion (Stage 15)
+
+Illustrations only. Every state and outcome is already in the text and badges, which the page renders first and
+independently. Motion never holds a result back and never adds delays; the backend is unaware of it.
+`public/journey-motion.js` has two parts.
+
+**Planner** (`createPlanner()`, pure, unit-tested in `test/journey-motion.test.js`). It compares successive
+journey views and returns effects, keyed by **stable attempt keys** (`<deliveryId>:<attemptNumber>`) and event IDs.
+- **The first observation after the displayed alert changes is recorded silently.** That covers page load or
+  refresh, selecting or reselecting an alert, and the tab becoming visible again: whatever happened meanwhile is
+  history, so it is never animated as if live.
+- **The visitor's own accepted send** (`accepted(eventId)`) is the exception: its attempts are watched live from the
+  start.
+- **Transitions:**
+  - attempt newly seen *in progress* → `send`
+  - *in progress* → 2xx → `ack`
+  - → HTTP error → `error-reply`
+  - → timeout → `timeout`
+  - → connection failure → `no-connection`
+- **An attempt first seen already finished** (common: a success takes milliseconds and polling runs every 2 s)
+  gets a single `latest` effect. That's a short look back labelled **"Latest attempt (already finished)"**, played
+  only after its outcome is on screen, and only for the newest attempt. Older unseen attempts are not illustrated.
+- **Receipt evidence** drives the receiver card on its own: `processed` when a receipt first appears (even while
+  the sender is still waiting), and `duplicate` ("Already processed") when the repeat count grows. A repeat never
+  produces a second processing effect.
+
+**Player** (`createPlayer(layer)`). It draws in `#journey-motion`, an overlay that refreshes never redraw.
+- **Only `transform` and `opacity` move** (Web Animations API). Every effect lasts at most about 1.7 s, and
+  nothing loops.
+- **Paths are measured from the current layout when an effect starts:** left to right in the row layout, and
+  stacked on phones (forward packets down the left of the path labels, replies up the right).
+- **Deduplication** is per effect type and key, so an attempt's live send and its later outcome both play, and
+  never twice.
+- **The queue holds at most 2 pending effects**, keeping the newest.
+- **Effects are cancelled when:** the alert or session changes, the tab is hidden, motion is turned off, or the
+  journey's width changes.
+
+| State | Static (always) | Motion (when on) |
+|---|---|---|
+| Accepted | *Accepted* badge | Brief "Saved" card at Your alert |
+| Sending | *Sending*, "Try n of max" | Envelope "Try n" travels along *Delivery try* |
+| Confirmed | *Confirmed*; acknowledgement *Delivery confirmed* with a return arrow | Teal "Delivery confirmed" marker travels back |
+| HTTP error (e.g. 503) | *Error reply* with a return arrow (a reply arrived); the alert stays retryable | Restrained outlined "Error reply" marker travels back |
+| Timeout | Acknowledgement *Timed out* on a broken line; the note says it is not proof of no processing | "Timed out" chip on the acknowledgement path; nothing travels back |
+| Retry scheduled | *Trying again*, countdown, a wait bar from the last try's `endedAt` to `nextAttemptAt` | The wait bar fills smoothly; a new packet only when the next attempt is observed |
+| Exhausted | *Stopped*, with **Deliver again** inside the delivery service | Nothing (it settles; no motion left) |
+| Duplicate | "Already processed: n repeats recognized, not processed again" | "Already processed" chip at the receiver; no second result |
+
+**Motion control.** *Motion: on/off* in the journey header (`aria-pressed`). The default follows
+`prefers-reduced-motion`; an explicit choice is kept for the tab (`sessionStorage` `irs.motion`). With motion off,
+nothing is drawn in the layer and the wait bar is redrawn once a second without animation. Icons, text and the
+static path styling (broken line vs return arrow, current-path emphasis) carry everything. The global CSS
+reduced-motion rule doesn't apply to Web Animations, which is why motion is gated in JavaScript; the wait bar
+deliberately doesn't use a CSS animation, which that rule would make jump to "full".
+
+**Hidden tab.** Illustrations stop at once. When the tab is visible again, the next fresh data is recorded
+silently (no replay of what was missed), and the current state is shown. Polling pauses as before, but that
+doesn't pause the backend: deliveries continue on the server.
+
 ## Known gaps (data the API doesn't provide)
 
+- **Attempts and delivery rows are read in two queries** by `GET /v1/events/{id}/deliveries`, so they can briefly
+  disagree. The adapter reconciles this (see *Two-query race*); a backend fix would read both in one transaction.
 
 - **The receiver mode is per session, not per alert.** Changing it affects every waiting retry in the session, and
   attempts don't record which mode was active. The page says so next to the mode choice.

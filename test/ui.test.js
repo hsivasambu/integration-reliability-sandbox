@@ -19,7 +19,7 @@ test('landing page is served with a strict Content-Security-Policy', async () =>
 test('page loads only same-origin script and stylesheet, with no inline script or handlers', async () => {
   const { text } = await request(app).get('/');
   const scripts = [...text.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)];
-  assert.deepEqual(scripts.map((m) => m[1].trim()), ['src="/journey-model.js"', 'src="/app.js"']);
+  assert.deepEqual(scripts.map((m) => m[1].trim()), ['src="/journey-model.js"', 'src="/journey-motion.js"', 'src="/app.js"']);
   assert.ok(scripts.every((m) => m[2].trim() === ''), 'no inline script');
   assert.doesNotMatch(text, /\son[a-z]+=/i, 'no inline event handlers');
   assert.doesNotMatch(text, /\sstyle=/i, 'no inline styles (blocked by the CSP)');
@@ -36,7 +36,7 @@ test('UI assets are served with correct types', async () => {
 });
 
 test('UI scripts render server text safely and never put the token in a URL', async () => {
-  for (const file of ['/app.js', '/journey-model.js']) {
+  for (const file of ['/app.js', '/journey-model.js', '/journey-motion.js']) {
     const res = await request(app).get(file);
     assert.equal(res.status, 200, file);
     assert.match(res.headers['content-type'], /javascript/);

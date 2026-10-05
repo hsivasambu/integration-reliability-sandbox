@@ -78,8 +78,13 @@
 
       <div class="journey-column">
         <section id="journey" class="journey" aria-labelledby="journey-heading">
-          <h2 id="journey-heading" class="journey-heading">Alert journey</h2>
+          <div class="journey-head">
+            <h2 id="journey-heading" class="journey-heading">Alert journey</h2>
+            <button type="button" id="motion-toggle" class="motion-toggle" aria-pressed="true" aria-describedby="motion-note">Motion: on</button>
+          </div>
+          <p id="motion-note" class="motion-note">Animations only illustrate what the delivery service reports; they are not real transmission timing. Turning them off changes nothing else.</p>
           <div id="detail"></div>
+          <div id="journey-motion" class="jm-layer" aria-hidden="true"></div>
           <p id="journey-announce" class="visually-hidden" aria-live="polite"></p>
         </section>
 
@@ -147,6 +152,7 @@
        Waiting deliveries are kept in the database until then.</p>
   </footer>
   <script src="/journey-model.js"></script>
+  <script src="/journey-motion.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
