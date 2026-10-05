@@ -661,6 +661,11 @@ async function sendPending(isCheck) {
 // Shows the accepted alert at once, from the API's own answer; later refreshes replace it.
 function showAccepted(data, status, isCheck) {
   if (!state.events.some((e) => e.id === data.event.id)) state.events = [data.event, ...state.events];
+  // The history store backs the journey and the cards: add the accepted alert now, not at the next refresh.
+  if (!state.known.has(data.event.id)) {
+    state.known.set(data.event.id, { event: data.event, checkedAt: Date.now() });
+    state.firstPageIds.add(data.event.id);
+  }
   selectEvent(data.eventId);
   const acceptedEffects = motion.planner.accepted(data.eventId);
   if (motionOn() && !document.hidden) motion.player.enqueue(acceptedEffects);
