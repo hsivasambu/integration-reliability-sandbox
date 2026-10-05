@@ -520,3 +520,15 @@ second deploy. `/ready` 200.
     - a 429 quota error is shown as "limit reached"
 - Not verified by me: visual layout at phone width, real screen-reader output, and real-browser focus rings.
   These need a human with a browser (manual steps are in the stage summary).
+
+**Deployed check (2026-10-05, by Claude, after pushing 55fdbaa and f1551fa).**
+- 0.9.0 was live with the worker. `/` sends the CSP, `nosniff` and `no-referrer` headers; `/app.js` and `/app.css`
+  return 200 with the right types; `/demo.js` returns 404.
+- jsdom run of the real page against Render: first run 25/27. Scenario 1's original wording ("switch before
+  the retry runs") left only about 2 s between attempt 1 and retry 2. With 2 s polling plus network latency,
+  attempt 2 had already failed by the time the receiver was switched; it was delivered on attempt 3 and
+  processed once.
+- Fix (f1551fa): the scenario now says switch "before the 4th attempt (about 14 seconds)" and expects
+  delivery on the first attempt after the switch.
+- Rerun after fixing the check script's regexes: **27/27**, plus the extra checks **4/4** (waking notice,
+  422 details, 429 limit message).
