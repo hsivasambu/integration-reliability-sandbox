@@ -189,7 +189,7 @@ seconds.
   - A 401 only ends the session it was sent with.
   - The renderer also only uses detail data whose `eventId` matches the selected alert.
 - **Network interruption:**
-  - The last known state stays on screen with "Showing the last known state from HH:MM:SS. Reconnecting…".
+  - The last known state stays on screen with "Reconnecting… Showing the last known state, from HH:MM:SS".
   - A polling failure never changes a delivery's state. Polling backs off as before (up to 30 s).
 - **Countdown reaching zero:** if the countdown ends before the API reports the next try, the journey says
   *Waiting for the next attempt*. It never claims a send.
@@ -255,7 +255,64 @@ deliberately doesn't use a CSS animation, which that rule would make jump to "fu
 silently (no replay of what was missed), and the current state is shown. Polling pauses as before, but that
 doesn't pause the backend: deliveries continue on the server.
 
+## Guided scenarios (Stage 16)
+
+Four cards under *Try a scenario*: **Normal delivery**, plus three guides. Everything uses the existing endpoints
+only (`PUT /v1/receiver`, `POST /v1/events`, `POST /v1/deliveries/{id}/replay`, and the reads). There is no backend
+scenario, no restore endpoint and no timer.
+
+| Card | Receiver mode | Steps (each advances only on API evidence) |
+|---|---|---|
+| Normal delivery | `success` (set only if different) | Sends one alert; no guide panel |
+| Recover from a temporary problem | `server_error` | 1 set + send · 2 watch the first try fail · 3 **Restore receiver** appears once a rejected try is observed (it only sends `PUT /v1/receiver`; the next *scheduled* try delivers) · 4 delivered |
+| Avoid processing twice | `process_then_timeout` | 1 set + send · 2 watch the first try · 3 the reply timed out but the receipt shows it processed; the automatic retry is recognized by the real receiver · done: one result, the repeat recognized. No configuration step is needed: the receiver recognizes a repeat before any simulated failure, in every mode |
+| Rescue a stopped delivery | `server_error` | 1 set + send · 2 wait until delivery stops · 3 **Restore and retry** appears only once a failed terminal delivery is confirmed: the receiver is restored (awaited), the delivery is re-read, then the existing replay endpoint is called · 4 the new delivery confirmed; the original failure stays in the history |
+
+**Starting a guide**
+1. The start button is disabled before anything is awaited, so rapid clicks start once.
+2. A session is created only by this click.
+3. The page **re-reads** the session's active deliveries (`GET /v1/summary`, which counts the whole session, not
+   just the 20 listed).
+4. If anything is still being delivered, it stops with the reason.
+5. Otherwise it saves the guide, sets the mode (`PUT`), and **only after a 200** sends a new alert through the
+   Stage 13 pipeline (same Idempotency-Key handling).
+6. If the receiver change fails, the guide says nothing was sent and offers *Try again*.
+7. If the send is refused (e.g. the alert limit), the guide says so and that the receiver stays changed.
+8. If the send is unconfirmed, the guide points to the composer's *Check again*.
+
+**Locks (session-wide setting).** The receiver mode applies to the whole session.
+- While any alert in the session is still being delivered, the guide start buttons, *Normal delivery* (when it
+  would change the mode) and the free choices under *Set the test receiver yourself* are disabled, each with a
+  one-line reason. A change by hand also re-reads the active count first.
+- During a guide, only the guide's own *Restore* changes the mode. Restoring to "Works normally" can only help
+  other waiting alerts, and the guide says so when there are any.
+- The page can't stop another tab using the same session from sending at the same moment, and says so under the
+  guide.
+- Once all work is terminal, everything is available again.
+
+**State and refresh.** The guide is kept in this tab (`sessionStorage` `irs.guide`) with a random tag of the session
+it belongs to (`irs.sessionTag`, regenerated when the session changes). It stores milestones only:
+- the stage
+- the alert's `eventId` (or the submission's Idempotency-Key until the alert is found in the list)
+- `restored`
+- `replay: { deliveryId, status }`
+
+On refresh the step is re-derived from fresh API data. Nothing is sent on load:
+- An interrupted receiver change shows *Try again*.
+- An unconfirmed retry request shows *Check again*, which re-sends the same replay Idempotency-Key (kept per
+  delivery until answered).
+- If the replay already exists in the history, that evidence is used and nothing is sent.
+
+**Guidance.** One short instruction at a time ("Step x of y"), in a panel above the journey. It's an inline card,
+not a modal; its buttons are normal keyboard-focusable buttons, and the instruction is announced only when it
+changes. Nothing starts on page load. *Leave guide* says the alert keeps being delivered in the background and
+which mode the receiver stays in. *Run it again* and *Close guide* appear at the end. If polling fails or a
+request is slow, the panel says *Waiting for the delivery service* with *Reconnect now*.
+
 ## Known gaps (data the API doesn't provide)
+
+- **Guides are a browser-side layer.** The server knows nothing about a "scenario", and the mode is per session, so
+  exclusivity across tabs or devices can't be guaranteed.
 
 - **Attempts and delivery rows are read in two queries** by `GET /v1/events/{id}/deliveries`, so they can briefly
   disagree. The adapter reconciles this (see *Two-query race*); a backend fix would read both in one transaction.

@@ -2,7 +2,7 @@
 
 A learning sandbox that accepts synthetic JSON events (shown in the browser as practice *alerts*), persists them, and delivers them
 reliably to a controlled mock receiver.
-**Current stage: 15. Visitor-facing frontend: purposeful motion on the journey.**
+**Current stage: 16. Visitor-facing frontend: guided scenarios and simplified receiver controls.**
 
 | Want to… | Go to |
 |---|---|
@@ -233,21 +233,21 @@ JavaScript, HTML, CSS and inline SVG; no framework or build step. Design notes a
 | Compose an alert (left) | Three **sample alerts** (Service request, Equipment notification, Team update) that fill an editable title and message with live character counts, a message-card preview, *View request JSON*, and one **Send alert** button (it starts the anonymous session when needed). If the answer is lost: *We could not confirm whether your alert was accepted* with **Check again** (same Idempotency-Key and payload). Also shows the current test receiver as one line |
 | Alert journey (right, navy) | A diagram of the three real components: **Your alert → Delivery service ⇄ Receiving system**. The delivery service carries the state badge (*Saved, Waiting, Sending, Trying again, Stopped, Confirmed*), with tries used, the next try time and a countdown. Separate *Delivery try* and *Acknowledgement* paths, plus a *Processing record* card driven by the receiver's receipt (*Unknown* if it can't be loaded). Below: a plain explanation, every delivery and try (replays kept separate), *Send an exact copy*, *Deliver again* (only after it stopped), and a technical view with IDs, status codes and raw JSON. On a connection problem the last known state stays, marked with its time and *Reconnecting…*. **Motion** (with a *Motion: on/off* control that defaults to the system reduced-motion setting): a packet for a try observed live, a return marker only when a reply arrived, *Timed out* without a return arrow, *Already processed* for a recognized repeat, and a labelled *Latest attempt (already finished)* look back when a try finished between refreshes. Illustrations only: the text is always current and nothing is held back |
 | Recent alerts | The 20 newest alerts with their delivery state; selecting one shows its journey |
-| Try an experiment | Three cards; each sets the receiver mode and sends one alert. Below them, *Set the test receiver yourself* holds the four modes (per session) |
+| Try a scenario | **Normal delivery** and three guides: *Recover from a temporary problem* (you restore the receiver; the next scheduled try delivers), *Avoid processing twice* (the real receiver recognizes the repeat), *Rescue a stopped delivery* (restore, then retry by hand with the replay endpoint). One instruction at a time in a panel above the journey; steps advance only on API evidence; nothing starts on page load. Starting a guide, or changing the receiver under *Set the test receiver yourself*, is paused with a reason while any alert in the session is still being delivered (the setting is session-wide) |
 | Technical details | Service status with versions, session summary and delivery-time metric, how the token is stored, API docs links |
 
 Delivery confirmation (the receiver acknowledged with a 2xx) and receiver processing (the receipt) are shown as separate
 steps, because they can differ: in the late-reply experiment the receiver processed the alert before the sandbox
 saw any acknowledgement.
 
-**Experiments** (each sets the receiver mode and sends one alert):
-1. **Receiver has a short outage** (`server_error`, then *Turn receiver back on* any time in the ~14 s before the
-   4th try). Expected: the tries before the switch failed (503, retryable), and the first try after it is confirmed;
-   the receiver processed once.
-2. **Receiver replies too late** (`process_then_timeout`). Expected: try 1 *no reply in time* while the receiver
-   already shows *processed*; try 2 confirmed; the receiver recognized 1 repeat and kept one confirmation code.
-3. **Outage outlasts every try** (`server_error` for about 15 s, then *Turn receiver back on* and *Deliver again*).
-   Expected: the first delivery stays stopped with 4 failed tries; the new delivery is confirmed on try 1.
+**Guided scenarios** (each sets the receiver mode, confirms the change, then sends one new alert; details in
+[`docs/frontend-notes.md`](docs/frontend-notes.md) → *Guided scenarios*):
+1. **Recover from a temporary problem** (`server_error`). After a rejected try is observed, *Restore receiver* sets
+   the mode back (no send); the next scheduled try is confirmed and the rejected tries stay in the history.
+2. **Avoid processing twice** (`process_then_timeout`). Try 1 times out while the receipt already shows it
+   processed; the automatic retry is recognized as a repeat: one result, one repeat.
+3. **Rescue a stopped delivery** (`server_error`). Once every try has failed, *Restore and retry* restores the
+   receiver, then calls the replay endpoint; the new delivery is confirmed and the original stays *Stopped*.
 
 **Refreshing.** While any delivery is pending, retrying or in progress, the page refreshes every 2 s
 (the event list, receiver counts, and the selected event's details). There's at most one refresh in flight,

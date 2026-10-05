@@ -77,6 +77,18 @@
       </section>
 
       <div class="journey-column">
+        <section id="guide" class="guide card" aria-labelledby="guide-heading" tabindex="-1" hidden>
+          <div class="guide-head">
+            <h2 id="guide-heading" class="guide-title">Guide</h2>
+            <p id="guide-step" class="guide-step"></p>
+          </div>
+          <p id="guide-text" class="guide-text" aria-live="polite"></p>
+          <div id="guide-extra"></div>
+          <div id="guide-actions" class="button-row"></div>
+          <p class="hint guide-foot">The receiver setting applies to your whole session. This page waits while other alerts are
+             being delivered, but another tab using the same session could still send at the same moment.</p>
+        </section>
+
         <section id="journey" class="journey" aria-labelledby="journey-heading">
           <div class="journey-head">
             <h2 id="journey-heading" class="journey-heading">Alert journey</h2>
@@ -99,11 +111,14 @@
     </div>
 
     <section class="experiments" aria-labelledby="experiments-heading">
-      <h2 id="experiments-heading">Try an experiment</h2>
-      <p class="hint">Each experiment sets how your test receiver responds and sends one alert. Then watch the journey.</p>
+      <h2 id="experiments-heading">Try a scenario</h2>
+      <p class="hint">Send a normal alert, or follow a short guide through a failure and its recovery. Guides never start by
+         themselves, and each step waits for what the sandbox actually reports.</p>
+      <div id="scenario-note" role="status" aria-live="polite"></div>
       <div id="scenarios" class="experiment-grid"></div>
       <details class="card receiver-details">
         <summary>Set the test receiver yourself</summary>
+        <p id="receiver-lock" class="notice is-waiting lock-reason" role="status"></p>
         <form id="receiver-form">
           <fieldset>
             <legend>How should the test receiver respond?</legend>
@@ -153,6 +168,7 @@
   </footer>
   <script src="/journey-model.js"></script>
   <script src="/journey-motion.js"></script>
+  <script src="/guide-model.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

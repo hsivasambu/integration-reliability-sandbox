@@ -14,7 +14,9 @@ const KEYS = {
   replayKeys: 'irs.replayKeys',
   pending: 'irs.pendingSubmit', // { key, body, status, lastError }: the submission whose result is not yet known
   draft: 'irs.draft',           // { preset, title, message }: what is in the composer
-  motion: 'irs.motion',         // 'on' | 'off': the visitor's explicit motion choice (else the system setting)
+  motion: 'irs.motion',
+  guide: 'irs.guide',           // the guided scenario in progress (this tab only)
+  sessionTag: 'irs.sessionTag', // random tag for the current session, so a stored guide can't leak into another         // 'on' | 'off': the visitor's explicit motion choice (else the system setting)
 };
 const LIMITS = { title: 100, message: 500 }; // same limits as the API (counted in Unicode characters)
 
@@ -135,6 +137,9 @@ const state = {
   })(),
   submitting: false,       // a send or check is in flight: the button is disabled
   preset: null,            // index of the chosen sample alert (null after an experiment fills the fields)
+  guide: null,             // the guided scenario in progress (Stage 16), loaded after the session tag is known
+  guideBusy: null,         // 'starting' | 'configuring' | 'sending' | 'restoring' | 'replaying' while requests run
+  guideNote: null,         // a short message under the scenario cards
   submitNote: null,        // the result of the last send, shown under the composer
   poll: { timer: null, running: false, again: false, failures: 0, lastError: null },
   slowRequests: 0,
@@ -259,6 +264,8 @@ async function pollNow() {
       // Keep the last known state and mark it as stale. A polling failure is not a delivery failure.
       state.connection = { ...state.connection, status: 'reconnecting' };
       keepFocus($('detail'), renderDetail);
+      renderGuide();          // "Waiting for the delivery service" with Reconnect
+      renderScenarioCards();  // locks depend on the connection too
     }
   } finally {
     state.poll.running = false;
@@ -369,6 +376,14 @@ function setToken(token) {
     state.refreshController?.abort();
     state.detailController?.abort();
     state.connection = { status: 'live', lastUpdatedAt: null };
+  }
+  if (token !== state.token) {
+    storage.set(KEYS.sessionTag, token ? crypto.randomUUID() : null);
+    if (state.guide) {
+      state.guide = null;
+      storage.set(KEYS.guide, null);
+      state.guideNote = 'The guide ended because the demo session changed.';
+    }
   }
   state.token = token;
   storage.set(KEYS.token, token);
@@ -533,6 +548,7 @@ async function sendDraft() {
       }
     }
     setPending({ key: crypto.randomUUID(), body: draftBody(), status: 'sending' }); // saved before the request
+    guideNoteSubmission(state.pendingSubmit.key);
     state.showLocal = true; // the journey shows the alert as 'Sending to the sandbox' until the server answers
     render();
     return await sendPending(false);
@@ -692,102 +708,309 @@ async function replayDelivery(deliveryId) {
         techLine(`HTTP ${status}`, 'manual replay scheduled'))
       : errorBox(status, data);
     await pollNow();
+    keepFocus($('detail'), renderDetail);
+    if (status === 202 || status === 200) return 'accepted';
+    return data?.error === 'already_replayed' ? 'exists' : 'rejected';
   } catch (err) {
+    // No answer: the stored key is kept, so asking again can't start a second retry.
     state.detailNote = unavailableBox(err);
+    keepFocus($('detail'), renderDetail);
+    return 'unknown';
   }
-  keepFocus($('detail'), renderDetail);
 }
 
-// --- experiments (the guided scenarios) -------------------------------------------
+// --- guided scenarios (Stage 16) -----------------------------------------------------
+// Uses only the existing per-session receiver modes, event submission and replay endpoints. The guide's
+// progress lives in this tab (sessionStorage), tied to the current session by a local session tag; steps
+// advance from what the API reports (public/guide-model.js), never from elapsed time.
 
-const SCENARIOS = [
-  {
-    id: 'recover',
-    icon: 'retry',
-    title: 'Receiver has a short outage',
-    why: 'The test receiver refuses alerts for a while. Watch the sandbox wait and try again, then turn the receiver back on.',
-    mode: 'server_error',
-    eventTitle: 'Experiment: short receiver outage',
-    steps: [
-      'Press Start. The test receiver is set to refuse alerts, and one alert is sent.',
-      'Watch the first try fail. The delivery service shows Trying again, with a countdown to the next try.',
-      'Press "Turn receiver back on" before the last try is used (the journey shows how many tries are left).',
-    ],
-    expected: 'The next try is confirmed and the receiver processes the alert once. The earlier tries stay in the record as failed.',
-    followUp: { label: 'Turn receiver back on', mode: 'success' },
-  },
-  {
-    id: 'timeout',
-    icon: 'hourglass',
-    title: 'Receiver replies too late',
-    why: 'The receiver does the work, but its reply arrives after the sandbox stops waiting. Watch the sandbox try again without the alert being processed twice.',
-    mode: 'process_then_timeout',
-    eventTitle: 'Experiment: reply arrives too late',
-    steps: [
-      'Press Start. The test receiver is set to do the work but reply late, and one alert is sent.',
-      'The first try shows "No reply in time", while the processing record already shows the alert as processed.',
-      'When the countdown ends, the delivery service tries again. No action is needed.',
-    ],
-    expected: 'Two tries: no reply in time, then confirmed. The processing record shows the alert processed once, with one repeat recognized.',
-  },
-  {
-    id: 'replay',
-    icon: 'replay',
-    title: 'Outage outlasts every try',
-    why: 'Every try fails, so the delivery service stops. Then turn the receiver back on and deliver the alert again by hand.',
-    mode: 'server_error',
-    eventTitle: 'Experiment: outage longer than every try',
-    steps: [
-      'Press Start. The test receiver is set to refuse alerts, and one alert is sent.',
-      'Wait until the delivery service shows Stopped (every try is used; this takes a little while).',
-      'Press "Turn receiver back on", then "Deliver again" in the journey.',
-    ],
-    expected: 'The first delivery stays stopped with every try failed. A new delivery is confirmed on its first try. The receiver processed the alert once.',
-    followUp: { label: 'Turn receiver back on', mode: 'success' },
-  },
-];
+const SCENARIO_ORDER = ['normal', 'recover', 'twice', 'rescue'];
+const sessionTag = () => storage.get(KEYS.sessionTag);
 
-async function runScenario(scenario, button) {
-  button.disabled = true;
+function loadGuide() {
+  const g = readJson(KEYS.guide);
+  return g && g.tag && g.tag === sessionTag() && GuideModel.SCENARIOS[g.scenario] ? g : null;
+}
+function saveGuide(g) {
+  state.guide = g;
+  storage.set(KEYS.guide, g ? JSON.stringify(g) : null);
+}
+const guideOpen = () => Boolean(state.guide && state.guide.stage !== 'done');
+
+// Deliveries that are still waiting or in flight anywhere in this session. /v1/summary counts all of the
+// session's alerts (the history list shows only the newest 20).
+function activeDeliveries() {
+  const fromList = state.events.filter((e) => ACTIVE_STATES.has(e.delivery.state)).length;
+  return Math.max(fromList, state.summary?.byCurrentDeliveryState.active ?? 0);
+}
+
+// Re-reads the session's active deliveries just before a receiver change. Throws if it can't be read.
+async function readActiveDeliveries() {
+  const res = await api('GET', '/v1/summary');
+  if (res.status !== 200) throw new Unavailable(`The API answered HTTP ${res.status}.`);
+  state.summary = res.data;
+  return res.data.byCurrentDeliveryState.active;
+}
+
+const ACTIVE_REASON = (n) => `${n === 1 ? 'An alert in your session is' : `${n} alerts in your session are`} still being delivered. `
+  + 'The receiver setting applies to the whole session, so changing it now would change how '
+  + `${n === 1 ? 'that alert is' : 'those alerts are'} handled. Wait until delivery is confirmed or stopped.`;
+
+// Why starting this scenario (or changing the receiver by hand) is not possible right now, or null.
+function scenarioLock(id) {
+  if (state.guideBusy) return 'Please wait: the previous step is still running.';
+  if (guideOpen()) return 'Finish or leave the current guide first.';
+  if (state.submitting || state.pendingSubmit) return 'An alert is still being sent. Wait until it is confirmed.';
+  if (state.connection.status === 'reconnecting') return 'Waiting for the delivery service to answer.';
+  const needsChange = id === 'free' || GuideModel.SCENARIOS[id]?.guided || state.receiver?.mode !== 'success';
+  const active = activeDeliveries();
+  if (needsChange && active > 0) return ACTIVE_REASON(active);
+  return null;
+}
+
+function setGuideNote(note) {
+  state.guideNote = note;
+  renderScenarioCards();
+}
+
+async function startScenario(id) {
+  const s = GuideModel.SCENARIOS[id];
+  const lock = scenarioLock(id);
+  if (lock) { setGuideNote(lock); return; }
+  state.guideBusy = 'starting'; // disables every start button before anything is awaited
+  setGuideNote(null);
+  render();
   try {
-    if (state.pendingSubmit || state.submitting) {
-      state.submitNote = h('div', { class: 'notice is-waiting' }, 'Please resolve the unconfirmed alert in the composer first.');
-      renderComposer();
+    if (!state.token && !(await startSession())) {
+      setGuideNote(`Could not start a demo session. ${state.sessionNote ?? ''} Nothing was sent.`);
       return;
     }
-    if (!state.token && !(await startSession())) return;
-    if (!(await setReceiverMode(scenario.mode))) return;
-    state.preset = null;
-    $('title').value = scenario.eventTitle;
-    $('message').value = 'Synthetic data for a sandbox experiment.';
-    saveDraft();
-    const eventId = await sendDraft();
-    if (eventId) {
-      const box = $('journey').getBoundingClientRect();
-      if (box.top < 0 || box.top > window.innerHeight * 0.6) {
-        $('journey').scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' });
+    // Re-read: another alert may have started since this page last refreshed (another tab, for example).
+    let active;
+    try {
+      active = await readActiveDeliveries();
+    } catch (err) {
+      setGuideNote(`Could not check your alerts (${err.message}). Nothing was changed.`);
+      return;
+    }
+    const needsChange = s.guided || state.receiver?.mode !== s.mode;
+    if (needsChange && active > 0) {
+      setGuideNote(ACTIVE_REASON(active));
+      pollNow();
+      return;
+    }
+    if (s.guided) saveGuide({ tag: sessionTag(), scenario: id, title: s.eventTitle, stage: 'configuring', startedAt: new Date().toISOString() });
+    if (needsChange) {
+      state.guideBusy = 'configuring';
+      render();
+      if (!(await setReceiverMode(s.mode))) {
+        // The guide (if any) stays at 'configuring': it then shows a recoverable "not confirmed" step.
+        if (!s.guided) setGuideNote('The receiver setting was not confirmed, so nothing was sent. You can try again.');
+        return;
       }
     }
+    if (s.guided) saveGuide({ ...state.guide, stage: 'sending' });
+    state.guideBusy = 'sending';
+    state.preset = null;
+    $('title').value = s.eventTitle;
+    $('message').value = s.guided ? 'Synthetic data for a guided scenario.' : 'Synthetic data for a normal delivery.';
+    saveDraft();
+    render();
+    const eventId = await sendDraft();
+    if (s.guided && eventId) saveGuide({ ...state.guide, stage: 'running', eventId });
+    if (eventId) revealGuide(s.guided);
   } finally {
-    button.disabled = false;
+    state.guideBusy = null;
+    render();
   }
 }
 
-function renderScenarios() {
-  $('scenarios').replaceChildren(...SCENARIOS.map((s) => {
-    const start = h('button', { type: 'button', class: 'btn btn-primary' }, 'Start experiment');
-    start.addEventListener('click', () => runScenario(s, start));
-    return h('article', { class: 'card experiment', 'aria-labelledby': `scenario-${s.id}` },
+// The Stage 13 send pipeline saves the Idempotency-Key before sending; the guide remembers it so the
+// alert can be found again after a reload, even if the answer was lost.
+function guideNoteSubmission(key) {
+  if (state.guide?.stage === 'sending') saveGuide({ ...state.guide, submissionKey: key });
+}
+
+// A guide waiting for its alert finds it by its Idempotency-Key in the alert list (reading, not sending).
+function guideAttachFromList() {
+  const g = state.guide;
+  if (g?.stage !== 'sending' || !g.submissionKey || state.pendingSubmit?.key === g.submissionKey && state.submitting) return;
+  const found = state.events.find((e) => e.idempotencyKey === g.submissionKey);
+  if (found) saveGuide({ ...g, stage: 'running', eventId: found.id });
+}
+
+function revealGuide(guided) {
+  const target = guided ? $('guide') : $('journey');
+  const box = target.getBoundingClientRect();
+  if (box.top < 0 || box.top > window.innerHeight * 0.6) target.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' });
+}
+
+// Restore: only PUT /v1/receiver. Nothing is sent; the next scheduled try does the delivery.
+async function guideRestore() {
+  if (state.guideBusy) return;
+  state.guideBusy = 'restoring';
+  render();
+  try {
+    const others = activeDeliveries() - 1;
+    if (await setReceiverMode('success')) {
+      saveGuide({ ...state.guide, restored: true });
+      setGuideNote(others > 0 ? 'Receiver restored. Your other waiting alerts will also be delivered normally from their next try.' : null);
+    } else {
+      setGuideNote('The receiver could not be restored. Nothing was sent; you can try again.');
+    }
+  } finally {
+    state.guideBusy = null;
+    render();
+  }
+}
+
+// Restore, then retry by hand with the existing replay endpoint. Only for a confirmed stopped delivery.
+async function guideRestoreAndRetry() {
+  if (state.guideBusy) return;
+  state.guideBusy = 'restoring';
+  render();
+  try {
+    if (!(await setReceiverMode('success'))) {
+      setGuideNote('The receiver could not be restored, so nothing was retried. You can try again.');
+      return;
+    }
+    saveGuide({ ...state.guide, restored: true });
+    // Re-read the delivery: retry only if it is still confirmed as stopped.
+    await loadDetail(state.guide.eventId);
+    const v = currentJourneyView();
+    if (!v?.server || v.eventId !== state.guide.eventId || v.delivery.code !== 'stopped') {
+      setGuideNote('The delivery is no longer shown as stopped, so it was not retried.');
+      return;
+    }
+    saveGuide({ ...state.guide, replay: { deliveryId: v.deliveryId, status: 'requested' } }); // saved before sending
+    state.guideBusy = 'replaying';
+    render();
+    await guideReplay(v.deliveryId);
+  } finally {
+    state.guideBusy = null;
+    render();
+  }
+}
+
+// Sends (or re-sends, with the same stored Idempotency-Key) the replay request. Never called automatically.
+async function guideReplay(deliveryId) {
+  const outcome = await replayDelivery(deliveryId);
+  const status = { accepted: 'confirmed', exists: 'confirmed', unknown: 'requested' }[outcome] ?? 'rejected';
+  saveGuide({ ...state.guide, replay: { deliveryId, status } });
+  if (status === 'rejected') setGuideNote('The retry was not accepted (see the message in the journey).');
+}
+
+async function guideCheckReplay() {
+  if (state.guideBusy || !state.guide?.replay) return;
+  state.guideBusy = 'replaying';
+  render();
+  try {
+    await guideReplay(state.guide.replay.deliveryId);
+  } finally {
+    state.guideBusy = null;
+    render();
+  }
+}
+
+function guideLeave() {
+  const mode = MODE_INFO[state.receiver?.mode]?.[0];
+  const running = state.guide?.eventId;
+  saveGuide(null);
+  setGuideNote(running
+    ? `You left the guide. Your alert keeps being delivered by the sandbox in the background${mode ? `, and the receiver stays set to "${mode}"` : ''}.`
+    : `You left the guide.${mode ? ` The receiver is set to "${mode}".` : ''}`);
+  render();
+}
+
+function guideAction(id) {
+  const scenario = state.guide?.scenario;
+  switch (id) {
+    case 'restore': return guideRestore();
+    case 'restore-retry': return guideRestoreAndRetry();
+    case 'replay-check': return guideCheckReplay();
+    case 'show':
+      selectEvent(state.guide.eventId);
+      render();
+      return pollNow();
+    case 'leave': return guideLeave();
+    case 'close':
+      saveGuide(null);
+      setGuideNote(null);
+      return render();
+    case 'again':
+    case 'retry-start':
+      saveGuide(null);
+      return startScenario(scenario);
+    default:
+      return undefined;
+  }
+}
+
+function currentGuideStep() {
+  const g = state.guide;
+  if (!g) return null;
+  const selected = Boolean(g.eventId) && state.selectedId === g.eventId && !state.showLocal;
+  const result = GuideModel.guideStep(g, {
+    view: selected ? currentJourneyView() : null,
+    selected,
+    busy: ['configuring', 'sending', 'restoring', 'replaying'].includes(state.guideBusy) ? state.guideBusy : null,
+    pending: state.pendingSubmit,
+    modeLabel: MODE_INFO[state.receiver?.mode]?.[0],
+  });
+  // Once finished, remember it: a reload shows the result without re-deriving it.
+  if (result.phase === 'done' && g.stage !== 'done') saveGuide({ ...g, stage: 'done', doneText: result.text });
+  return result;
+}
+
+function renderGuide() {
+  guideAttachFromList();
+  const panel = $('guide');
+  const r = currentGuideStep();
+  panel.hidden = !r;
+  if (!r) return;
+  const s = GuideModel.SCENARIOS[state.guide.scenario];
+  panel.className = `guide card ${r.tone}`;
+  $('guide-heading').replaceChildren(icon(s.icon), `Guide: ${s.title}`);
+  $('guide-step').textContent = `Step ${r.step} of ${r.total}`;
+  const text = r.phase === 'done' && state.guide.doneText ? state.guide.doneText : r.text;
+  if ($('guide-text').textContent !== text) $('guide-text').textContent = text; // announced only when it changes
+  const waiting = state.connection.status === 'reconnecting' || state.slowRequests > 0;
+  $('guide-extra').replaceChildren(...[
+    waiting ? h('p', { class: 'notice is-waiting' }, h('strong', {}, 'Waiting for the delivery service. '),
+      'The free service may be waking up; the guide continues when it answers. ',
+      h('button', { type: 'button', class: 'btn-link', 'data-focus-key': 'reconnect', onclick: () => pollNow() }, 'Reconnect now')) : null,
+  ].filter(Boolean));
+  keepFocus($('guide-actions'), () => $('guide-actions').replaceChildren(...r.actions.map((a) => h('button', {
+    type: 'button', class: `btn ${a.primary ? 'btn-primary' : 'btn-quiet'}`, 'data-focus-key': `guide-${a.id}`,
+    disabled: Boolean(state.guideBusy), onclick: () => guideAction(a.id),
+  }, a.label))));
+}
+
+function renderScenarioCards() {
+  const container = $('scenarios');
+  keepFocus(container, () => container.replaceChildren(...SCENARIO_ORDER.map((id) => {
+    const s = GuideModel.SCENARIOS[id];
+    const mine = state.guide?.scenario === id && guideOpen();
+    const lock = mine ? null : scenarioLock(id);
+    const reasonId = `scenario-${id}-reason`;
+    const button = mine
+      ? h('button', { type: 'button', class: 'btn btn-quiet', 'data-focus-key': `start-${id}`, onclick: () => { revealGuide(true); $('guide').focus(); } }, 'Go to the guide')
+      : h('button', {
+        type: 'button', class: 'btn btn-primary', 'data-focus-key': `start-${id}`,
+        disabled: Boolean(lock), 'aria-describedby': lock ? reasonId : null, onclick: () => startScenario(id),
+      }, s.guided ? 'Start guide' : 'Send a normal alert');
+    return h('article', { class: `card experiment${s.guided ? '' : ' is-normal'}`, 'aria-labelledby': `scenario-${id}` },
       icon(s.icon, 'exp-icon'),
-      h('h3', { id: `scenario-${s.id}` }, s.title),
-      h('p', {}, s.why),
-      h('p', { class: 'note' }, 'Changes how your test receiver responds for this session.'),
-      h('details', { class: 'tech' }, h('summary', {}, 'Steps and what to expect'),
-        h('ol', {}, s.steps.map((step) => h('li', {}, step))),
-        h('p', {}, h('strong', {}, 'Expected: '), s.expected)),
-      h('div', { class: 'button-row' }, start,
-        s.followUp ? h('button', { type: 'button', class: 'btn btn-quiet', onclick: () => setReceiverMode(s.followUp.mode) }, s.followUp.label) : null));
-  }));
+      h('h3', { id: `scenario-${id}` }, s.title),
+      h('p', {}, s.summary),
+      h('p', { class: 'note' }, s.guided
+        ? `Sets your receiver to "${MODE_INFO[s.mode][0]}" for the whole session, then sends one alert. One step at a time.`
+        : 'Sets the receiver back to "Works normally" if needed, then sends one alert.'),
+      h('div', { class: 'button-row' }, button),
+      lock ? h('p', { class: 'hint lock-reason', id: reasonId }, lock) : null,
+      mine ? h('p', { class: 'hint' }, 'In progress: the guide is shown above the journey.') : null);
+  })));
+  $('scenario-note').replaceChildren(...[state.guideNote ? h('p', { class: 'notice is-waiting' }, state.guideNote) : null].filter(Boolean));
 }
 
 const MODE_INFO = {
@@ -814,6 +1037,8 @@ function render() {
   keepFocus($('detail'), renderDetail);
   renderSummary();
   renderComposer();
+  renderScenarioCards();
+  renderGuide();
 }
 
 function setService(status, detail = null) {
@@ -872,18 +1097,41 @@ function renderReceiver() {
   if (!container.firstChild) {
     container.append(...Object.entries(MODE_INFO).map(([mode, [label, description]]) => {
       const input = h('input', { type: 'radio', name: 'mode', value: mode, id: `mode-${mode}` });
-      input.addEventListener('change', () => setReceiverMode(mode));
+      input.addEventListener('change', () => changeModeByHand(mode));
       return h('label', { for: `mode-${mode}`, class: 'choice' }, input, h('span', {}, h('strong', {}, label), h('span', {}, description)));
     }));
   }
+  const lock = state.token ? scenarioLock('free') : null;
   for (const input of container.querySelectorAll('input')) {
     input.checked = input.value === current;
-    input.disabled = !state.token;
+    input.disabled = !state.token || Boolean(lock);
   }
+  $('receiver-lock').textContent = lock ?? '';
   if (!state.token) $('receiver-status').textContent = 'Start a session to choose how the test receiver responds.';
   else if (state.receiver && !$('receiver-status').textContent) {
     $('receiver-status').textContent = `Currently: ${MODE_INFO[current]?.[0] ?? current}.`;
   }
+}
+
+// Changing the receiver by hand: re-read the session's active deliveries first.
+async function changeModeByHand(mode) {
+  const lock = scenarioLock('free');
+  if (lock) { $('receiver-lock').textContent = lock; renderReceiver(); return; }
+  try {
+    const active = await readActiveDeliveries();
+    if (active > 0) {
+      $('receiver-lock').textContent = ACTIVE_REASON(active);
+      renderReceiver(); // puts the radio back on the current mode
+      pollNow();
+      return;
+    }
+  } catch (err) {
+    $('receiver-status').replaceChildren(unavailableBox(err));
+    renderReceiver();
+    return;
+  }
+  await setReceiverMode(mode);
+  render();
 }
 
 function renderComposer() {
@@ -943,7 +1191,7 @@ function renderComposer() {
   $('receiver-label').replaceChildren(icon('inbox'),
     h('span', {}, 'Test receiver: ', h('strong', {}, MODE_INFO[mode]?.[0] ?? 'checking…'),
       state.token ? '' : ' (the default for a new session)',
-      h('span', { class: 'hint receiver-hint' }, 'Experiments below can change this.')));
+      h('span', { class: 'hint receiver-hint' }, 'The scenarios below can change this.')));
 }
 
 // The unconfirmed submission, shown apart from the draft so editing the draft never changes it.
@@ -1123,7 +1371,7 @@ function staleBanner(v) {
   if (!v.stale) return null;
   return h('p', { class: 'jd-stale', role: 'status' }, icon('offline'),
     v.stale.since
-      ? `Showing the last known state from ${fullTime(v.stale.since)}. Reconnecting…`
+      ? `Reconnecting… Showing the last known state, from ${fullTime(v.stale.since)}`
       : 'Reconnecting… Nothing could be loaded yet.');
 }
 
@@ -1426,7 +1674,8 @@ $('event-form').addEventListener('submit', async (e) => {
 
 restoreDraft();
 state.showLocal = Boolean(state.pendingSubmit); // an unconfirmed alert from before the reload
-renderScenarios();
+if (state.token && !sessionTag()) storage.set(KEYS.sessionTag, crypto.randomUUID());
+state.guide = loadGuide();
 renderMotionToggle();
 renderService();
 render();

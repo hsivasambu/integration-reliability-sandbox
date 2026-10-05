@@ -1136,5 +1136,105 @@ push; `/ready` 200.
 - The revised suites were run against Render only, not locally again.
 - The checks created about 10 sessions and 35 synthetic alerts.
 
+## Stage 16: Guided scenario cards and simplified receiver controls (2026-10-05)
+
+**Before starting.** Clean tree at `29b4347`. Findings:
+- The Stage 12–15 experiments, the free mode radios and "Turn receiver back on" changed the session-wide receiver
+  mode at any time, even while other alerts were being delivered.
+- `GET /v1/summary` counts active deliveries for the whole session (the list shows only 20), so it can serve as the
+  re-read before a change.
+- Restoring is just `PUT /v1/receiver`; it never sends anything.
+- `replayDelivery()` didn't report its outcome.
+- The receiver recognizes a repeat before any simulated failure in every mode, so "Avoid processing twice" needs no
+  configuration step.
+- There's no server-side "scenario", so guide state is a browser-side layer.
+
+**Decisions** (details in `docs/frontend-notes.md` → *Guided scenarios*)
+- **Four cards:** Normal delivery plus three guides. Only the existing endpoints are used; there is no backend
+  change, no new dependency, and no timers.
+- **`public/guide-model.js`:** pure step logic (unit-tested), turning saved milestones plus the observed journey
+  view into "Step x of y", one instruction and the allowed actions. Steps advance only on API evidence.
+- **Start:** the button is disabled before any await. Then:
+  1. Re-read the session's active deliveries.
+  2. Refuse with a reason if any are active.
+  3. Save the guide.
+  4. `PUT` the mode, and only after a 200 send a new alert through the Stage 13 pipeline.
+  5. A failed setup stops with a recoverable message, and nothing is sent.
+- **Recover:** *Restore receiver* appears after a rejected try is observed; it only sends `PUT`. The text says the
+  next scheduled try delivers.
+- **Twice:** no configuration change; the guide waits for the receipt's repeat recognition.
+- **Rescue:** *Restore and retry* appears only once a failed terminal delivery is confirmed.
+  - Order: restore (awaited), re-read the delivery, save `replay: requested`, then call the existing replay endpoint
+    with its stored Idempotency-Key.
+  - `replayDelivery()` now returns accepted / exists / rejected / unknown.
+  - After a refresh, an unconfirmed request shows *Check again* (the same key); a replay visible in the history is
+    taken as evidence.
+- **Locks:** guide start buttons, Normal delivery (when it would change the mode) and the free receiver choices are
+  disabled with a one-line reason while any alert in the session is being delivered, while a guide is open, or while
+  a send is unconfirmed. A change by hand re-reads first. The page states that another tab can't be excluded.
+- **State:** `irs.guide` plus `irs.sessionTag` (a new tag per session) in `sessionStorage`; milestones only. Nothing
+  is sent on load.
+- **Guidance:** an inline panel above the journey (not a modal), keyboard-reachable buttons, the instruction
+  announced only when it changes, no autoplay. *Leave guide* explains that delivery continues in the background.
+  *Waiting for the delivery service* plus *Reconnect now* when polling fails or is slow.
+- The old "Turn receiver back on" buttons and the Stage 12 experiment cards were removed.
+
+**Found and fixed while verifying**
+- A failed poll redrew only the journey, so the guide never showed *Waiting for the delivery service* and the card
+  locks went stale. The guide and cards now redraw on poll failure.
+- Stale-banner text "p.m.. Reconnecting" (from Stage 14) was reworded to "Reconnecting… Showing the last known
+  state, from HH:MM:SS".
+- Four cards in a three-column grid left one card alone; the grid is now 2 columns from 40rem and 4 from 72rem.
+- The free-choice lock reason sat below the radios; it's now above them.
+
+**Verification (local, Node 22.18.0, Postgres 18.6, worker on; headless Edge, one browser context per section)**
+- `npm test`: **163/163** (8 new guide-model tests), `skipped 0`.
+- **Stage 16 browser suite: 52/52** (server with `MAX_EVENTS_PER_SESSION=8` for the quota case).
+  - **Load:** no guide, 0 POST/PUT; four cards.
+  - **Normal delivery:** confirmed, with no guide panel.
+  - **Recover:**
+    - A keyboard start plus two rapid clicks → exactly 1 `PUT server_error`, then 1 alert.
+    - Other cards and the free choices were locked with reasons.
+    - *Restore receiver* appeared only after a rejected try was observed.
+    - A refresh kept the step and sent nothing.
+    - Restore by keyboard → 1 `PUT success` and **0 sends**; a refresh after restoring sent nothing.
+    - Delivered on the scheduled retry with only one alert ever sent and no replay.
+    - A refresh after done sent nothing; *Close guide* worked.
+  - **Twice:** a refresh mid-way kept the guide; done with "One processing result (RCPT-…). The repeat was
+    recognized"; the card showed *Already processed*; the guide said the mode stays; no mode change after the
+    start.
+  - **Rescue:**
+    - No retry action before the stop; *Restore and retry* after it; a refresh at that step sent nothing.
+    - A double click → 1 `PUT success`, then 1 replay request, which was held. A reload with the request still held
+      showed "could not confirm the retry request" and **sent no replay** in 2.5 s.
+    - *Check again* re-sent with the **same Idempotency-Key** → done. History: original *Stopped* plus *Delivered
+      again (1): Confirmed*.
+    - An earlier run had released the held request before reloading. The guide then found the replay in the
+      history and finished without sending anything, which is also correct.
+  - **Interrupted setup:** the `PUT` failed at the network → "not confirmed, so nothing was sent" with 0 alerts; it
+    survived a refresh; *Try again* proceeded.
+  - **Leave:** "keeps being delivered by the sandbox in the background".
+  - **Active alert:** guides and free choices locked with "still being delivered", and unlocked once it stopped.
+    An alert created behind the page's back (an in-page API call, like another tab) → *Start* re-read, refused,
+    and changed and sent nothing.
+  - **Offline:** "Waiting for the delivery service" with *Reconnect now*; it cleared when back online.
+  - **Quota:** "the alert was not sent … still set to Temporary outage", with the composer's limit message and 0
+    automatic sessions.
+  - No horizontal scroll; the guide sits above the journey on phones; axe 0 violations on desktop and phone; no
+    script errors.
+- **Regression:** Stage 15 49/49, Stage 14 41/41, Stage 13 58/58 (quota included), Stage 12 24/25 without its old
+  experiment flows (only the expected browser network log).
+  - Stage 14/15 helpers now set the mode through the API when the UI lock is on, as another tab could, because
+    those suites change the mode mid-delivery on purpose.
+  - Stage 15 was rerun on a second local server with the normal alert limit, after the first run hit the lowered
+    limit (429s in the log).
+
+**Not verified**
+- Real screen readers.
+- Other browsers; real phones.
+- Back/forward navigation as such: the page is a single document, and reloads were tested.
+- True concurrent use from two real tabs (simulated by an API call from the page).
+
+
 
 
