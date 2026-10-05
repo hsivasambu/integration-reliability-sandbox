@@ -1235,6 +1235,18 @@ push; `/ready` 200.
 - Back/forward navigation as such: the page is a single document, and reloads were tested.
 - True concurrent use from two real tabs (simulated by an API call from the page).
 
+**Deployed check (2026-10-05, by Claude, after pushing da5912f).** `/guide-model.js` was served about 20 s after the push;
+`/ready` 200.
+- Stage 16 suite against Render, without the quota step (the deployed limit is 100): **49/49**. That covered all
+  three guides, rapid clicks and keyboard start, a refresh at each step, the held-and-reloaded retry with a same-key
+  *Check again*, interrupted setup, leaving, the active-alert lock and the behind-the-page race, offline waiting,
+  layout and axe.
+- Stage 15 first scored 47/49 on Render (exhaustion never stopped). Cause, in my test helper: after clicking a mode
+  it waited for "Saved", which was still shown from the previous change. Over the network, the new re-read before the
+  `PUT` meant the alert was sent before the mode changed. The helpers now clear the old message first.
+- Rerun against Render: Stage 15 49/49, Stage 14 41/41, Stage 13 56/56, Stage 12 24/25 (the expected network log).
+- The checks created about 15 sessions and 50 synthetic alerts.
+
 
 
 
