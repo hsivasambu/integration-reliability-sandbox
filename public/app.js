@@ -1,5 +1,6 @@
-// Integration Reliability Sandbox: browser UI (plain JavaScript, same-origin API).
+// Follow an Alert: browser UI for the Integration Reliability Sandbox (plain JavaScript, same-origin API).
 // All text from the server is rendered with textContent / text nodes, never as HTML.
+// Every delivery and processing state shown here comes from the API; the browser never decides it.
 'use strict';
 
 const POLL_MS = 2000;               // refresh interval while deliveries are in progress
@@ -29,6 +30,38 @@ function h(tag, attrs = {}, ...children) {
   return el;
 }
 
+// Outline icons (24×24, stroke only). Decorative: the words next to them carry the meaning.
+const ICON_PATHS = {
+  send: ['M4 12 20 4l-5.5 16-3-7z', 'M11.5 13 20 4'],
+  check: ['M5 12.5 9.5 17 19 7.5'],
+  clock: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M12 7.5V12l3 2'],
+  retry: ['M20 12a8 8 0 1 1-2.4-5.7', 'M20 4v4.5h-4.5'],
+  stop: ['M8.3 3h7.4L21 8.3v7.4L15.7 21H8.3L3 15.7V8.3z', 'M9.5 9.5l5 5', 'M14.5 9.5l-5 5'],
+  cross: ['M7 7l10 10', 'M17 7 7 17'],
+  inbox: ['M4 13.5 6.5 5h11l2.5 8.5V19H4z', 'M4 13.5h4.5l1 2.5h5l1-2.5H20'],
+  box: ['M3.5 7.5 12 3l8.5 4.5v9L12 21l-8.5-4.5z', 'M3.5 7.5 12 12l8.5-4.5', 'M12 12v9'],
+  question: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M9.6 9.3a2.5 2.5 0 1 1 3.4 2.4c-.6.3-1 .8-1 1.5v.6', 'M12 16.8v.2'],
+  dash: ['M7 12h10'],
+  offline: ['M3 3l18 18', 'M8.5 8.8A11 11 0 0 0 2.5 12', 'M12 5a11 11 0 0 1 9.5 7', 'M8 15.5a6 6 0 0 1 7.5-.8', 'M12 19.5v.2'],
+  replay: ['M4 12a8 8 0 1 0 2.4-5.7', 'M4 4v4.5h4.5', 'M10.5 9.5v5l4-2.5z'],
+  hourglass: ['M7 3h10', 'M7 21h10', 'M8 3c0 5 8 5 8 9s-8 4-8 9', 'M16 3c0 5-8 5-8 9s8 4 8 9'],
+};
+function icon(name, extraClass = '') {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  for (const [k, v] of Object.entries({
+    viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8',
+    'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', focusable: 'false',
+    class: `icon ${extraClass}`.trim(),
+  })) svg.setAttribute(k, v);
+  for (const d of ICON_PATHS[name] ?? ICON_PATHS.question) {
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', d);
+    svg.append(path);
+  }
+  return svg;
+}
+
 // sessionStorage can be unavailable (privacy modes); the page still works for this tab.
 const storage = {
   get(key) { try { return sessionStorage.getItem(key); } catch { return null; } },
@@ -43,12 +76,14 @@ const storage = {
 const time = (iso) => (iso ? new Date(iso).toLocaleTimeString() : '');
 const secondsUntil = (iso) => Math.max(0, Math.round((new Date(iso) - Date.now()) / 1000));
 const shortId = (id) => id.slice(0, 8);
+const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+// Synthetic, non-clinical examples that fit the API payload (a title and a message only).
 const EXAMPLES = [
-  ['Synthetic appointment reminder', 'Test patient A has a synthetic follow-up visit tomorrow at 09:00.'],
-  ['Synthetic lab result ready', 'A synthetic lab panel for test patient B is ready for review.'],
-  ['Synthetic discharge notice', 'Test patient C was discharged from synthetic ward 4 at 14:30.'],
-  ['Synthetic referral received', 'A synthetic cardiology referral for test patient D was received.'],
+  ['Practice alert: storage almost full', 'Synthetic test: the demo storage volume is at 92% of its practice limit.'],
+  ['Practice alert: nightly report ready', 'Synthetic test: the nightly practice report finished and is ready to read.'],
+  ['Practice alert: door sensor check', 'Synthetic test: the demo door sensor reported an open door during a drill.'],
+  ['Practice alert: maintenance window', 'Synthetic test: a practice maintenance window starts at 22:00 tonight.'],
 ];
 
 // --- state -------------------------------------------------------------------
@@ -62,12 +97,14 @@ const state = {
   hasMoreEvents: false,
   selectedId: storage.get(KEYS.selected),
   detail: null,            // { eventId, deliveries, receipt }
-  detailNote: null,        // result of the last duplicate / replay action for the selected event
+  detailNote: null,        // result of the last copy / replay action for the selected event
+  techOpen: false,         // the journey's technical view stays open across refreshes
   receiver: null,
   summary: null,
   pendingSubmit: null,     // { key, body } kept until the server answers, so a retry reuses the key
   poll: { timer: null, running: false, again: false, failures: 0, lastError: null },
   slowRequests: 0,
+  service: { status: 'checking', detail: null }, // checking | ready | not_ready | unreachable | offline
 };
 
 // --- API access ----------------------------------------------------------------
@@ -110,18 +147,35 @@ async function api(method, path, { body, headers = {}, auth = true } = {}) {
   }
 }
 
-// Turns an API error body into a readable box (validation details included).
+// Plain-language wording for API error codes. The technical line keeps the status and code.
+const ERROR_TEXT = {
+  event_limit_reached: 'This demo session has reached its limit of alerts. Start a fresh session to continue.',
+  rate_limited: 'Too many requests from your connection. Wait a minute, then try again.',
+  replay_limit_reached: 'This alert has already been re-delivered the maximum number of times.',
+  delivery_not_failed: 'Only a delivery that has stopped can be tried again.',
+  already_replayed: 'This delivery was already tried again. Follow the newer delivery instead.',
+  idempotency_key_conflict: 'This request reused an identifier that belongs to a different alert, so it was refused.',
+  validation_failed: 'Some fields need attention. Nothing was saved.',
+  session_capacity_reached: 'The demo is busy right now. Please try again later.',
+};
+const FIELD_NAMES = { 'payload.title': 'Alert title', 'payload.message': 'Alert message' };
+
+function techLine(...parts) {
+  return h('p', { class: 'hint' }, h('span', { class: 'visually-hidden' }, 'Technical: '), parts.filter(Boolean).join(' · '));
+}
+
+// Turns an API error answer into a readable notice (validation details included).
 function errorBox(status, data) {
-  const quota = status === 429;
-  return h('div', { class: `box ${quota ? 'box-warn' : 'box-bad'}` },
-    h('strong', {}, `HTTP ${status}${quota ? ' (limit reached)' : ''}: `),
-    data?.message ?? 'The request was not accepted.',
-    data?.details ? h('ul', {}, data.details.map((d) => h('li', {}, `${d.field} ${d.issue}`))) : null);
+  const tone = status === 429 ? 'is-waiting' : 'is-failed';
+  return h('div', { class: `notice ${tone}` },
+    h('strong', {}, ERROR_TEXT[data?.error] ?? data?.message ?? 'The request was not accepted.'),
+    data?.details ? h('ul', {}, data.details.map((d) => h('li', {}, `${FIELD_NAMES[d.field] ?? d.field} ${d.issue}.`))) : null,
+    techLine(`HTTP ${status}`, data?.error));
 }
 
 function unavailableBox(err) {
-  return h('div', { class: 'box box-bad' }, h('strong', {}, 'Backend unavailable: '), err.message,
-    ' Nothing was changed by this attempt as far as the page can tell; you can try again.');
+  return h('div', { class: 'notice is-failed' }, h('strong', {}, 'No answer from the service. '), err.message,
+    ' As far as this page can tell, nothing was changed; you can try again.');
 }
 
 // --- polling -------------------------------------------------------------------
@@ -149,9 +203,12 @@ async function pollNow() {
     await refresh();
     state.poll.failures = 0;
     state.poll.lastError = null;
+    // A successful refresh reached the API and its database.
+    if (state.service.status !== 'ready') setService('ready');
   } catch (err) {
     state.poll.failures += 1;
     state.poll.lastError = err.message;
+    if (err instanceof Unavailable) setService(navigator.onLine === false ? 'offline' : 'unreachable', err.message);
   } finally {
     state.poll.running = false;
   }
@@ -194,9 +251,9 @@ async function loadDetail(eventId) {
     api('GET', `/v1/events/${eventId}/deliveries`),
     api('GET', `/v1/receiver/receipts/${eventId}`),
   ]);
-  if (state.selectedId !== eventId || !state.token) return;
+  if (state.selectedId !== eventId || !state.token) return; // a stale answer for an alert no longer shown
   if (deliveries.status === 404) { selectEvent(null); return; }
-  if (deliveries.status !== 200 || receipt.status !== 200) throw new Unavailable('Could not load the event details.');
+  if (deliveries.status !== 200 || receipt.status !== 200) throw new Unavailable('Could not load the alert details.');
   state.detail = { eventId, deliveries: deliveries.data.deliveries, receipt: receipt.data };
 }
 
@@ -204,6 +261,9 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) { stopPolling(); renderPollStatus('paused'); } else { pollNow(); }
 });
 window.addEventListener('pagehide', stopPolling);
+// "Offline" is only ever shown for the visitor's own connection, never for a receiver mode.
+window.addEventListener('offline', () => setService('offline'));
+window.addEventListener('online', () => { checkStatus(); pollNow(); });
 
 // --- session -------------------------------------------------------------------
 
@@ -222,7 +282,7 @@ function sessionExpired() {
   state.receiver = null;
   state.summary = null;
   selectEvent(null);
-  state.sessionNote = 'Your demo session has expired or is no longer valid. Start a new one to continue.';
+  state.sessionNote = 'Your demo session has ended or is no longer valid. Start a new one to continue.';
   render();
 }
 
@@ -234,7 +294,7 @@ async function startSession() {
     const { status, data, headers } = await api('POST', '/v1/sessions', { auth: false });
     if (status !== 201) {
       const retry = headers.get('Retry-After');
-      state.sessionNote = `${data.message ?? `HTTP ${status}`}${retry ? ` Try again in about ${Math.ceil(retry / 60)} minute(s).` : ''}`;
+      state.sessionNote = `${ERROR_TEXT[data.error] ?? data.message ?? `HTTP ${status}`}${retry ? ` Try again in about ${Math.ceil(retry / 60)} minute(s).` : ''}`;
       return false;
     }
     setToken(data.token);
@@ -280,7 +340,9 @@ function selectEvent(eventId) {
 }
 
 function fillExample() {
-  const [title, message] = EXAMPLES[Math.floor(Math.random() * EXAMPLES.length)];
+  const current = $('title').value;
+  const choices = EXAMPLES.filter(([title]) => title !== current);
+  const [title, message] = choices[Math.floor(Math.random() * choices.length)];
   $('title').value = title;
   $('message').value = message;
 }
@@ -291,9 +353,9 @@ function validateForm() {
     const value = $(id).value;
     const error = $(`${id}-error`);
     let problem = null;
-    if (value.trim() === '') problem = 'Required.';
-    else if ([...value].length > max) problem = `At most ${max} characters.`;
-    else if (id === 'title' && /[\u0000-\u001F\u007F]/.test(value)) problem = 'No line breaks or control characters.';
+    if (value.trim() === '') problem = 'Please fill this in.';
+    else if ([...value].length > max) problem = `Please keep it to ${max} characters or fewer.`;
+    else if (id === 'title' && /[\u0000-\u001F\u007F]/.test(value)) problem = 'Please use a single line without special characters.';
     error.textContent = problem ?? '';
     error.hidden = !problem;
     $(id).setAttribute('aria-invalid', problem ? 'true' : 'false');
@@ -309,25 +371,28 @@ async function submitEvent(title, message) {
   const key = same ? state.pendingSubmit.key : crypto.randomUUID();
   state.pendingSubmit = { key, body };
   const result = $('submit-result');
-  result.replaceChildren(h('p', { class: 'muted' }, 'Submitting…'));
+  result.replaceChildren(h('p', { class: 'hint' }, 'Sending to the sandbox…'));
   try {
     const { status, data } = await api('POST', '/v1/events', { body, headers: { 'Idempotency-Key': key } });
     state.pendingSubmit = null; // the server answered; this key is settled
     if (status === 202) {
-      result.replaceChildren(h('div', { class: 'box box-ok' },
-        h('strong', {}, 'Accepted by the API (HTTP 202). '),
-        'The event is stored and queued for delivery. It has not been delivered yet; follow it under "Your events".'));
+      result.replaceChildren(h('div', { class: 'notice is-done' },
+        h('strong', {}, 'Alert accepted. '),
+        'The sandbox saved it and will now deliver it to the test receiver. Follow its journey.',
+        techLine('HTTP 202 Accepted', 'stored and queued, not yet delivered')));
       selectEvent(data.eventId);
       await pollNow();
       return data.eventId;
     }
     result.replaceChildren(status === 200
-      ? h('div', { class: 'box box-info' }, 'HTTP 200: this exact request was already accepted earlier. No new event was created.')
+      ? h('div', { class: 'notice is-idle' }, h('strong', {}, 'Already sent. '),
+        'This exact alert was accepted earlier, so nothing new was created.',
+        techLine('HTTP 200', 'Idempotent-Replayed: true'))
       : errorBox(status, data));
     return status === 200 ? data.eventId : null;
   } catch (err) {
-    result.replaceChildren(h('div', { class: 'box box-bad' }, h('strong', {}, 'No answer from the server: '), err.message,
-      ' The event may or may not have been stored. Submitting again reuses the same Idempotency-Key, so it cannot be stored twice.'));
+    result.replaceChildren(h('div', { class: 'notice is-waiting' }, h('strong', {}, 'No reply from the service. '), err.message,
+      ' Your alert may or may not have been saved. Pressing Send alert again is safe: it reuses the same request identifier, so it cannot create a second copy.'));
     return null;
   }
 }
@@ -342,7 +407,7 @@ async function setReceiverMode(mode) {
       return false;
     }
     state.receiver = res.data;
-    status.textContent = `Saved: your receiver is now in "${mode}" mode.`;
+    status.textContent = `Saved. The test receiver now: ${MODE_INFO[mode][0]}.`;
     renderReceiver();
     return true;
   } catch (err) {
@@ -354,7 +419,7 @@ async function setReceiverMode(mode) {
 
 // Reuses the original event's Idempotency-Key and payload: the API must not create a new event.
 async function submitDuplicate(event) {
-  state.detailNote = h('p', { class: 'muted' }, 'Sending the duplicate submission…');
+  state.detailNote = h('p', { class: 'hint' }, 'Sending an exact copy…');
   keepFocus($('detail'), renderDetail);
   try {
     const { status, data, headers } = await api('POST', '/v1/events', {
@@ -362,9 +427,10 @@ async function submitDuplicate(event) {
       headers: { 'Idempotency-Key': event.idempotencyKey },
     });
     state.detailNote = status === 200
-      ? h('div', { class: 'box box-ok' }, h('strong', {}, 'Duplicate submission: HTTP 200'),
-        headers.get('Idempotent-Replayed') ? ' with Idempotent-Replayed: true.' : '.',
-        ` Same event ID (${shortId(data.eventId)}…); no new event and no new delivery were created.`)
+      ? h('div', { class: 'notice is-done' }, h('strong', {}, 'Copy recognized. '),
+        'The sandbox saw this exact alert before: no new alert was created and nothing was delivered again.',
+        techLine(`HTTP ${status}`, headers.get('Idempotent-Replayed') ? 'Idempotent-Replayed: true' : null,
+          `same event ID ${shortId(data.eventId)}…`))
       : errorBox(status, data);
   } catch (err) {
     state.detailNote = unavailableBox(err);
@@ -378,7 +444,7 @@ async function replayDelivery(deliveryId) {
   try { keys = JSON.parse(storage.get(KEYS.replayKeys) || '{}'); } catch { keys = {}; }
   keys[deliveryId] ??= crypto.randomUUID();
   storage.set(KEYS.replayKeys, JSON.stringify(keys));
-  state.detailNote = h('p', { class: 'muted' }, 'Requesting a replay…');
+  state.detailNote = h('p', { class: 'hint' }, 'Asking the sandbox to deliver it again…');
   keepFocus($('detail'), renderDetail);
   try {
     const { status, data } = await api('POST', `/v1/deliveries/${deliveryId}/replay`,
@@ -386,8 +452,9 @@ async function replayDelivery(deliveryId) {
     delete keys[deliveryId];
     storage.set(KEYS.replayKeys, JSON.stringify(keys));
     state.detailNote = status === 202 || status === 200
-      ? h('div', { class: 'box box-ok' }, h('strong', {}, `Replay scheduled (HTTP ${status}). `),
-        'A new delivery of the same event starts with a fresh budget of attempts. The failed one stays in the history.')
+      ? h('div', { class: 'notice is-done' }, h('strong', {}, 'Delivering again. '),
+        'A new delivery of the same alert has started with a fresh set of tries. The stopped delivery stays in the record.',
+        techLine(`HTTP ${status}`, 'manual replay scheduled'))
       : errorBox(status, data);
     await pollNow();
   } catch (err) {
@@ -396,49 +463,52 @@ async function replayDelivery(deliveryId) {
   keepFocus($('detail'), renderDetail);
 }
 
-// --- guided scenarios -------------------------------------------------------------
+// --- experiments (the guided scenarios) -------------------------------------------
 
 const SCENARIOS = [
   {
     id: 'recover',
-    title: '1. Recover from a temporary failure',
-    why: 'Receivers have short outages. Retrying with a delay lets the delivery succeed once the receiver is back.',
+    icon: 'retry',
+    title: 'Receiver has a short outage',
+    why: 'The test receiver refuses alerts for a while. Watch the sandbox wait and try again, then turn the receiver back on.',
     mode: 'server_error',
-    eventTitle: 'Scenario 1: temporary receiver outage',
+    eventTitle: 'Experiment: short receiver outage',
     steps: [
-      'Start: the receiver is set to server_error and one event is submitted.',
-      'Watch attempt 1 fail with HTTP 503 and a retry get scheduled (retries follow after 2, 4 and 8 seconds).',
-      'Click "Switch receiver to success" before the 4th attempt (you have about 14 seconds).',
+      'Press Start. The test receiver is set to refuse alerts, and one alert is sent.',
+      'Watch the first try fail and a new try get scheduled (tries follow after 2, 4 and 8 seconds).',
+      'Press "Turn receiver back on" within about 14 seconds, before the fourth and last try.',
     ],
-    expected: 'The first attempt after the switch is delivered (HTTP 200). Earlier attempts show failed, HTTP 503, retryable. The receiver processed the event once.',
-    followUp: { label: 'Switch receiver to success', mode: 'success' },
+    expected: 'The next try is confirmed and the receiver processes the alert once. The earlier tries stay in the record as failed.',
+    followUp: { label: 'Turn receiver back on', mode: 'success' },
   },
   {
     id: 'timeout',
-    title: '2. Prevent duplicate processing after a timeout',
-    why: 'A receiver can finish the work but answer too late. The sender sees only a timeout and must retry without knowing.',
+    icon: 'hourglass',
+    title: 'Receiver replies too late',
+    why: 'The receiver does the work, but its reply arrives after the sandbox stops waiting. Watch the sandbox try again without the alert being processed twice.',
     mode: 'process_then_timeout',
-    eventTitle: 'Scenario 2: processed, but the reply was late',
+    eventTitle: 'Experiment: reply arrives too late',
     steps: [
-      'Start: the receiver is set to process_then_timeout and one event is submitted.',
-      'After about 3 seconds: attempt 1 shows "timeout, no response", while the receiver already shows it processed the event.',
-      'After about 6 seconds the retry runs. No action is needed.',
+      'Press Start. The test receiver is set to do the work but reply late, and one alert is sent.',
+      'After about 3 seconds the first try shows "No reply in time", while the receiver already shows the alert as processed.',
+      'After about 6 seconds the sandbox tries again. No action is needed.',
     ],
-    expected: 'Sender: 2 attempts (timeout, then delivered). Receiver: processed once, 1 duplicate recognized, same confirmation code.',
+    expected: 'Two tries: no reply in time, then confirmed. The receiver processed the alert once and recognized one repeat.',
   },
   {
     id: 'replay',
-    title: '3. Replay after retries are exhausted',
-    why: 'Some failures outlast every retry. An operator can replay the delivery later without losing the record of what failed.',
+    icon: 'replay',
+    title: 'Outage outlasts every try',
+    why: 'All four tries fail, so the sandbox stops. Then turn the receiver back on and deliver the alert again by hand.',
     mode: 'server_error',
-    eventTitle: 'Scenario 3: outage longer than the retry budget',
+    eventTitle: 'Experiment: outage longer than every try',
     steps: [
-      'Start: the receiver is set to server_error and one event is submitted.',
-      'Wait about 15 seconds until the delivery shows "Failed: all 4 attempts used".',
-      'Click "Switch receiver to success", then "Replay failed delivery" in the event details.',
+      'Press Start. The test receiver is set to refuse alerts, and one alert is sent.',
+      'Wait about 15 seconds until the journey shows "Delivery stopped".',
+      'Press "Turn receiver back on", then "Deliver again" in the journey.',
     ],
-    expected: 'The original delivery stays failed with 4 attempts. A separate replay delivery is delivered on its first attempt. The receiver processed the event once.',
-    followUp: { label: 'Switch receiver to success', mode: 'success' },
+    expected: 'The first delivery stays stopped with 4 failed tries. A new delivery is confirmed on its first try. The receiver processed the alert once.',
+    followUp: { label: 'Turn receiver back on', mode: 'success' },
   },
 ];
 
@@ -447,10 +517,16 @@ async function runScenario(scenario, button) {
   try {
     if (!state.token && !(await startSession())) return;
     if (!(await setReceiverMode(scenario.mode))) return;
+    const message = 'Synthetic data for a sandbox experiment.';
     $('title').value = scenario.eventTitle;
-    $('message').value = 'Synthetic data for a guided scenario.';
-    const eventId = await submitEvent(scenario.eventTitle, 'Synthetic data for a guided scenario.');
-    if (eventId) $('detail-heading').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    $('message').value = message;
+    const eventId = await submitEvent(scenario.eventTitle, message);
+    if (eventId) {
+      const box = $('journey').getBoundingClientRect();
+      if (box.top < 0 || box.top > window.innerHeight * 0.6) {
+        $('journey').scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' });
+      }
+    }
   } finally {
     button.disabled = false;
   }
@@ -458,17 +534,99 @@ async function runScenario(scenario, button) {
 
 function renderScenarios() {
   $('scenarios').replaceChildren(...SCENARIOS.map((s) => {
-    const start = h('button', { type: 'button', class: 'primary' }, 'Start scenario');
+    const start = h('button', { type: 'button', class: 'btn btn-primary' }, 'Start experiment');
     start.addEventListener('click', () => runScenario(s, start));
-    return h('article', { class: 'scenario', 'aria-labelledby': `scenario-${s.id}` },
+    return h('article', { class: 'card experiment', 'aria-labelledby': `scenario-${s.id}` },
+      icon(s.icon, 'exp-icon'),
       h('h3', { id: `scenario-${s.id}` }, s.title),
       h('p', {}, s.why),
-      h('ol', {}, s.steps.map((step) => h('li', {}, step))),
-      h('p', {}, h('strong', {}, 'Expected: '), s.expected),
+      h('p', { class: 'note' }, 'Changes how your test receiver responds for this session.'),
+      h('details', { class: 'tech' }, h('summary', {}, 'Steps and what to expect'),
+        h('ol', {}, s.steps.map((step) => h('li', {}, step))),
+        h('p', {}, h('strong', {}, 'Expected: '), s.expected)),
       h('div', { class: 'button-row' }, start,
-        s.followUp ? h('button', { type: 'button', onclick: () => setReceiverMode(s.followUp.mode) }, s.followUp.label) : null));
+        s.followUp ? h('button', { type: 'button', class: 'btn btn-quiet', onclick: () => setReceiverMode(s.followUp.mode) }, s.followUp.label) : null));
   }));
 }
+
+// --- plain-language views of API state ------------------------------------------------
+
+// One delivery's state, from delivery.state / attemptCount / maxAttempts / nextAttemptAt / failureReason.
+function deliveryView(d) {
+  const n = d.attemptCount;
+  const max = d.maxAttempts;
+  switch (d.state) {
+    case 'pending':
+      return n === 0
+        ? { tone: 'is-waiting', icon: 'clock', label: 'Waiting to send', detail: 'Queued for the sandbox\'s delivery worker.' }
+        : { tone: 'is-waiting', icon: 'clock', label: 'Waiting to send again', detail: `Try ${n} ended without a known result (the delivery worker stopped). It will be sent again.` };
+    case 'in_progress':
+      return { tone: 'is-active', icon: 'send', label: 'Sending', detail: `Try ${n} of ${max} is on its way to the receiver.` };
+    case 'retry_scheduled': {
+      const wait = secondsUntil(d.nextAttemptAt);
+      return {
+        tone: 'is-waiting', icon: 'retry', label: 'Trying again',
+        detail: `Try ${n} of ${max} did not get through. Next try ${wait > 0 ? `in about ${wait} s` : 'is due now'} (at ${time(d.nextAttemptAt)}).`,
+      };
+    }
+    case 'delivered':
+      return { tone: 'is-done', icon: 'check', label: 'Delivery confirmed', detail: `The receiver acknowledged it on try ${n} of ${max}.` };
+    case 'failed':
+      return {
+        tone: 'is-failed', icon: 'stop', label: 'Delivery stopped',
+        detail: {
+          attempts_exhausted: `All ${max} tries failed, so the sandbox stopped trying.`,
+          non_retryable: 'The receiver refused it in a way that trying again cannot fix.',
+          session_expired: 'The demo session ended before it could be delivered.',
+        }[d.failureReason] ?? 'The sandbox stopped trying.',
+      };
+    default:
+      return { tone: 'is-unknown', icon: 'question', label: 'Unknown state', detail: `The API reported "${d.state}".` };
+  }
+}
+
+// One attempt, from outcome / errorCategory / retryable.
+function attemptView(a) {
+  const at = ` (${time(a.startedAt)})`;
+  if (a.outcome === 'in_progress') return { tone: 'is-active', icon: 'send', text: `Try ${a.attemptNumber}: sending…${at}` };
+  if (a.outcome === 'delivered') return { tone: 'is-done', icon: 'check', text: `Try ${a.attemptNumber}: receiver confirmed${at}` };
+  if (a.outcome === 'lease_expired') return { tone: 'is-unknown', icon: 'question', text: `Try ${a.attemptNumber}: result unknown, the delivery worker restarted${at}` };
+  const why = {
+    http_error: a.retryable === false ? 'receiver refused it' : 'receiver reported a problem',
+    timeout: 'no reply in time',
+    network_error: 'could not reach the receiver',
+  }[a.errorCategory] ?? 'did not get through';
+  return { tone: a.errorCategory === 'timeout' ? 'is-waiting' : 'is-failed', icon: a.errorCategory === 'timeout' ? 'hourglass' : 'cross', text: `Try ${a.attemptNumber}: ${why}${at}` };
+}
+
+// The receiver's side, from the receipt (processed / result / deliveriesReceived / duplicateCount).
+function receiverView(receipt, latest) {
+  if (!receipt) return { tone: 'is-unknown', icon: 'question', label: 'Checking…', detail: 'Loading what the receiver recorded.' };
+  if (receipt.processed) {
+    const repeats = receipt.duplicateCount;
+    return {
+      tone: 'is-done', icon: 'inbox', label: 'Receiver processed alert',
+      detail: `Confirmation ${receipt.result?.confirmationCode ?? '(none)'}. `
+        + (repeats > 0
+          ? `It received the alert ${receipt.deliveriesReceived} times, recognized ${repeats} as ${repeats === 1 ? 'a repeat' : 'repeats'}, and processed it only once.`
+          : 'Processed once.'),
+    };
+  }
+  if (latest && ACTIVE_STATES.has(latest.state)) {
+    return { tone: 'is-idle', icon: 'dash', label: 'Not processed yet', detail: 'Nothing has been processed while delivery is still under way.' };
+  }
+  if (latest?.state === 'failed') {
+    return { tone: 'is-idle', icon: 'dash', label: 'Not processed', detail: 'The receiver did not act on this alert.' };
+  }
+  return { tone: 'is-unknown', icon: 'question', label: 'No processing recorded', detail: 'The delivery was confirmed, but the receiver has no record of processing it.' };
+}
+
+const MODE_INFO = {
+  success: ['Works normally', 'Accepts the alert and processes it right away.'],
+  server_error: ['Temporary outage', 'Refuses alerts with an error and processes nothing. The sandbox tries again.'],
+  timeout: ['Too slow to reply', 'Replies after the sandbox has stopped waiting, and processes nothing.'],
+  process_then_timeout: ['Processes, then replies late', 'Does the work, but the reply arrives after the sandbox has stopped waiting.'],
+};
 
 // --- rendering ---------------------------------------------------------------------
 
@@ -490,38 +648,56 @@ function render() {
   for (const id of ['submit-event', 'new-example']) $(id).disabled = !signedIn;
 }
 
+function setService(status, detail = null) {
+  state.service = { status, detail };
+  renderService();
+}
+
+function renderService() {
+  const { status } = state.service;
+  const waking = state.slowRequests > 0 && status === 'checking';
+  const view = waking
+    ? ['is-waiting', 'hourglass', 'Waking up…']
+    : {
+      checking: ['is-idle', 'clock', 'Checking service…'],
+      ready: ['is-done', 'check', 'Service ready'],
+      not_ready: ['is-failed', 'stop', 'Service not ready'],
+      unreachable: ['is-failed', 'cross', 'Can\'t reach service'],
+      offline: ['is-failed', 'offline', 'You are offline'],
+    }[status];
+  const pill = $('service-status');
+  pill.className = `status-pill ${view[0]}`;
+  pill.replaceChildren(icon(view[1]), view[2]);
+}
+
 function renderWakeBanner() {
   const banner = $('wake-banner');
   banner.hidden = state.slowRequests === 0;
   banner.textContent = state.slowRequests > 0
-    ? 'Waiting for the server… On the free hosting plan the service sleeps after 15 minutes without traffic '
+    ? 'Waiting for the server… On the free hosting plan the service sleeps after 15 minutes without visitors '
       + 'and can take about a minute to wake up. Nothing has failed: your request is still in progress.'
     : '';
+  renderService();
 }
 
 function renderSession() {
   const area = $('session-area');
   const children = [];
-  if (state.sessionNote) children.push(h('div', { class: 'box box-warn' }, state.sessionNote));
+  if (state.sessionNote) children.push(h('div', { class: 'notice is-waiting' }, state.sessionNote));
   if (state.token) {
-    children.push(h('p', {}, 'Session active',
-      state.expiresAt ? ` until ${new Date(state.expiresAt).toLocaleString()}` : '', '.'));
-    children.push(h('button', { type: 'button', onclick: () => startSession(), disabled: state.creatingSession },
-      state.creatingSession ? 'Starting…' : 'Start a fresh session'));
+    children.push(h('div', { class: 'session-box' },
+      h('p', { class: 'status-pill is-done' }, icon('check'), 'Demo session active'),
+      state.expiresAt ? h('p', { class: 'hint' }, `until ${new Date(state.expiresAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}`) : null,
+      h('button', { type: 'button', class: 'btn-link small', onclick: () => startSession(), disabled: state.creatingSession },
+        state.creatingSession ? 'Starting…' : 'Start fresh session')));
   } else {
-    children.push(h('p', {}, 'No session yet. A session is an anonymous demo credential, not an account.'));
-    children.push(h('button', { type: 'button', class: 'primary', onclick: () => startSession(), disabled: state.creatingSession },
-      state.creatingSession ? 'Starting…' : (state.sessionNote ? 'Start a new session' : 'Start demo session')));
+    children.push(h('div', { class: 'session-start' },
+      h('p', {}, 'Start a private demo session to send alerts. No sign-up: it is anonymous and ends after 24 hours.'),
+      h('button', { type: 'button', class: 'btn btn-primary', onclick: () => startSession(), disabled: state.creatingSession },
+        state.creatingSession ? 'Starting…' : (state.sessionNote ? 'Start a new session' : 'Start demo session'))));
   }
   area.replaceChildren(...children);
 }
-
-const MODE_INFO = {
-  success: ['success', 'Processes the event and answers HTTP 200 immediately.'],
-  server_error: ['server_error', 'Answers HTTP 503 immediately and processes nothing (retryable).'],
-  timeout: ['timeout', 'Answers too late (after the 2 s sender timeout) and processes nothing.'],
-  process_then_timeout: ['process_then_timeout', 'Processes the event, then answers too late. The sender cannot tell that it worked.'],
-};
 
 function renderReceiver() {
   const container = $('receiver-modes');
@@ -531,59 +707,40 @@ function renderReceiver() {
     container.append(...Object.entries(MODE_INFO).map(([mode, [label, description]]) => {
       const input = h('input', { type: 'radio', name: 'mode', value: mode, id: `mode-${mode}` });
       input.addEventListener('change', () => setReceiverMode(mode));
-      return h('label', { for: `mode-${mode}` }, input, h('span', {}, h('strong', {}, label), description));
+      return h('label', { for: `mode-${mode}`, class: 'choice' }, input, h('span', {}, h('strong', {}, label), h('span', {}, description)));
     }));
   }
   for (const input of container.querySelectorAll('input')) {
     input.checked = input.value === current;
     input.disabled = !state.token;
   }
-  if (!state.token) $('receiver-status').textContent = 'Start a session to configure your receiver.';
+  if (!state.token) $('receiver-status').textContent = 'Start a session to choose how the test receiver responds.';
   else if (state.receiver && !$('receiver-status').textContent) {
-    $('receiver-status').textContent = `Current mode: ${current}.`;
-  }
-}
-
-function deliveryBadge(delivery) {
-  const { state: s, attemptCount: n, maxAttempts: max } = delivery;
-  switch (s) {
-    case 'pending':
-      return ['badge-info', n === 0 ? 'Queued for delivery' : 'Queued again (a worker stopped responding)'];
-    case 'in_progress':
-      return ['badge-info', `Sending attempt ${n} of ${max}`];
-    case 'retry_scheduled':
-      return ['badge-warn', `Attempt ${n} failed · retry ${n + 1} of ${max} at ${time(delivery.nextAttemptAt)} (in ~${secondsUntil(delivery.nextAttemptAt)} s)`];
-    case 'delivered':
-      return ['badge-ok', `Delivered (HTTP 2xx) on attempt ${n}`];
-    case 'failed':
-      return ['badge-bad', delivery.failureReason === 'non_retryable'
-        ? `Failed: receiver rejected it (not retryable)`
-        : `Failed: all ${max} attempts used`];
-    default:
-      return ['badge-info', s];
+    $('receiver-status').textContent = `Currently: ${MODE_INFO[current]?.[0] ?? current}.`;
   }
 }
 
 function renderEvents() {
   const list = $('event-list');
   if (!state.token) {
-    list.replaceChildren(h('li', { class: 'muted' }, 'Start a session to submit and track events.'));
+    list.replaceChildren(h('li', { class: 'history-empty' }, 'Your alerts will appear here.'));
     return;
   }
   if (state.events.length === 0) {
-    list.replaceChildren(h('li', { class: 'muted' }, 'No events yet. Submit one or start a guided scenario.'));
+    list.replaceChildren(h('li', { class: 'history-empty' }, 'No alerts yet. Send one or start an experiment.'));
     return;
   }
   const items = state.events.map((event) => {
-    const [badgeClass, text] = deliveryBadge(event.delivery);
+    const view = deliveryView(event.delivery);
+    const replays = event.delivery.replayCount;
     const button = h('button', {
-      type: 'button', class: 'event-item', 'aria-current': event.id === state.selectedId ? 'true' : 'false',
+      type: 'button', class: `history-item ${view.tone}`, 'aria-current': event.id === state.selectedId ? 'true' : 'false',
       'data-focus-key': `event-${event.id}`,
     },
-    h('span', { class: 'event-title' }, event.payload.title),
-    h('span', { class: `badge ${badgeClass}` }, text),
-    h('span', { class: 'event-meta' }, `Accepted ${time(event.createdAt)}`,
-      event.delivery.replayCount ? ` · ${event.delivery.replayCount} replay(s)` : ''));
+    icon(view.icon),
+    h('span', { class: 'h-title' }, event.payload.title),
+    h('span', { class: 'h-time' }, time(event.createdAt)),
+    h('span', { class: 'h-state' }, view.label, replays ? ` · delivered again ${replays === 1 ? 'once' : `${replays} times`}` : ''));
     button.addEventListener('click', () => {
       selectEvent(event.id);
       render();
@@ -591,132 +748,173 @@ function renderEvents() {
     });
     return h('li', {}, button);
   });
-  if (state.hasMoreEvents) items.push(h('li', { class: 'muted' }, 'Showing your 20 newest events.'));
+  if (state.hasMoreEvents) items.push(h('li', { class: 'hint' }, 'Showing your 20 newest alerts.'));
   list.replaceChildren(...items);
 }
 
 function renderPollStatus(mode, delay) {
   const text = {
     none: '',
-    active: 'Deliveries in progress: refreshing every 2 seconds.',
-    idle: 'All deliveries have finished. Refreshing stopped; it restarts when you submit or replay.',
-    paused: 'Refreshing paused while this tab is hidden.',
-    backoff: `Could not refresh (${state.poll.lastError}). Trying again in ${Math.round((delay ?? 0) / 1000)} s.`,
+    active: 'Updating every 2 seconds while alerts are on their way.',
+    idle: 'All alerts have finished. Updates resume when you send or deliver again.',
+    paused: 'Updates paused while this tab is hidden.',
+    backoff: `Couldn't update (${state.poll.lastError}). Trying again in ${Math.round((delay ?? 0) / 1000)} s.`,
   }[mode];
   const el = $('poll-status');
   el.replaceChildren(text ?? '');
-  if (mode === 'backoff') el.append(' ', h('button', { type: 'button', onclick: () => pollNow() }, 'Retry now'));
+  if (mode === 'backoff') el.append(' ', h('button', { type: 'button', class: 'btn-link', onclick: () => pollNow() }, 'Retry now'));
 }
 
+function stage(name, question, view, ...body) {
+  return h('li', { class: `stage ${view.tone}` },
+    h('div', { class: 'stage-icon' }, icon(view.icon)),
+    h('p', { class: 'stage-name' }, name),
+    h('p', { class: 'stage-question' }, question),
+    h('p', { class: 'stage-status' }, view.label),
+    h('div', { class: 'stage-body' }, view.detail ? h('p', {}, view.detail) : null, ...body));
+}
+
+const STAGES = [
+  ['1 · Sandbox', 'Did the sandbox accept the alert?'],
+  ['2 · Delivery', 'Did the receiver confirm it got the alert?'],
+  ['3 · Receiver', 'Did the receiver act on it?'],
+];
+
+// Technical lines kept from the earlier UI, shown only in the technical view.
 function attemptLine(a) {
-  const parts = [`Attempt ${a.attemptNumber}: ${a.outcome.replace('_', ' ')}`];
-  if (a.outcome === 'in_progress') parts.push('waiting for the receiver');
-  else if (a.outcome === 'lease_expired') parts.push('result unknown (the worker stopped before reporting)');
-  else parts.push(a.responseStatus ? `HTTP ${a.responseStatus}` : 'no HTTP response');
-  if (a.errorCategory && a.outcome === 'failed') parts.push(a.errorCategory.replace('_', ' '));
-  if (a.retryable === true) parts.push('retryable');
-  if (a.retryable === false) parts.push('not retryable');
+  const parts = [`Attempt ${a.attemptNumber}: ${a.outcome}`];
+  parts.push(a.responseStatus ? `HTTP ${a.responseStatus}` : 'no HTTP response');
+  if (a.errorCategory) parts.push(a.errorCategory);
+  if (a.retryable !== null) parts.push(`retryable: ${a.retryable}`);
   if (a.durationMs !== null) parts.push(`${a.durationMs} ms`);
-  parts.push(`started ${time(a.startedAt)}`);
   return parts.join(' · ');
+}
+
+function technicalView(event, detail) {
+  const details = h('details', { class: 'tech', open: state.techOpen },
+    h('summary', { 'data-focus-key': 'tech' }, 'Technical view: IDs, status codes and raw API data'),
+    h('ul', { class: 'tech-list' },
+      h('li', {}, 'Event ID: ', h('code', {}, event.id)),
+      h('li', {}, 'Idempotency-Key: ', h('code', {}, event.idempotencyKey)),
+      h('li', {}, 'Accepted with HTTP 202 at ', h('code', {}, event.createdAt)),
+      h('li', {}, 'Status URL: ', h('code', {}, event.delivery.statusUrl)),
+      ...(detail?.deliveries ?? []).map((d, i) => h('li', {},
+        `${i === 0 ? 'Original delivery' : `Replay ${i}`} `, h('code', {}, d.id), `: state ${d.state}`,
+        d.failureReason ? `, failureReason ${d.failureReason}` : '',
+        h('ul', {}, d.attempts.map((a) => h('li', {}, attemptLine(a)))))),
+      detail ? h('li', {}, `Receiver receipt: processed ${detail.receipt.processed}, deliveriesReceived ${detail.receipt.deliveriesReceived}, duplicateCount ${detail.receipt.duplicateCount}`) : null),
+    h('pre', {}, JSON.stringify({ event, deliveries: detail?.deliveries ?? null, receipt: detail?.receipt ?? null }, null, 2)));
+  details.addEventListener('toggle', () => { state.techOpen = details.open; });
+  return details;
 }
 
 function renderDetail() {
   const container = $('detail');
   const event = state.events.find((e) => e.id === state.selectedId);
   if (!state.token || !event) {
-    container.replaceChildren(h('p', { class: 'muted' }, 'Select an event to see its delivery history.'));
+    const idle = { tone: 'is-idle', icon: 'dash', label: 'Not started', detail: null };
+    container.replaceChildren(h('div', { class: 'journey-empty' },
+      h('p', {}, !state.token
+        ? 'Start a demo session and send an alert. Its journey will appear here, step by step.'
+        : state.events.length ? 'Choose an alert from Recent alerts to see its journey.' : 'Send an alert to see its journey here.'),
+      h('p', { class: 'journey-sub' }, 'Every journey has three steps:'),
+      h('ol', { class: 'stages' }, STAGES.map(([name, question]) => stage(name, question, idle)))));
     return;
   }
+
   const detail = state.detail?.eventId === event.id ? state.detail : null;
-  const latest = detail?.deliveries.at(-1);
+  const deliveries = detail?.deliveries ?? null;
+  const latest = deliveries?.at(-1) ?? event.delivery;
 
-  const lane1 = h('div', { class: 'lane lane-1' },
-    h('h3', {}, '1. Accepted by the API'),
-    h('p', {}, `HTTP 202 at ${time(event.createdAt)}: stored durably with Idempotency-Key `,
-      h('code', {}, event.idempotencyKey), '. Acceptance means "will be delivered", not "delivered".'),
-    h('div', { class: 'button-row' },
-      h('button', { type: 'button', 'data-focus-key': 'duplicate', onclick: () => submitDuplicate(event) },
-        'Submit duplicate (same key and payload)')),
-    state.detailNote);
+  const accepted = { tone: 'is-done', icon: 'box', label: 'Accepted', detail: 'Saved and queued. Accepted means it will be delivered, not that it has been.' };
 
-  const lane2 = h('div', { class: 'lane lane-2' }, h('h3', {}, '2. HTTP delivery (what the sender saw)'));
-  if (!detail) {
-    lane2.append(h('p', { class: 'muted' }, 'Loading delivery history…'));
+  let deliveryBody;
+  if (!deliveries) {
+    deliveryBody = [h('p', { class: 'stage-question' }, 'Loading the delivery record…')];
   } else {
-    detail.deliveries.forEach((delivery, index) => {
-      const [badgeClass, text] = deliveryBadge(delivery);
-      lane2.append(h('div', { class: 'delivery-block' },
-        h('p', {}, h('strong', {}, index === 0 ? 'Original delivery' : `Replay ${index}`), ' ',
-          h('span', { class: `badge ${badgeClass}` }, text)),
-        delivery.attempts.length
-          ? h('ol', { class: 'attempts' }, delivery.attempts.map((a) => h('li', {}, attemptLine(a))))
-          : h('p', { class: 'muted' }, 'No attempts yet: waiting for the worker.')));
-    });
-    if (latest?.state === 'failed') {
-      lane2.append(h('div', { class: 'button-row' },
-        h('button', { type: 'button', class: 'primary', 'data-focus-key': 'replay', onclick: () => replayDelivery(latest.id) },
-          'Replay failed delivery')));
-    }
+    deliveryBody = deliveries.map((d, index) => h('div', { class: 'delivery-group' },
+      deliveries.length > 1 ? h('h4', {}, index === 0 ? 'First delivery' : `Delivered again (${index})`, ': ', deliveryView(d).label) : null,
+      d.attempts.length
+        ? h('ul', { class: 'tries' }, d.attempts.map((a) => {
+          const v = attemptView(a);
+          return h('li', { class: v.tone }, icon(v.icon), h('span', {}, v.text));
+        }))
+        : h('p', {}, 'No tries yet.')));
   }
 
-  const lane3 = h('div', { class: 'lane lane-3' }, h('h3', {}, '3. Receiver processing (what the receiver did)'));
-  if (detail) {
-    const r = detail.receipt;
-    if (r.processed) {
-      lane3.append(h('p', {}, h('span', { class: 'badge badge-ok' }, 'Processed once'),
-        ` Confirmation ${r.result.confirmationCode}: ${r.result.summary}`));
-      lane3.append(h('p', {}, `Deliveries received: ${r.deliveriesReceived} · duplicates recognized and not re-processed: ${r.duplicateCount}.`));
-      const timedOut = detail.deliveries.some((d) => d.attempts.some((a) => a.errorCategory === 'timeout'));
-      if (timedOut) {
-        lane3.append(h('div', { class: 'box box-info' },
-          'The receiver processed this event even though a sender attempt timed out. The sender could not know that, so it retried; the receiver recognized the event ID and did not process it again.'));
-      }
-    } else {
-      lane3.append(h('p', {}, h('span', { class: 'badge badge-info' }, 'Not processed'),
-        ' The receiver has not processed this event (yet).'));
-    }
-  }
-  container.replaceChildren(h('p', {}, h('strong', {}, event.payload.title)), lane1, lane2, lane3);
+  // After a manual replay, the stage summary describes the newest delivery; say so.
+  const latestView = deliveryView(latest);
+  if (deliveries && deliveries.length > 1) latestView.detail = `Delivered again: ${latestView.detail.charAt(0).toLowerCase()}${latestView.detail.slice(1)}`;
+
+  const timedOutButProcessed = detail?.receipt.processed
+    && deliveries.some((d) => d.attempts.some((a) => a.errorCategory === 'timeout'));
+
+  const actions = h('div', { class: 'journey-actions' },
+    h('button', { type: 'button', class: 'btn', 'data-focus-key': 'duplicate', onclick: () => submitDuplicate(event) },
+      'Send an exact copy'),
+    latest.state === 'failed' && deliveries
+      ? h('button', { type: 'button', class: 'btn btn-primary', 'data-focus-key': 'replay', onclick: () => replayDelivery(latest.id) },
+        icon('replay'), 'Deliver again')
+      : null);
+
+  // replaceChildren() would print null as text, so empty parts are filtered out.
+  container.replaceChildren(...[
+    h('h3', { class: 'journey-title' }, event.payload.title),
+    h('p', { class: 'journey-sub' }, `Sent ${time(event.createdAt)}`),
+    h('ol', { class: 'stages' },
+      stage(...STAGES[0], accepted),
+      stage(...STAGES[1], latestView, ...deliveryBody),
+      stage(...STAGES[2], receiverView(detail?.receipt, latest))),
+    timedOutButProcessed
+      ? h('p', { class: 'journey-explain' }, 'The receiver processed this alert even though a try ran out of time. The sandbox could not know that, so it tried again; the receiver recognized the repeat and did not process it twice.')
+      : null,
+    actions,
+    h('p', { class: 'journey-sub' }, '"Send an exact copy" repeats the original request, to show that it cannot create a second alert.'),
+    state.detailNote,
+    technicalView(event, detail)].filter(Boolean));
 }
 
 function renderSummary() {
   const container = $('summary');
   const s = state.summary;
   if (!state.token || !s) {
-    container.replaceChildren(h('p', { class: 'muted' }, 'Start a session to see a summary.'));
+    container.replaceChildren(h('p', { class: 'hint' }, 'Start a session to see a summary.'));
     return;
   }
   const d = s.recentDeliveryDuration;
   container.replaceChildren(
-    h('p', {}, `Events: ${s.events} · delivered: ${s.byCurrentDeliveryState.delivered} · failed: ${s.byCurrentDeliveryState.failed}`
-      + ` · in progress: ${s.byCurrentDeliveryState.active} · HTTP attempts: ${s.attempts} · replays: ${s.replays}`),
-    h('p', {}, `Receiver: processed ${s.receiver.processed} event(s), recognized ${s.receiver.duplicatesRecognized} duplicate delivery(ies).`),
+    h('p', {}, `Alerts: ${s.events} · confirmed: ${s.byCurrentDeliveryState.delivered} · stopped: ${s.byCurrentDeliveryState.failed}`
+      + ` · under way: ${s.byCurrentDeliveryState.active} · tries: ${s.attempts} · delivered again: ${s.replays}`),
+    h('p', {}, `Receiver: processed ${s.receiver.processed}, recognized ${s.receiver.duplicatesRecognized} repeat(s).`),
+    h('p', {}, 'Test receiver mode (API value): ', h('code', {}, state.receiver?.mode ?? 'unknown')),
     h('p', {}, h('strong', {}, 'Recent delivery time: '), d.sampleSize === 0
-      ? 'no delivered events yet.'
-      : `median ${(d.medianMs / 1000).toFixed(1)} s, slowest ${(d.maxMs / 1000).toFixed(1)} s, over ${d.sampleSize} delivered event(s).`),
-    h('details', { class: 'note' }, h('summary', {}, 'How this is measured'),
+      ? 'no confirmed alerts yet.'
+      : `median ${(d.medianMs / 1000).toFixed(1)} s, slowest ${(d.maxMs / 1000).toFixed(1)} s, over ${d.sampleSize} alert(s).`),
+    h('details', { class: 'tech' }, h('summary', {}, 'How this is measured'),
       h('p', {}, `From: ${d.start}. To: ${d.end}. Population: ${d.population} Includes ${d.includes}.`),
       h('p', {}, s.notice)));
 }
 
-// --- API status (from Stage 1) -----------------------------------------------------
+// --- service status (/health and /ready) -------------------------------------------
 
 async function checkStatus() {
   const result = $('status-result');
   const button = $('check-status');
   button.disabled = true;
   result.textContent = 'Checking…';
+  if (state.service.status !== 'ready') setService('checking');
   try {
     const started = performance.now();
     const health = await api('GET', '/health', { auth: false });
     const ready = await api('GET', '/ready', { auth: false });
     const ms = Math.round(performance.now() - started);
     const ok = health.status === 200 && ready.status === 200;
-    result.replaceChildren(h('span', { class: `badge ${ok ? 'badge-ok' : 'badge-bad'}` }, ok ? 'Ready' : 'Not ready'),
-      ` Process: ${health.data.status} (version ${health.data.version}). `,
+    setService(ok ? 'ready' : 'not_ready', ready.data.reason);
+    result.replaceChildren(ok ? 'Ready.' : 'Not ready.',
+      ` Process: ${health.data.status} (version ${health.data.version}, delivery worker in this process: ${health.data.inProcessWorker ? 'yes' : 'no'}). `,
       `Database: ${ready.status === 200 ? 'ready' : `unavailable (${ready.data.reason})`}. Checked in ${ms} ms.`);
   } catch (err) {
+    setService(navigator.onLine === false ? 'offline' : 'unreachable', err.message);
     result.replaceChildren(unavailableBox(err));
   } finally {
     button.disabled = false;
@@ -742,6 +940,7 @@ $('event-form').addEventListener('submit', async (e) => {
 
 fillExample();
 renderScenarios();
+renderService();
 render();
 checkStatus();
 restoreSession();

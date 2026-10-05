@@ -738,3 +738,92 @@ but they need restarting by hand.
 - Headless Edge on Render's `/docs/`: 15 operations, 7 tags, 0 console errors or CSP violations, no horizontal scroll.
 - Not done by me: item 3 (Render log view) and item 9 (manual browser scenario). They need the dashboard or a person.
   The Stage 10 jsdom UI check was not rerun; the UI changed only by one footer link.
+
+## Stage 12: Visitor-facing frontend, visual foundation (2026-10-05)
+
+**Before starting.** Clean tree at `13c8516`. Read the UI (`public/*`), the OpenAPI spec, `app.js` state logic,
+`test/ui.test.js` and the Render setup. Differences from the planned "alert" concept:
+- the API has no alert fields beyond `title`/`message` (no severity or priority)
+- the receiver mode is per session and applies at delivery time, including waiting retries
+- attempts don't store the receiver's error code or the mode that was active
+- worker liveness isn't public
+- updates are polling only
+
+All of these are recorded in `docs/frontend-notes.md` → *Known gaps*.
+
+**Decisions**
+- **No backend or API change.** No new dependency. Same files (`index.html`, `app.css`, `app.js`), same CSP.
+- **Page structure:**
+  - header: *Follow an Alert*, Demo label, service pill, *Technical details* link
+  - intro line
+  - workspace: composer left; navy journey right with *Recent alerts* under it
+  - three experiment cards
+  - a Technical details section
+- **Every existing control is kept:**
+  - session start/restart
+  - the four receiver modes (now plain labels)
+  - send with the kept Idempotency-Key
+  - the three scenarios (now experiment cards)
+  - duplicate submission (*Send an exact copy*)
+  - replay (*Deliver again*)
+  - session summary
+  - status check
+  - polling, backoff, the waking banner and 401 handling
+- **The journey has three steps.** *Sandbox / Delivery / Receiver*, each with a plain question, so delivery
+  acknowledgement and receiver processing are separate. Labels: *Waiting to send, Sending, Trying again, Delivery
+  confirmed, Delivery stopped, Receiver processed alert*. The field mapping is in the frontend notes.
+- **Technical view.** IDs, HTTP codes and raw JSON are in a collapsible view, which stays open across the
+  2-second refresh.
+- **Offline.** *You are offline* is shown only when `navigator.onLine === false`. Receiver errors are called
+  *Temporary outage* / *receiver reported a problem*.
+- **Tokens:** colour, type (system serif headings, system UI body), spacing, radii, shadows, focus (navy ring
+  on light, light ring on navy), state treatments (`is-done/active/waiting/failed/idle/unknown`), and motion
+  tokens with a global `prefers-reduced-motion` rule.
+- **Not yet built:** no animation, so **no motion-off control yet** (a toggle with nothing to switch off would be
+  a fake feature). The new alert composer comes in a later stage; the current title/message form is restyled only.
+- **Example text changed.** The examples no longer mention "test patient" (that implied clinical use); they're
+  neutral synthetic practice alerts.
+- **Dropped:** the automatic dark theme (the specified palette is light with a navy canvas).
+- The smooth scroll after starting an experiment now respects reduced motion and only runs when the journey is
+  off-screen.
+
+**Verification (local, Node 22.18.0, Postgres 18.6, Windows 11)**
+- `npm test`: 131/131, `skipped 0`, two consecutive runs. One assertion was updated: the page `<title>` is now
+  "Follow an Alert · Integration Reliability Sandbox".
+  - A first full run had one failure in `test/worker.test.js` while my local UI server was also running. It passed
+    alone (13/13) and in both later full runs. This is the timing sensitivity already noted in Stage 5, not a
+    Stage 12 change (no backend code changed).
+- **Real browser, headless Edge (puppeteer-core) against a local server with the worker on, real API data, no
+  fixtures. Second run: 35/36 checks.**
+  - Header shows *Service ready*.
+  - Send is disabled before a session; the session starts only on click.
+  - The token is in `sessionStorage`, not in the URL or page text, and not in the technical view.
+  - Send → *Alert accepted* → *Delivery confirmed* + *Receiver processed alert* (separate steps).
+  - Exact copy: *Copy recognized*, still 1 alert.
+  - Experiment 1: *Trying again*, then confirmed after *Turn receiver back on*.
+  - Experiment 2: *no reply in time*, *recognized 1 as a repeat*, explanation shown.
+  - Experiment 3: *Delivery stopped*, *Not processed*; after *Deliver again*, *Delivered again (1): Delivery
+    confirmed*.
+  - The technical view keeps its open state and shows raw JSON.
+  - Offline submission: an ambiguous-result message and *You are offline*. Resending after reconnecting created
+    exactly one alert.
+  - Phone width (390 px): composer before journey, journey vertical.
+  - Expired token: explained, *Start a new session* offered, 0 automatic session creations.
+  - No horizontal scroll at 1440 px and 390 px, with and without data.
+  - **axe-core: 0 violations** on desktop (empty and with data) and mobile.
+  - The one "failure" is the browser's own network log for the two deliberate failures (offline, 401). There
+    were no script errors.
+- **Screenshots reviewed** (desktop 1440×900, mobile 390×844, full pages). Fixed after the first run:
+  - a stray "null" text in the journey (`replaceChildren` stringifies `null`)
+  - a doubled period after the locale time ("p.m..")
+  - an unclear delivery summary after a replay (now prefixed "Delivered again:")
+  - raw ISO-like session expiry (now medium date + short time)
+  - truncated history titles on phones (now wrap)
+
+**Not verified**
+- Real screen readers.
+- Safari, Firefox and real mobile devices: only Chromium-based Edge was used.
+- Visual review by a person.
+- Windows high-contrast mode.
+- The check scripts (puppeteer-core, axe-core) live in a scratch folder, not in the repository.
+

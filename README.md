@@ -1,8 +1,8 @@
 # Integration Reliability Sandbox
 
-A learning sandbox that accepts synthetic JSON events, persists them, and delivers them
+A learning sandbox that accepts synthetic JSON events (shown in the browser as practice *alerts*), persists them, and delivers them
 reliably to a controlled mock receiver.
-**Current stage: 11. API documentation, Postman collection, and release checkpoint.**
+**Current stage: 12. Visitor-facing frontend: visual foundation ("Follow an Alert").**
 
 | Want to… | Go to |
 |---|---|
@@ -219,31 +219,35 @@ curl.exe -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/events?limit=5"         
 Remove-Item event.json; Remove-Variable TOKEN
 ```
 
-The landing page has the same flow: **Start demo session**, **Submit event**, **Send same request again**, and **Refresh list**.
+The landing page has the same flow: **Start demo session**, **Send alert**, and, in the alert journey, **Send an exact copy**.
 
-## Browser UI
+## Browser UI: Follow an Alert
 
-A single page served by the same app (`public/`). It uses plain JavaScript with no framework or build step.
+A single page served by the same app (`public/`), aimed at visitors without a technical background. Plain
+JavaScript, HTML, CSS and inline SVG; no framework or build step. Design notes and the field-to-label mapping are in
+[`docs/frontend-notes.md`](docs/frontend-notes.md).
 
 | Area | What it shows |
 |---|---|
-| API status | `/health` + `/ready`, as in Stage 1 |
-| Demo session | Start / restart an anonymous session, its expiry, and how the token is stored |
-| Guided scenarios | Three one-click scenarios, with steps and the expected result |
-| Your mock receiver | The four modes as radio buttons (saved immediately, for your session only) |
-| Submit a synthetic event | A prefilled synthetic example, with validation and quota errors shown inline |
-| Your events | The 20 newest events, each with its delivery state, attempt *n* of 4, and next retry time |
-| Event details | Three separate lanes: **1. Accepted by the API** (202, idempotency key, *Submit duplicate*), **2. HTTP delivery** (every delivery and attempt, *Replay failed delivery*), **3. Receiver processing** (processed?, confirmation code, duplicates) |
+| Header | *Follow an Alert*, a **Demo** label, service availability (`/health` + `/ready`; *You are offline* only for the visitor's own connection), and a *Technical details* link |
+| Compose an alert (left) | Start / restart the anonymous session; alert title and message with a synthetic example (*Send alert*); how the test receiver responds (the four modes, in plain words, per session) |
+| Alert journey (right, navy) | Three steps for the selected alert: **1 · Sandbox** (accepted), **2 · Delivery** (*Waiting to send*, *Sending*, *Trying again*, *Delivery confirmed*, *Delivery stopped*, with every try), **3 · Receiver** (*Receiver processed alert*, with repeats recognized). Actions: *Send an exact copy* (same Idempotency-Key and payload) and *Deliver again* (manual replay, only after delivery stopped). A collapsible **technical view** shows IDs, status codes and the raw API JSON |
+| Recent alerts | The 20 newest alerts with their delivery state; selecting one shows its journey |
+| Try an experiment | Three cards; each sets the receiver mode and sends one alert |
+| Technical details | Service status with versions, session summary and delivery-time metric, how the token is stored, API docs links |
 
-**Guided scenarios** (each sets the receiver mode and submits one event):
-1. **Recover from a temporary failure** (`server_error`, then *Switch receiver to success* any time in the
-   ~14 s before the 4th attempt). Expected: the attempts before the switch failed (503, retryable), and the
-   first attempt after it is delivered; the receiver processed once.
-2. **Prevent duplicate processing after a timeout** (`process_then_timeout`). Expected: attempt 1 timeout with no
-   response while the receiver already shows "processed"; attempt 2 delivered; the receiver shows 1 duplicate
-   and the same confirmation code.
-3. **Replay after retry exhaustion** (`server_error` for about 15 s, then success and *Replay*). Expected: the
-   original delivery stays failed with 4 attempts; Replay 1 is delivered on attempt 1.
+Delivery confirmation (the receiver acknowledged with a 2xx) and receiver processing (the receipt) are shown as separate
+steps, because they can differ: in the late-reply experiment the receiver processed the alert before the sandbox
+saw any acknowledgement.
+
+**Experiments** (each sets the receiver mode and sends one alert):
+1. **Receiver has a short outage** (`server_error`, then *Turn receiver back on* any time in the ~14 s before the
+   4th try). Expected: the tries before the switch failed (503, retryable), and the first try after it is confirmed;
+   the receiver processed once.
+2. **Receiver replies too late** (`process_then_timeout`). Expected: try 1 *no reply in time* while the receiver
+   already shows *processed*; try 2 confirmed; the receiver recognized 1 repeat and kept one confirmation code.
+3. **Outage outlasts every try** (`server_error` for about 15 s, then *Turn receiver back on* and *Deliver again*).
+   Expected: the first delivery stays stopped with 4 failed tries; the new delivery is confirmed on try 1.
 
 **Refreshing.** While any delivery is pending, retrying or in progress, the page refreshes every 2 s
 (the event list, receiver counts, and the selected event's details). There's at most one refresh in flight,
@@ -267,7 +271,8 @@ risk:
 
 **Accessibility.** Real buttons, labelled form fields and a fieldset/legend for the modes. `aria-live`
 status regions, a visible focus outline, and a skip link. Keyboard focus is kept on the same control when the
-2-second refresh re-renders the list. The layout is a single column on phones and two columns from about 830 px.
+2-second refresh re-renders the list. Every state is given by words and an icon, never by colour alone. The layout is a
+single column on phones (composer first, journey steps stacked) and two columns from 60rem (960 px).
 
 ## Delivery worker
 

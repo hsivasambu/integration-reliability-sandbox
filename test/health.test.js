@@ -34,7 +34,7 @@ test('unknown route returns JSON 404', async () => {
 test('GET / serves the landing page', async () => {
   const res = await request(app).get('/');
   assert.equal(res.status, 200);
-  assert.match(res.text, /<title>Integration Reliability Sandbox<\/title>/);
+  assert.match(res.text, /<title>[^<]*Integration Reliability Sandbox<\/title>/);
 });
 
 test('responses do not advertise Express', async () => {
