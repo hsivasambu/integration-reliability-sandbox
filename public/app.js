@@ -55,6 +55,8 @@ const ICON_PATHS = {
   bell: ['M6 16v-5a6 6 0 1 1 12 0v5l1.5 2h-15z', 'M10 20.5a2 2 0 0 0 4 0'],
   wrench: ['M5 19l8-8', 'M12.5 6.5a4 4 0 0 1 5.5-1.5l-2.5 2.5 1 2 2 1 2.5-2.5a4 4 0 0 1-5.5 5.5'],
   list: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M4.5 6h.01', 'M4.5 12h.01', 'M4.5 18h.01'],
+  'arrow-right': ['M4 12h15', 'M14 7l5 5-5 5'],
+  'arrow-left': ['M20 12H5', 'M10 7l-5 5 5 5'],
 };
 function icon(name, extraClass = '') {
   const NS = 'http://www.w3.org/2000/svg';
@@ -111,7 +113,13 @@ const state = {
   events: [],
   hasMoreEvents: false,
   selectedId: storage.get(KEYS.selected),
-  detail: null,            // { eventId, deliveries, receipt }
+  detail: null,            // { eventId, deliveries, receipt, receiptState: 'ok' | 'unavailable' }
+  detailController: null,  // cancels the selected alert's in-flight requests when the selection changes
+  refreshController: null, // cancels an in-flight refresh when the session changes
+  showLocal: false,        // the journey shows the alert being submitted (not yet confirmed by the server)
+  // When data was last refreshed successfully, and whether the page is currently reconnecting.
+  connection: { status: 'live', lastUpdatedAt: null },
+  announced: null,         // the last journey state read out to screen readers
   detailNote: null,        // result of the last copy / replay action for the selected event
   techOpen: false,         // the journey's technical view stays open across refreshes
   receiver: null,
@@ -133,21 +141,27 @@ const state = {
 // --- API access ----------------------------------------------------------------
 
 class Unavailable extends Error {}
+class Aborted extends Error {} // the page cancelled the request because its answer is no longer wanted
 
 // Calls the API. Returns { status, data, headers } for any JSON answer (including 4xx/5xx).
-// Throws Unavailable when no usable answer arrived (network error, non-JSON reply, 90 s timeout).
-async function api(method, path, { body, headers = {}, auth = true } = {}) {
+// Throws Unavailable when no usable answer arrived (network error, non-JSON reply, 90 s timeout),
+// and Aborted when the caller's `signal` cancelled it (selection or session changed).
+async function api(method, path, { body, headers = {}, auth = true, signal } = {}) {
   const controller = new AbortController();
-  const hardTimeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const cancel = () => controller.abort();
+  signal?.addEventListener('abort', cancel);
+  const hardTimeout = setTimeout(cancel, REQUEST_TIMEOUT_MS);
   let slow = false;
   const slowTimer = setTimeout(() => { slow = true; state.slowRequests += 1; renderWakeBanner(); }, SLOW_NOTICE_MS);
+  const sentToken = auth ? state.token : null;
   try {
+    if (signal?.aborted) throw new Aborted();
     const response = await fetch(path, {
       method,
       cache: 'no-store',
       signal: controller.signal,
       headers: {
-        ...(auth && state.token ? { Authorization: `Bearer ${state.token}` } : {}),
+        ...(sentToken ? { Authorization: `Bearer ${sentToken}` } : {}),
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
         ...headers,
       },
@@ -156,14 +170,17 @@ async function api(method, path, { body, headers = {}, auth = true } = {}) {
     const isJson = (response.headers.get('content-type') || '').includes('application/json');
     if (!isJson) throw new Unavailable(`The server answered HTTP ${response.status} without API data; it may be starting up.`);
     const data = await response.json();
-    if (response.status === 401 && auth && state.token) sessionExpired();
+    // Only a 401 for the session that is still current ends it; a late answer for an older session doesn't.
+    if (response.status === 401 && sentToken && sentToken === state.token) sessionExpired();
     return { status: response.status, data, headers: response.headers };
   } catch (err) {
+    if (signal?.aborted || err instanceof Aborted) throw new Aborted();
     if (err instanceof Unavailable) throw err;
     throw new Unavailable(err.name === 'AbortError'
       ? 'The server did not answer within 90 seconds.'
       : 'Could not reach the server. Check your connection.');
   } finally {
+    signal?.removeEventListener('abort', cancel);
     clearTimeout(hardTimeout);
     clearTimeout(slowTimer);
     if (slow) { state.slowRequests -= 1; renderWakeBanner(); }
@@ -223,15 +240,23 @@ async function pollNow() {
 
   state.poll.running = true;
   try {
-    await refresh();
+    const completed = await refresh();
     state.poll.failures = 0;
     state.poll.lastError = null;
+    if (completed) state.connection = { status: 'live', lastUpdatedAt: Date.now() };
     // A successful refresh reached the API and its database.
     if (state.service.status !== 'ready') setService('ready');
   } catch (err) {
-    state.poll.failures += 1;
-    state.poll.lastError = err.message;
-    if (err instanceof Unavailable) setService(navigator.onLine === false ? 'offline' : 'unreachable', err.message);
+    if (err instanceof Aborted) {
+      state.poll.again = true; // superseded (selection or session changed): fetch the current view instead
+    } else {
+      state.poll.failures += 1;
+      state.poll.lastError = err.message;
+      if (err instanceof Unavailable) setService(navigator.onLine === false ? 'offline' : 'unreachable', err.message);
+      // Keep the last known state and mark it as stale. A polling failure is not a delivery failure.
+      state.connection = { ...state.connection, status: 'reconnecting' };
+      keepFocus($('detail'), renderDetail);
+    }
   } finally {
     state.poll.running = false;
   }
@@ -252,12 +277,20 @@ async function pollNow() {
   renderPollStatus('idle');
 }
 
+// Fetches a current snapshot. Returns true when it was applied, false when its answers were discarded
+// because the session changed meanwhile.
 async function refresh() {
-  if (!state.token) return;
+  if (!state.token) return false;
+  const token = state.token;
+  state.refreshController?.abort();
+  const controller = new AbortController();
+  state.refreshController = controller;
+  const { signal } = controller;
   const [events, receiver, summary] = await Promise.all([
-    api('GET', '/v1/events?limit=20'), api('GET', '/v1/receiver'), api('GET', '/v1/summary'),
+    api('GET', '/v1/events?limit=20', { signal }), api('GET', '/v1/receiver', { signal }), api('GET', '/v1/summary', { signal }),
   ]);
-  if (!state.token) return; // the session expired during the request
+  // Answers for a session that is no longer current must never reach the screen.
+  if (state.token !== token) return false;
   if (events.status !== 200 || receiver.status !== 200) {
     throw new Unavailable(`The API answered HTTP ${events.status !== 200 ? events.status : receiver.status}.`);
   }
@@ -277,22 +310,42 @@ async function refresh() {
       techLine('found by reading GET /v1/events', `Idempotency-Key ${pending.key}`));
   }
   if (state.selectedId) await loadDetail(state.selectedId);
+  if (state.token !== token) return false;
   render();
+  return true;
 }
 
+// Loads the selected alert's delivery history and receipt. Selecting another alert (or changing the
+// session) aborts these requests, and any answer that still arrives for an older selection is ignored.
 async function loadDetail(eventId) {
-  const [deliveries, receipt] = await Promise.all([
-    api('GET', `/v1/events/${eventId}/deliveries`),
-    api('GET', `/v1/receiver/receipts/${eventId}`),
-  ]);
-  if (state.selectedId !== eventId || !state.token) return; // a stale answer for an alert no longer shown
+  state.detailController?.abort();
+  const controller = new AbortController();
+  state.detailController = controller;
+  const token = state.token;
+  const isCurrent = () => state.detailController === controller && state.selectedId === eventId && state.token === token;
+  const { signal } = controller;
+
+  const deliveriesRequest = api('GET', `/v1/events/${eventId}/deliveries`, { signal });
+  // The receipt is the receiving system's record. If it can't be loaded, processing is shown as Unknown;
+  // the rest of the journey still updates.
+  const receiptRequest = api('GET', `/v1/receiver/receipts/${eventId}`, { signal })
+    .catch((err) => { if (err instanceof Aborted) throw err; return null; });
+  const [deliveries, receipt] = await Promise.all([deliveriesRequest, receiptRequest]);
+  if (!isCurrent()) return;
   if (deliveries.status === 404) { selectEvent(null); return; }
-  if (deliveries.status !== 200 || receipt.status !== 200) throw new Unavailable('Could not load the alert details.');
-  state.detail = { eventId, deliveries: deliveries.data.deliveries, receipt: receipt.data };
+  if (deliveries.status !== 200) throw new Unavailable('Could not load the alert details.');
+  const receiptOk = receipt?.status === 200;
+  state.detail = {
+    eventId,
+    deliveries: deliveries.data.deliveries,
+    receipt: receiptOk ? receipt.data : null,
+    receiptState: receiptOk ? 'ok' : 'unavailable',
+  };
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { stopPolling(); renderPollStatus('paused'); } else { pollNow(); }
+  if (document.hidden) { stopPolling(); renderPollStatus('paused'); } else { pollNow(); keepFocus($('detail'), renderDetail); }
+  syncCountdown();
 });
 window.addEventListener('pagehide', stopPolling);
 // "Offline" is only ever shown for the visitor's own connection, never for a receiver mode.
@@ -302,6 +355,12 @@ window.addEventListener('online', () => { checkStatus(); pollNow(); });
 // --- session -------------------------------------------------------------------
 
 function setToken(token) {
+  // Requests made for the previous session are cancelled; their answers would belong to another session.
+  if (token !== state.token) {
+    state.refreshController?.abort();
+    state.detailController?.abort();
+    state.connection = { status: 'live', lastUpdatedAt: null };
+  }
   state.token = token;
   storage.set(KEYS.token, token);
 }
@@ -373,10 +432,12 @@ async function restoreSession() {
 // --- actions ---------------------------------------------------------------------
 
 function selectEvent(eventId) {
+  if (eventId !== state.selectedId) state.detailController?.abort(); // the old alert's answers are no longer wanted
   state.selectedId = eventId;
   storage.set(KEYS.selected, eventId);
   state.detail = null;
   state.detailNote = null;
+  state.showLocal = false;
 }
 
 // --- composer --------------------------------------------------------------------
@@ -460,7 +521,8 @@ async function sendDraft() {
       }
     }
     setPending({ key: crypto.randomUUID(), body: draftBody(), status: 'sending' }); // saved before the request
-    renderComposer();
+    state.showLocal = true; // the journey shows the alert as 'Sending to the sandbox' until the server answers
+    render();
     return await sendPending(false);
   } finally {
     state.submitting = false;
@@ -475,7 +537,8 @@ async function checkAgain() {
   state.submitting = true;
   setPending({ ...state.pendingSubmit, status: 'sending' });
   state.submitNote = null;
-  renderComposer();
+  state.showLocal = true;
+  render();
   try {
     await sendPending(true);
   } finally {
@@ -486,6 +549,7 @@ async function checkAgain() {
 
 function stopChecking() {
   setPending(null);
+  state.showLocal = false;
   state.submitNote = h('div', { class: 'notice is-idle' }, h('strong', {}, 'Stopped checking. '),
     'If that alert was accepted, it will still appear in Recent alerts.');
   render();
@@ -507,6 +571,7 @@ async function sendPending(isCheck) {
 
   // Any other answer settles this key.
   if (state.pendingSubmit === pending) setPending(null);
+  state.showLocal = false; // 202/200 switch to the server's view below; errors return to the previous view
   const { status, data } = res;
   if (status === 202 || status === 200) {
     showAccepted(data, status, isCheck);
@@ -631,8 +696,8 @@ const SCENARIOS = [
     eventTitle: 'Experiment: short receiver outage',
     steps: [
       'Press Start. The test receiver is set to refuse alerts, and one alert is sent.',
-      'Watch the first try fail and a new try get scheduled (tries follow after 2, 4 and 8 seconds).',
-      'Press "Turn receiver back on" within about 14 seconds, before the fourth and last try.',
+      'Watch the first try fail. The delivery service shows Trying again, with a countdown to the next try.',
+      'Press "Turn receiver back on" before the last try is used (the journey shows how many tries are left).',
     ],
     expected: 'The next try is confirmed and the receiver processes the alert once. The earlier tries stay in the record as failed.',
     followUp: { label: 'Turn receiver back on', mode: 'success' },
@@ -646,24 +711,24 @@ const SCENARIOS = [
     eventTitle: 'Experiment: reply arrives too late',
     steps: [
       'Press Start. The test receiver is set to do the work but reply late, and one alert is sent.',
-      'After about 3 seconds the first try shows "No reply in time", while the receiver already shows the alert as processed.',
-      'After about 6 seconds the sandbox tries again. No action is needed.',
+      'The first try shows "No reply in time", while the processing record already shows the alert as processed.',
+      'When the countdown ends, the delivery service tries again. No action is needed.',
     ],
-    expected: 'Two tries: no reply in time, then confirmed. The receiver processed the alert once and recognized one repeat.',
+    expected: 'Two tries: no reply in time, then confirmed. The processing record shows the alert processed once, with one repeat recognized.',
   },
   {
     id: 'replay',
     icon: 'replay',
     title: 'Outage outlasts every try',
-    why: 'All four tries fail, so the sandbox stops. Then turn the receiver back on and deliver the alert again by hand.',
+    why: 'Every try fails, so the delivery service stops. Then turn the receiver back on and deliver the alert again by hand.',
     mode: 'server_error',
     eventTitle: 'Experiment: outage longer than every try',
     steps: [
       'Press Start. The test receiver is set to refuse alerts, and one alert is sent.',
-      'Wait about 15 seconds until the journey shows "Delivery stopped".',
+      'Wait until the delivery service shows Stopped (every try is used; this takes a little while).',
       'Press "Turn receiver back on", then "Deliver again" in the journey.',
     ],
-    expected: 'The first delivery stays stopped with 4 failed tries. A new delivery is confirmed on its first try. The receiver processed the alert once.',
+    expected: 'The first delivery stays stopped with every try failed. A new delivery is confirmed on its first try. The receiver processed the alert once.',
     followUp: { label: 'Turn receiver back on', mode: 'success' },
   },
 ];
@@ -709,78 +774,6 @@ function renderScenarios() {
       h('div', { class: 'button-row' }, start,
         s.followUp ? h('button', { type: 'button', class: 'btn btn-quiet', onclick: () => setReceiverMode(s.followUp.mode) }, s.followUp.label) : null));
   }));
-}
-
-// --- plain-language views of API state ------------------------------------------------
-
-// One delivery's state, from delivery.state / attemptCount / maxAttempts / nextAttemptAt / failureReason.
-function deliveryView(d) {
-  const n = d.attemptCount;
-  const max = d.maxAttempts;
-  switch (d.state) {
-    case 'pending':
-      return n === 0
-        ? { tone: 'is-waiting', icon: 'clock', label: 'Waiting to send', detail: 'Queued for the sandbox\'s delivery worker.' }
-        : { tone: 'is-waiting', icon: 'clock', label: 'Waiting to send again', detail: `Try ${n} ended without a known result (the delivery worker stopped). It will be sent again.` };
-    case 'in_progress':
-      return { tone: 'is-active', icon: 'send', label: 'Sending', detail: `Try ${n} of ${max} is on its way to the receiver.` };
-    case 'retry_scheduled': {
-      const wait = secondsUntil(d.nextAttemptAt);
-      return {
-        tone: 'is-waiting', icon: 'retry', label: 'Trying again',
-        detail: `Try ${n} of ${max} did not get through. Next try ${wait > 0 ? `in about ${wait} s` : 'is due now'} (at ${time(d.nextAttemptAt)}).`,
-      };
-    }
-    case 'delivered':
-      return { tone: 'is-done', icon: 'check', label: 'Delivery confirmed', detail: `The receiver acknowledged it on try ${n} of ${max}.` };
-    case 'failed':
-      return {
-        tone: 'is-failed', icon: 'stop', label: 'Delivery stopped',
-        detail: {
-          attempts_exhausted: `All ${max} tries failed, so the sandbox stopped trying.`,
-          non_retryable: 'The receiver refused it in a way that trying again cannot fix.',
-          session_expired: 'The demo session ended before it could be delivered.',
-        }[d.failureReason] ?? 'The sandbox stopped trying.',
-      };
-    default:
-      return { tone: 'is-unknown', icon: 'question', label: 'Unknown state', detail: `The API reported "${d.state}".` };
-  }
-}
-
-// One attempt, from outcome / errorCategory / retryable.
-function attemptView(a) {
-  const at = ` (${time(a.startedAt)})`;
-  if (a.outcome === 'in_progress') return { tone: 'is-active', icon: 'send', text: `Try ${a.attemptNumber}: sending…${at}` };
-  if (a.outcome === 'delivered') return { tone: 'is-done', icon: 'check', text: `Try ${a.attemptNumber}: receiver confirmed${at}` };
-  if (a.outcome === 'lease_expired') return { tone: 'is-unknown', icon: 'question', text: `Try ${a.attemptNumber}: result unknown, the delivery worker restarted${at}` };
-  const why = {
-    http_error: a.retryable === false ? 'receiver refused it' : 'receiver reported a problem',
-    timeout: 'no reply in time',
-    network_error: 'could not reach the receiver',
-  }[a.errorCategory] ?? 'did not get through';
-  return { tone: a.errorCategory === 'timeout' ? 'is-waiting' : 'is-failed', icon: a.errorCategory === 'timeout' ? 'hourglass' : 'cross', text: `Try ${a.attemptNumber}: ${why}${at}` };
-}
-
-// The receiver's side, from the receipt (processed / result / deliveriesReceived / duplicateCount).
-function receiverView(receipt, latest) {
-  if (!receipt) return { tone: 'is-unknown', icon: 'question', label: 'Checking…', detail: 'Loading what the receiver recorded.' };
-  if (receipt.processed) {
-    const repeats = receipt.duplicateCount;
-    return {
-      tone: 'is-done', icon: 'inbox', label: 'Receiver processed alert',
-      detail: `Confirmation ${receipt.result?.confirmationCode ?? '(none)'}. `
-        + (repeats > 0
-          ? `It received the alert ${receipt.deliveriesReceived} times, recognized ${repeats} as ${repeats === 1 ? 'a repeat' : 'repeats'}, and processed it only once.`
-          : 'Processed once.'),
-    };
-  }
-  if (latest && ACTIVE_STATES.has(latest.state)) {
-    return { tone: 'is-idle', icon: 'dash', label: 'Not processed yet', detail: 'Nothing has been processed while delivery is still under way.' };
-  }
-  if (latest?.state === 'failed') {
-    return { tone: 'is-idle', icon: 'dash', label: 'Not processed', detail: 'The receiver did not act on this alert.' };
-  }
-  return { tone: 'is-unknown', icon: 'question', label: 'No processing recorded', detail: 'The delivery was confirmed, but the receiver has no record of processing it.' };
 }
 
 const MODE_INFO = {
@@ -973,7 +966,7 @@ function renderEvents() {
     return;
   }
   const items = state.events.map((event) => {
-    const view = deliveryView(event.delivery);
+    const view = JourneyModel.deliveryStatus(event.delivery, Date.now());
     const replays = event.delivery.replayCount;
     const button = h('button', {
       type: 'button', class: `history-item ${view.tone}`, 'aria-current': event.id === state.selectedId ? 'true' : 'false',
@@ -1007,20 +1000,104 @@ function renderPollStatus(mode, delay) {
   if (mode === 'backoff') el.append(' ', h('button', { type: 'button', class: 'btn-link', onclick: () => pollNow() }, 'Retry now'));
 }
 
-function stage(name, question, view, ...body) {
-  return h('li', { class: `stage ${view.tone}` },
-    h('div', { class: 'stage-icon' }, icon(view.icon)),
-    h('p', { class: 'stage-name' }, name),
-    h('p', { class: 'stage-question' }, question),
-    h('p', { class: 'stage-status' }, view.label),
-    h('div', { class: 'stage-body' }, view.detail ? h('p', {}, view.detail) : null, ...body));
+// --- journey (Stage 14) ------------------------------------------------------------
+// The view model comes from public/journey-model.js (window.JourneyModel); this part only draws it.
+
+const fullTime = (iso) => (iso ? new Date(iso).toLocaleTimeString() : '');
+
+// One component of the system: Your alert, Delivery service, Receiving system.
+function journeyNode(kind, name, iconName, badge, ...extra) {
+  return h('div', { class: `jd-node jd-${kind}` },
+    h('div', { class: 'jd-head' }, h('span', { class: 'jd-icon' }, icon(iconName)), h('p', { class: 'jd-name' }, name)),
+    badge ? h('p', { class: `jd-badge ${badge.tone}` }, icon(badge.icon ?? 'dash'), badge.label) : null,
+    ...extra);
 }
 
-const STAGES = [
-  ['1 · Sandbox', 'Did the sandbox accept the alert?'],
-  ['2 · Delivery', 'Did the receiver confirm it got the alert?'],
-  ['3 · Receiver', 'Did the receiver act on it?'],
-];
+// A labelled path between components. Arrows show direction; the words say what travels on it.
+function journeyPath(kind, name, direction, view) {
+  return h('div', { class: `jd-path jd-${kind} ${view.tone}${view.active ? ' is-current' : ''}` },
+    h('span', { class: 'jd-path-name' }, name),
+    h('span', { class: 'jd-line' }, icon(direction === 'back' ? 'arrow-left' : 'arrow-right', 'jd-arrow')),
+    h('span', { class: 'jd-path-state' }, view.label));
+}
+
+function triesText(d) {
+  if (d.max === undefined) return null;
+  switch (d.code) {
+    case 'saved': return `No tries yet (up to ${d.max})`;
+    case 'sending': return `Try ${d.currentTry} of ${d.max}`;
+    case 'confirmed': return `Confirmed on try ${d.triesSoFar} of ${d.max}`;
+    default: return `${d.triesSoFar} of ${d.max} tries used`;
+  }
+}
+
+function nextTryText(d) {
+  if (d.code === 'retrying') {
+    return h('span', {}, 'Next try ', h('span', { 'data-countdown-to': d.nextAttemptAt }, `in about ${d.countdownSeconds} s`),
+      ` (at ${fullTime(d.nextAttemptAt)})`);
+  }
+  if (d.code === 'waiting' && d.nextAttemptAt) return `Next try was due at ${fullTime(d.nextAttemptAt)}; waiting for it to start`;
+  return null;
+}
+
+function journeyDiagram(v) {
+  const d = v.delivery;
+  const p = v.processing;
+  return h('div', { class: 'jd', role: 'group', 'aria-label': 'Alert journey diagram' },
+    journeyNode('alert', 'Your alert', 'bell', v.alert,
+      h('p', { class: 'jd-detail' }, v.title),
+      v.acceptedAt ? h('p', { class: 'jd-meta' }, `Accepted ${fullTime(v.acceptedAt)}`) : h('p', { class: 'jd-meta' }, v.alert.detail)),
+    h('div', { class: `jd-link jd-handover ${v.handover.tone}` },
+      h('span', { class: 'jd-line' }, icon('arrow-right', 'jd-arrow')), h('span', { class: 'jd-path-state' }, v.handover.label)),
+    journeyNode('delivery', 'Delivery service', 'send', d,
+      triesText(d) ? h('p', { class: 'jd-meta' }, triesText(d)) : null,
+      nextTryText(d) ? h('p', { class: 'jd-meta jd-next' }, nextTryText(d)) : null),
+    h('div', { class: 'jd-link jd-paths' },
+      journeyPath('forward', 'Delivery try', 'forward', v.forward),
+      journeyPath('ack', 'Acknowledgement', 'back', v.ack)),
+    journeyNode('receiver', 'Receiving system', 'inbox', null,
+      h('div', { class: `jd-card ${p.tone}` },
+        h('p', { class: 'jd-card-title' }, 'Processing record'),
+        h('p', { class: `jd-badge ${p.tone}` }, icon(p.icon), p.label),
+        p.confirmationCode ? h('p', { class: 'jd-meta' }, `Confirmation ${p.confirmationCode}`) : null)));
+}
+
+function journeyNow(v) {
+  const d = v.delivery;
+  const facts = [
+    ['Delivery', d.label],
+    ['Tries', triesText(d) ?? '—'],
+    ['Next try', d.code === 'retrying' ? `at ${fullTime(d.nextAttemptAt)}` : d.code === 'waiting' && d.nextAttemptAt ? `was due at ${fullTime(d.nextAttemptAt)}` : '—'],
+    ['Processing', v.processing.label],
+  ];
+  return h('div', { class: 'jd-now' },
+    h('p', { class: 'jd-explain' }, v.explanation),
+    h('dl', { class: 'jd-facts' }, facts.flatMap(([k, val]) => [h('dt', {}, k), h('dd', {}, val)])),
+    v.processing.code === 'unknown' || v.processing.code === 'processed'
+      ? h('p', { class: 'hint' }, v.processing.detail) : null);
+}
+
+// Every delivery (original and replays) with its tries, keyed by delivery and attempt IDs.
+function journeyHistory(v) {
+  if (!v.server) return null;
+  if (!v.deliveries.length) return h('p', { class: 'hint' }, 'Loading what happened so far…');
+  return h('div', { class: 'jd-history' },
+    h('h4', {}, 'What happened so far'),
+    ...v.deliveries.map((group) => h('div', { class: 'delivery-group', 'data-delivery-id': group.id },
+      h('p', { class: 'delivery-group-name' }, group.label, ': ', h('strong', {}, group.status.label)),
+      group.attempts.length
+        ? h('ul', { class: 'tries' }, group.attempts.map((a) => h('li', { class: a.tone, 'data-attempt-key': a.key },
+          icon(a.icon), h('span', {}, `Try ${a.number}: ${a.text} (${fullTime(a.startedAt)})`))))
+        : h('p', { class: 'hint' }, 'No tries yet.'))));
+}
+
+function staleBanner(v) {
+  if (!v.stale) return null;
+  return h('p', { class: 'jd-stale', role: 'status' }, icon('offline'),
+    v.stale.since
+      ? `Showing the last known state from ${fullTime(v.stale.since)}. Reconnecting…`
+      : 'Reconnecting… Nothing could be loaded yet.');
+}
 
 // Technical lines kept from the earlier UI, shown only in the technical view.
 function attemptLine(a) {
@@ -1040,80 +1117,125 @@ function technicalView(event, detail) {
       h('li', {}, 'Idempotency-Key: ', h('code', {}, event.idempotencyKey)),
       h('li', {}, 'Accepted with HTTP 202 at ', h('code', {}, event.createdAt)),
       h('li', {}, 'Status URL: ', h('code', {}, event.delivery.statusUrl)),
-      ...(detail?.deliveries ?? []).map((d, i) => h('li', {},
-        `${i === 0 ? 'Original delivery' : `Replay ${i}`} `, h('code', {}, d.id), `: state ${d.state}`,
+      ...(detail?.deliveries ?? []).map((d) => h('li', {},
+        d.replayOf ? 'Replay delivery ' : 'Original delivery ', h('code', {}, d.id), `: state ${d.state}`,
         d.failureReason ? `, failureReason ${d.failureReason}` : '',
         h('ul', {}, d.attempts.map((a) => h('li', {}, attemptLine(a)))))),
-      detail ? h('li', {}, `Receiver receipt: processed ${detail.receipt.processed}, deliveriesReceived ${detail.receipt.deliveriesReceived}, duplicateCount ${detail.receipt.duplicateCount}`) : null),
+      detail
+        ? h('li', {}, detail.receiptState === 'ok'
+          ? `Receiver receipt: processed ${detail.receipt.processed}, deliveriesReceived ${detail.receipt.deliveriesReceived}, duplicateCount ${detail.receipt.duplicateCount}`
+          : 'Receiver receipt: could not be loaded (shown as Unknown)')
+        : null),
     h('pre', {}, JSON.stringify({ event, deliveries: detail?.deliveries ?? null, receipt: detail?.receipt ?? null }, null, 2)));
   details.addEventListener('toggle', () => { state.techOpen = details.open; });
   return details;
 }
 
+// The view model for whatever the journey should show now, or null for the empty state.
+function currentJourneyView() {
+  const stale = state.connection.status === 'reconnecting'
+    ? { since: state.connection.lastUpdatedAt ? new Date(state.connection.lastUpdatedAt).toISOString() : null }
+    : null;
+  const pending = state.pendingSubmit;
+  if (state.showLocal && pending) {
+    return JourneyModel.toJourneyView({
+      local: { status: pending.status === 'uncertain' ? 'uncertain' : 'sending', title: pending.body.payload.title },
+      now: Date.now(),
+      stale: null, // the local state is the browser's own; staleness applies to server data
+    });
+  }
+  const event = state.token ? state.events.find((e) => e.id === state.selectedId) : null;
+  if (!event) return null;
+  const detail = state.detail?.eventId === event.id ? state.detail : null;
+  return JourneyModel.toJourneyView({
+    event,
+    deliveries: detail?.deliveries ?? null,
+    receipt: detail?.receipt ?? null,
+    receiptState: detail ? detail.receiptState : 'loading',
+    now: Date.now(),
+    stale,
+  });
+}
+
+const EMPTY_STEPS = [
+  ['Your alert', 'bell', 'What you send.'],
+  ['Delivery service', 'send', 'Saves your alert, sends it, and tries again if needed.'],
+  ['Receiving system', 'inbox', 'A test system inside this sandbox that confirms and processes alerts.'],
+];
+
 function renderDetail() {
   const container = $('detail');
-  const event = state.events.find((e) => e.id === state.selectedId);
-  if (!state.token || !event) {
-    const idle = { tone: 'is-idle', icon: 'dash', label: 'Not started', detail: null };
+  const v = currentJourneyView();
+  if (!v) {
     container.replaceChildren(h('div', { class: 'journey-empty' },
       h('p', {}, !state.token
-        ? 'Start a demo session and send an alert. Its journey will appear here, step by step.'
+        ? 'Send an alert to see its journey here, step by step.'
         : state.events.length ? 'Choose an alert from Recent alerts to see its journey.' : 'Send an alert to see its journey here.'),
-      h('p', { class: 'journey-sub' }, 'Every journey has three steps:'),
-      h('ol', { class: 'stages' }, STAGES.map(([name, question]) => stage(name, question, idle)))));
+      h('ul', { class: 'jd-legend' }, EMPTY_STEPS.map(([name, iconName, text]) =>
+        h('li', {}, icon(iconName), h('span', {}, h('strong', {}, name), ` · ${text}`))))));
+    announce(null);
+    syncCountdown();
     return;
   }
 
-  const detail = state.detail?.eventId === event.id ? state.detail : null;
-  const deliveries = detail?.deliveries ?? null;
-  const latest = deliveries?.at(-1) ?? event.delivery;
-
-  const accepted = { tone: 'is-done', icon: 'box', label: 'Accepted', detail: 'Saved and queued. Accepted means it will be delivered, not that it has been.' };
-
-  let deliveryBody;
-  if (!deliveries) {
-    deliveryBody = [h('p', { class: 'stage-question' }, 'Loading the delivery record…')];
-  } else {
-    deliveryBody = deliveries.map((d, index) => h('div', { class: 'delivery-group' },
-      deliveries.length > 1 ? h('h4', {}, index === 0 ? 'First delivery' : `Delivered again (${index})`, ': ', deliveryView(d).label) : null,
-      d.attempts.length
-        ? h('ul', { class: 'tries' }, d.attempts.map((a) => {
-          const v = attemptView(a);
-          return h('li', { class: v.tone }, icon(v.icon), h('span', {}, v.text));
-        }))
-        : h('p', {}, 'No tries yet.')));
-  }
-
-  // After a manual replay, the stage summary describes the newest delivery; say so.
-  const latestView = deliveryView(latest);
-  if (deliveries && deliveries.length > 1) latestView.detail = `Delivered again: ${latestView.detail.charAt(0).toLowerCase()}${latestView.detail.slice(1)}`;
-
-  const timedOutButProcessed = detail?.receipt.processed
-    && deliveries.some((d) => d.attempts.some((a) => a.errorCategory === 'timeout'));
-
-  const actions = h('div', { class: 'journey-actions' },
-    h('button', { type: 'button', class: 'btn', 'data-focus-key': 'duplicate', onclick: () => submitDuplicate(event) },
-      'Send an exact copy'),
-    latest.state === 'failed' && deliveries
-      ? h('button', { type: 'button', class: 'btn btn-primary', 'data-focus-key': 'replay', onclick: () => replayDelivery(latest.id) },
-        icon('replay'), 'Deliver again')
-      : null);
+  const event = v.server ? state.events.find((e) => e.id === v.eventId) : null;
+  const detail = event && state.detail?.eventId === event.id ? state.detail : null;
+  const canReplay = v.server && v.delivery.code === 'stopped' && detail;
+  const actions = v.server
+    ? h('div', { class: 'journey-actions' },
+      h('button', { type: 'button', class: 'btn', 'data-focus-key': 'duplicate', onclick: () => submitDuplicate(event) },
+        'Send an exact copy'),
+      canReplay
+        ? h('button', { type: 'button', class: 'btn btn-primary', 'data-focus-key': 'replay', onclick: () => replayDelivery(v.deliveryId) },
+          icon('replay'), 'Deliver again')
+        : null)
+    : null;
 
   // replaceChildren() would print null as text, so empty parts are filtered out.
   container.replaceChildren(...[
-    h('h3', { class: 'journey-title' }, event.payload.title),
-    h('p', { class: 'journey-sub' }, `Sent ${time(event.createdAt)}`),
-    h('ol', { class: 'stages' },
-      stage(...STAGES[0], accepted),
-      stage(...STAGES[1], latestView, ...deliveryBody),
-      stage(...STAGES[2], receiverView(detail?.receipt, latest))),
-    timedOutButProcessed
-      ? h('p', { class: 'journey-explain' }, 'The receiver processed this alert even though a try ran out of time. The sandbox could not know that, so it tried again; the receiver recognized the repeat and did not process it twice.')
-      : null,
+    staleBanner(v),
+    h('h3', { class: 'journey-title' }, v.title),
+    h('p', { class: 'journey-sub' }, v.server
+      ? (v.stale ? 'Last known state' : `Updated ${fullTime(new Date(state.connection.lastUpdatedAt ?? Date.now()).toISOString())}`)
+      : 'Not confirmed by the sandbox yet'),
+    journeyDiagram(v),
+    journeyNow(v),
+    journeyHistory(v),
     actions,
-    h('p', { class: 'journey-sub' }, '"Send an exact copy" repeats the original request, to show that it cannot create a second alert.'),
-    state.detailNote,
-    technicalView(event, detail)].filter(Boolean));
+    v.server ? h('p', { class: 'journey-sub' }, '"Send an exact copy" repeats the original request, to show that it cannot create a second alert.') : null,
+    v.server ? state.detailNote : null,
+    event ? technicalView(event, detail) : null].filter(Boolean));
+  announce(v);
+  syncCountdown();
+}
+
+// Screen readers hear a short sentence only when the delivery or processing state actually changes,
+// not on every refresh.
+function announce(v) {
+  const text = v ? `${v.title}: delivery ${v.delivery.label}. Processing ${v.processing.label}.` : null;
+  if (text === state.announced) return;
+  const first = state.announced === null;
+  state.announced = text;
+  if (text && !first) $('journey-announce').textContent = text;
+}
+
+// Updates "in about N s" once a second while a retry is scheduled. When it reaches zero, the journey is
+// redrawn from the last data, which then says "waiting for the next attempt" until the API reports a try.
+let countdownTimer = null;
+function syncCountdown() {
+  const needed = !document.hidden && document.querySelector('[data-countdown-to]');
+  if (needed && !countdownTimer) countdownTimer = setInterval(tickCountdown, 1000);
+  if (!needed && countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+}
+function tickCountdown() {
+  let reachedZero = false;
+  for (const el of document.querySelectorAll('[data-countdown-to]')) {
+    const seconds = Math.ceil((Date.parse(el.dataset.countdownTo) - Date.now()) / 1000);
+    if (seconds <= 0) reachedZero = true;
+    else el.textContent = `in about ${seconds} s`;
+  }
+  if (reachedZero) keepFocus($('detail'), renderDetail);
+  else syncCountdown();
 }
 
 function renderSummary() {
@@ -1180,6 +1302,7 @@ $('event-form').addEventListener('submit', async (e) => {
 });
 
 restoreDraft();
+state.showLocal = Boolean(state.pendingSubmit); // an unconfirmed alert from before the reload
 renderScenarios();
 renderService();
 render();

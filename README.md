@@ -2,7 +2,7 @@
 
 A learning sandbox that accepts synthetic JSON events (shown in the browser as practice *alerts*), persists them, and delivers them
 reliably to a controlled mock receiver.
-**Current stage: 13. Visitor-facing frontend: alert composer connected to the event API.**
+**Current stage: 14. Visitor-facing frontend: live journey visualization.**
 
 | Want to… | Go to |
 |---|---|
@@ -231,7 +231,7 @@ JavaScript, HTML, CSS and inline SVG; no framework or build step. Design notes a
 |---|---|
 | Header | *Follow an Alert*, a **Demo** label, service availability (`/health` + `/ready`; *You are offline* only for the visitor's own connection), and a *Technical details* link |
 | Compose an alert (left) | Three **sample alerts** (Service request, Equipment notification, Team update) that fill an editable title and message with live character counts, a message-card preview, *View request JSON*, and one **Send alert** button (it starts the anonymous session when needed). If the answer is lost: *We could not confirm whether your alert was accepted* with **Check again** (same Idempotency-Key and payload). Also shows the current test receiver as one line |
-| Alert journey (right, navy) | Three steps for the selected alert: **1 · Sandbox** (accepted), **2 · Delivery** (*Waiting to send*, *Sending*, *Trying again*, *Delivery confirmed*, *Delivery stopped*, with every try), **3 · Receiver** (*Receiver processed alert*, with repeats recognized). Actions: *Send an exact copy* (same Idempotency-Key and payload) and *Deliver again* (manual replay, only after delivery stopped). A collapsible **technical view** shows IDs, status codes and the raw API JSON |
+| Alert journey (right, navy) | A diagram of the three real components: **Your alert → Delivery service ⇄ Receiving system**. The delivery service carries the state badge (*Saved, Waiting, Sending, Trying again, Stopped, Confirmed*), with tries used, the next try time and a countdown. Separate *Delivery try* and *Acknowledgement* paths, plus a *Processing record* card driven by the receiver's receipt (*Unknown* if it can't be loaded). Below: a plain explanation, every delivery and try (replays kept separate), *Send an exact copy*, *Deliver again* (only after it stopped), and a technical view with IDs, status codes and raw JSON. On a connection problem the last known state stays, marked with its time and *Reconnecting…* |
 | Recent alerts | The 20 newest alerts with their delivery state; selecting one shows its journey |
 | Try an experiment | Three cards; each sets the receiver mode and sends one alert. Below them, *Set the test receiver yourself* holds the four modes (per session) |
 | Technical details | Service status with versions, session summary and delivery-time metric, how the token is stored, API docs links |

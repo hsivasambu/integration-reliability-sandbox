@@ -79,7 +79,8 @@
       <div class="journey-column">
         <section id="journey" class="journey" aria-labelledby="journey-heading">
           <h2 id="journey-heading" class="journey-heading">Alert journey</h2>
-          <div id="detail" aria-live="polite"></div>
+          <div id="detail"></div>
+          <p id="journey-announce" class="visually-hidden" aria-live="polite"></p>
         </section>
 
         <section class="card history" aria-labelledby="history-heading">
@@ -145,6 +146,7 @@
        systems. Free hosting: the service sleeps after 15 minutes without visitors and takes about a minute to wake up.
        Waiting deliveries are kept in the database until then.</p>
   </footer>
+  <script src="/journey-model.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

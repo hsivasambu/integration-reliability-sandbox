@@ -924,4 +924,103 @@ All of these are recorded in `docs/frontend-notes.md` → *Known gaps*.
   experiments and *Deliver again* through the new send path.
 - These checks created about 8 sessions and 20 synthetic alerts.
 
+## Stage 14: Live journey visualization with minimal motion (2026-10-05)
+
+**Before starting.** Clean tree at `2fb3ff9`. Client-side problems found in the existing code:
+- `refresh()` checked only that *a* token existed after its requests returned, so a refresh in flight during a
+  session switch could write the old session's alerts into the new session.
+- Any 401 ended the current session, even when it answered a request made with an older token.
+- Obsolete requests were never cancelled.
+- A failed receipt request failed the whole detail view.
+- Poll failures kept old data with no stale marker.
+- The experiment text stated backend timing ("2, 4 and 8 seconds", "about 14 seconds", "four tries") that the API
+  doesn't expose.
+
+**Decisions** (full mapping in `docs/frontend-notes.md` → *Journey*)
+- **Diagram of the three real components:** *Your alert → Delivery service ⇄ Receiving system*, in HTML plus inline
+  SVG icons. No queue or database node is drawn. The delivery service carries the badge (*Saved, Waiting, Sending,
+  Trying again, Stopped*, plus *Confirmed* for a delivered alert, which the brief's list didn't name).
+  - Separate *Delivery try* and *Acknowledgement* paths.
+  - A *Processing record* card driven only by the receipt.
+  - Receipt loading is *Checking…*; a receipt that can't be loaded is *Unknown*, explicitly "not proof that nothing
+    was processed".
+- **Presentation adapter `public/journey-model.js`:** a pure function from API responses (plus the browser-only
+  submitting state) to a view model. It's loaded as a second same-origin script and unit-tested in Node.
+  - Stable keys: `event:<id>`, delivery IDs, and attempt keys `<deliveryId>:<attemptNumber>`.
+  - Replays are separate deliveries.
+- **Local vs server state:** while the POST is unanswered, the journey shows *Sending to the sandbox / Not saved
+  yet*; when the outcome is uncertain, *Unconfirmed / Unknown*; after 202, the server's state.
+- **Timing:** only `nextAttemptAt`, `attemptCount` and `maxAttempts` (from the API). The countdown updates once a
+  second; at zero it says *Waiting for the next attempt* until the API reports a try. The experiment text no longer
+  quotes seconds or a fixed number of tries.
+- **Stale answers:**
+  - `AbortController` per refresh and per selected alert.
+  - Answers are discarded unless they are still for the current session and selection.
+  - A 401 only ends the session it was sent with.
+  - The renderer also only uses detail data for the selected alert.
+- **Interruption:** the last known state stays, with "Showing the last known state from HH:MM:SS. Reconnecting…".
+  Polling failures never change a delivery's state.
+- **Accessibility:** the journey region is no longer `aria-live` (it's redrawn on every refresh). A hidden live
+  region announces one sentence only when the delivery or processing state changes.
+- No backend or API change. No new dependency. No animation beyond the countdown text.
+
+**Verification (local, Node 22.18.0, Postgres 18.6, worker on; headless Edge with real API data; faults injected
+with DevTools `Fetch`)**
+- `npm test`: **145/145** (14 new adapter tests), `skipped 0`.
+- The adapter tests use fixtures shaped like the OpenAPI schemas. They cover:
+  - local sending and uncertain states
+  - just accepted, and the list summary only (no invented history; *Checking…*)
+  - sending; retry in the future (countdown 3 s, next try 2)
+  - a countdown that has passed (*Waiting*, no fabricated send)
+  - a lost lease
+  - delivered + receipt; delivered with the receipt unavailable (*Unknown*)
+  - reply too late, both mid-retry and finished
+  - exhaustion
+  - a replay, with separate keyed deliveries and unique attempt keys
+  - a stale marker that doesn't change the state
+  - an unknown state
+- **Stage 14 browser suite: 41/41.**
+  - The local *Sending to the sandbox* state while the POST is held, then *Accepted*.
+  - Exactly 3 components.
+  - *Confirmed* with acknowledgement *Delivery confirmed*, "1 try sent", and *Processed*.
+  - *Trying again* with "1 of 4 tries used", "Next try in about N s (at …)", *Error reply*, and an explanation.
+  - **Offline during a retry:** the stale banner appeared; the countdown reached zero and the view said *Waiting*,
+    never *Stopped*. Back online, the banner cleared and the alert was *Confirmed*.
+  - **Receipt requests failed:** *Unknown* plus "not proof…", with the delivery still *Confirmed*.
+  - **Selection change:** alert A's history answer was held while B was selected. The page cancelled A's request
+    (`net::ERR_ABORTED`), and releasing it late left B on screen.
+  - **Reload:** a MutationObserver recorded every delivery badge drawn from page load. Only *Confirmed* was ever
+    drawn (no replayed transitions).
+  - **Session switch:** 3 old-session answers were held, *Start fresh session* was pressed, and the answers were
+    released. No old alert appeared, **not even briefly**, and the new session was kept.
+  - **Exhaustion and replay:** *Stopped* with *No processing recorded*, then "This is a new delivery, started by
+    hand", *Confirmed*, two deliveries with distinct IDs and unique attempt keys, and the original still *Stopped*.
+  - No horizontal scroll at 1440 or 390 px; stacked on phones; axe-core 0 violations on desktop and mobile; no
+    script errors.
+- **Mutation checks:**
+  - With the session guards removed (token comparison and abort on switch), the session-switch check **failed**:
+    old-session alerts flashed into the new session. A first version of that check looked only at the end state
+    and missed it, so it now watches for any appearance.
+  - With the selection guards removed, the "request cancelled" check failed. The "not overwritten" check still
+    passed, because the renderer's own `eventId` check is a second line of defence.
+- **Regression suites (updated to the new labels):** Stage 13 56/56 (quota step not run); Stage 12 35/36 (the same
+  expected browser network log).
+- **Fixed after screenshot review:**
+  - The diagram was stacked even on desktop: the panel's content box (~45.5rem) was just under the first 46rem
+    breakpoint. Now 40rem.
+  - "Acknowledgement" was clipped in its column, and "Not processed yet" wrapped to three lines (sentence-case path
+    names, flatter processing card).
+  - The countdown was shown twice (the facts list now shows only the clock time).
+  - Low contrast for small technical text inside light notices on the navy panel (found by axe).
+- Test-side issues found and fixed along the way:
+  - "Unknown" was checked before the receipt failure was known (that led to the *Checking…* label).
+  - A history click raced a list re-render.
+  - Uppercase text from CSS `text-transform` appears in `innerText`.
+
+**Not verified**
+- Real screen readers (the announcement wording is untested with assistive technology).
+- Browsers other than Chromium-based Edge; real phones.
+- Very long outages: polling backs off to 30 s as before, so the countdown can sit at *Waiting* for that long
+  after reconnecting.
+
 

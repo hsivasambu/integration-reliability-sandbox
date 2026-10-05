@@ -22,8 +22,7 @@ same strict CSP (`script-src 'self'`, `style-src 'self'`, no inline code).
 1. Header: *Follow an Alert*, **Demo** label, service pill, *Technical details* link (to `#technical`).
 2. One-line introduction.
 3. Workspace: composer (left) and the navy alert journey (right) with *Recent alerts* under it. Two columns
-   from 60rem. On phones the composer comes first, and the three journey steps stack vertically (a CSS
-   container query switches them to a row when the journey panel is at least 46rem wide).
+   from 60rem. On phones the composer comes first, and the journey diagram stacks vertically (see *Journey*).
 4. Three experiment cards.
 5. Technical details: service check with versions, session summary, token storage note, API docs links.
 
@@ -93,43 +92,113 @@ No web fonts and no background texture. The plain paper colour reads better than
 There is no dark theme (the earlier UI followed the system setting); the specified palette is light, with a
 navy journey canvas.
 
-## Which API fields drive which words
+## Journey (Stage 14)
 
-| UI label | API source |
+The journey shows **three logical components that actually exist**, joined by labelled paths:
+
+```
+Your alert ──handed over──▶ Delivery service ──delivery try──▶ Receiving system
+                                             ◀──acknowledgement──   └ Processing record (from the receipt)
+```
+
+- **Delivery service** is the sandbox's API plus its background worker, drawn as one component. **Receiving
+  system** is the mock receiver inside the same app. There's no queue service or extra network hop to draw: the
+  job store is the same PostgreSQL database, and the diagram doesn't pretend otherwise.
+- **The forward path** ("Delivery try") and **the acknowledgement path** are separate. A 2xx reply confirms
+  *delivery*.
+- **The processing record** is a separate card, driven only by the receiver's receipt
+  (`GET /v1/receiver/receipts/{id}`), so it confirms the synthetic *processing* result. If the receipt can't be
+  loaded, processing is **Unknown**. That is never treated as proof that nothing was processed.
+- **Below the diagram:** a plain-language explanation, then *Delivery / Tries / Next try / Processing*, then
+  *What happened so far*. That list shows every delivery, original and replays, each with its tries.
+- **Layout:** stacked on phones; one row when the journey panel is at least 40rem wide (a container query).
+- **No animation in this stage.** Arrows and words show direction, and badges show state. The only thing that
+  changes once a second is the countdown text "in about N s".
+
+### Journey adapter (`public/journey-model.js`)
+
+A pure function, `JourneyModel.toJourneyView(input)`. It has no DOM access, no network and no clock of its
+own, and it's unit-tested in `test/journey-model.test.js` with fixtures shaped like the API's responses. The page
+draws only what it returns.
+
+**Input**
+
+| Field | Source |
 |---|---|
-| Waiting to send | `delivery.state = pending`, `attemptCount = 0` |
-| Waiting to send again | `pending`, `attemptCount > 0` (a worker lost its lease) |
-| Sending | `in_progress` (try *n* of `maxAttempts`) |
-| Trying again (next try in about *N* s) | `retry_scheduled`, `nextAttemptAt` |
-| Delivery confirmed | `delivered`: the receiver acknowledged with 2xx |
-| Delivery stopped | `failed`; the reason comes from `failureReason` (`attempts_exhausted`, `non_retryable`, `session_expired`) |
-| Try *n*: receiver reported a problem / no reply in time / could not reach the receiver / result unknown | attempt `outcome`, `errorCategory`, `retryable` |
-| Receiver processed alert (confirmation, repeats recognized) | receipt `processed`, `result.confirmationCode`, `deliveriesReceived`, `duplicateCount` |
-| Not processed yet / Not processed / No processing recorded | receipt `processed = false` combined with the latest delivery state |
-| Service ready / Service not ready / Can't reach service | `/health` + `/ready`; a successful refresh also counts as reachable |
-| You are offline | Only when the browser reports no connection (`navigator.onLine === false`). Never used for a receiver mode |
+| `local` | Browser only: `{ status: 'sending' \| 'uncertain', title }` while a submission has no server answer (Stage 13's unconfirmed state) |
+| `event` | `GET /v1/events` → `data[]`, or the POST response's `event`: `id`, `payload.title`, `createdAt`, `delivery` (summary) |
+| `deliveries` | `GET /v1/events/{id}/deliveries` → `deliveries[]` (oldest first): `id`, `replayOf`, `state`, `attemptCount`, `maxAttempts`, `nextAttemptAt`, `failureReason`, `attempts[]` (`attemptNumber`, `outcome`, `errorCategory`, `responseStatus`, `retryable`, `startedAt`) |
+| `receipt` / `receiptState` | `GET /v1/receiver/receipts/{id}`: `processed`, `result.confirmationCode`, `deliveriesReceived`, `duplicateCount`; `receiptState` is `ok`, `loading` or `unavailable` |
+| `now` | The current time (milliseconds), used only to compare against `nextAttemptAt` |
+| `stale` | `{ since }` when the last refresh failed; `since` is the last successful update |
 
-*Delivery confirmed* and *Receiver processed alert* are separate steps on purpose. Acknowledgement is what the
-sender observed, and processing is what the receiver recorded. With `process_then_timeout` the receiver processes
-the alert before the sender sees any reply.
+**Delivery service badge** (latest delivery; replays are separate deliveries)
+
+| Badge | API state |
+|---|---|
+| Saved | `pending`, `attemptCount = 0` |
+| Waiting | `pending`, `attemptCount > 0` (lease lost; the last try's result is unknown), **or** `retry_scheduled` whose `nextAttemptAt` has passed: "Waiting for the next attempt". No send is assumed until the API reports a try |
+| Sending | `in_progress` (try *n* of `maxAttempts`) |
+| Trying again | `retry_scheduled`, `nextAttemptAt` in the future: tries used, next try time, countdown |
+| Stopped | `failed`, with the reason from `failureReason` |
+| Confirmed | `delivered` |
+| Unknown | Any state the page doesn't recognize |
+
+**Acknowledgement path** (latest try): *No reply yet* (no tries) · *Waiting for a reply* (`in_progress`) ·
+*Delivery confirmed* (`delivered`) · *Error reply* (`http_error`) · *No reply in time* (`timeout`) ·
+*No connection* (`network_error`) · *Unknown* (`lease_expired`) · *Not loaded yet* (only the summary is known).
+HTTP codes are in the technical view.
+
+**Processing record:** *Processed* (`processed: true`, with the confirmation code and repeats recognized) ·
+*Not processed yet* (no receipt, delivery still active) · *No processing recorded* (no receipt, delivery finished) ·
+*Checking…* (receipt still loading) · *Unknown* (receipt couldn't be loaded).
+
+**Local (browser-only) states:** *Sending to the sandbox / Not saved yet* while the POST is unanswered, and
+*Unconfirmed / Unknown* when the outcome is uncertain. These are never shown as server states.
+
+**Timing:** the adapter uses only `nextAttemptAt`, `attemptCount` and `maxAttempts` from the API. The retry
+backoff, the sender's timeout and the receiver's delay are server configuration that the API doesn't expose,
+so the page never states them. The experiment text was changed to point at the countdown instead of quoting
+seconds.
+
+### Snapshots, stale answers and interruptions
+
+- **Every refresh is a snapshot.** A reload shows the current state at once and never replays old transitions.
+  If polling missed an intermediate state, the page shows the latest state and the completed tries.
+- **Answers are bound to the request that asked for them:**
+  - Selecting another alert aborts the previous alert's requests (`AbortController`), and any answer that still
+    arrives is ignored (`isCurrent()`).
+  - Changing the session aborts all requests for the old session, and a refresh whose token is no longer
+    current is discarded.
+  - A 401 only ends the session it was sent with.
+  - The renderer also only uses detail data whose `eventId` matches the selected alert.
+- **Network interruption:**
+  - The last known state stays on screen with "Showing the last known state from HH:MM:SS. Reconnecting…".
+  - A polling failure never changes a delivery's state. Polling backs off as before (up to 30 s).
+- **Countdown reaching zero:** if the countdown ends before the API reports the next try, the journey says
+  *Waiting for the next attempt*. It never claims a send.
+- **Screen readers:** the journey region isn't `aria-live` (it's redrawn every refresh). A separate hidden live
+  region announces one short sentence, only when the delivery or processing state of the shown alert changes.
 
 ## Known gaps (data the API doesn't provide)
+
 
 - **The receiver mode is per session, not per alert.** Changing it affects every waiting retry in the session, and
   attempts don't record which mode was active. The page says so next to the mode choice.
 - **Attempts store only `responseStatus` / `errorCategory`, not the receiver's error code**, so the page says
-  "receiver reported a problem" rather than naming the simulated outage.
+  "error reply" rather than naming the simulated outage.
 - **There's no public worker liveness.** "Service ready" means the API and database answer, not that deliveries are
   moving.
 - **No alert fields beyond `title` and `message`.** There's no severity or priority, and the page doesn't invent
   any.
 
-## Refresh and recovery behaviour (unchanged from Stage 9)
+## Refresh and recovery behaviour
 
 Single-flight polling every 2 s while any delivery is active. It pauses when the tab is hidden and refreshes on
 return, and it backs off up to 30 s on errors with *Retry now*. A slow request (> 4 s) shows the "waking up" banner;
-a request fails only after 90 s or with no API answer. Late answers for an alert that's no longer selected are
-ignored. On reload, the session and the selected alert are restored from `sessionStorage`.
+a request fails only after 90 s or with no API answer. Obsolete requests are cancelled and late answers ignored
+(see *Snapshots, stale answers and interruptions*). On reload, the session and the selected alert are restored
+from `sessionStorage`.
 
 A submission without an answer keeps its Idempotency-Key, so pressing *Send alert* again can't create a second
 alert. Replay keys are kept per delivery until answered. A 401 clears the token and offers a new session, but
@@ -137,7 +206,8 @@ never creates one automatically.
 
 ## Checking the page
 
-- `npm test` includes `test/ui.test.js`: CSP, no inline script/handlers/styles, safe DOM APIs, no token in URLs.
+- `npm test` includes `test/ui.test.js` (CSP, no inline script/handlers/styles, safe DOM APIs in both scripts, no
+  token in URLs) and `test/journey-model.test.js` (the adapter's mapping, with fixtures).
 - For visual and flow checks, run a local server with the worker on (`WORKER_ENABLED=true`) and use a real browser.
-  Stage 12 used headless Edge with puppeteer-core and axe-core from a scratch folder (not project dependencies).
-  See the Stage 12 build notes.
+  Stages 12–14 used headless Edge with puppeteer-core and axe-core from a scratch folder (not project
+  dependencies), with DevTools `Fetch` interception to hold, fail or delay specific requests. See the build notes.
