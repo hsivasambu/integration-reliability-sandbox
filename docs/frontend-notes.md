@@ -309,7 +309,78 @@ changes. Nothing starts on page load. *Leave guide* says the alert keeps being d
 which mode the receiver stays in. *Run it again* and *Close guide* appear at the end. If polling fails or a
 request is slow, the panel says *Waiting for the delivery service* with *Reconnect now*.
 
+## Outcomes and history (Stage 17)
+
+**History cards** (*Recent alerts*). Each card shows:
+- the sample title and creation time
+- *Delivery:* its state
+- *Processing:* only when the receiver's record was actually read in this page (when the alert was viewed),
+  with the time it was read if nothing was processed
+- *View journey*
+
+The alert list (`GET /v1/events`) has no receiver data, and the page doesn't add a receipt request per card.
+
+- **Ordering is newest first** (by `createdAt`, then ID), and stable.
+- **Cards are updated in place,** keyed by event ID (not rebuilt), so focus stays put.
+- **No jumps:** `keepFocus()` holds the focused element's position on screen. If anything above it grows (a new
+  card, a longer timeline), the page scrolls by the same amount.
+
+**Pagination.** Polling refreshes the first page (20). *Load older alerts* reads the next page with the API's own
+cursor, only on request. Alerts that slide off the first page stay listed with "Status as of HH:MM:SS. View the
+journey to refresh it." Viewing an alert reads its history and receipt, and updates its card. Nothing other than
+bounded reads happens when a visitor browses the history.
+
+**Actions:**
+- *New alert* only prepares a draft: the first sample, with the title focused. An unconfirmed submission is kept
+  separately, and nothing is sent.
+- *Reset view* clears the journey and says that nothing was cancelled or deleted.
+- No session is ever created automatically.
+
+**Outcome** (`buildOutcome()` in `journey-model.js`). Two separate kinds of evidence:
+
+| Line | Comes from | Values |
+|---|---|---|
+| Delivery (acknowledgements) | delivery states and attempts | *Delivery confirmed* (2xx, no earlier failure) · *Retried successfully* (2xx after an earlier failed attempt, including after a retry by hand) · *Stopped* (allowance of `maxAttempts` exhausted / terminal error / session ended / "no reason was recorded") · *Not finished* |
+| Processing (receiver's record) | the receipt only | *Processed once* (receipt shows a repeat: `duplicateCount` ≥ 1) · *Processed* · *Not processed*; **hidden** when the receipt wasn't loaded or nothing is recorded yet |
+
+- **"Processed once" is never inferred from attempt counts.**
+- **An interrupted attempt** (`lease_expired`) is not counted as a failure.
+- **Timing** ("Confirmed about N s after the alert was accepted") is shown only when both recorded times exist and
+  only for the original delivery. A retry by hand includes human waiting time, so it would be misleading.
+
+**Which delivery the summary describes:** always the newest one, i.e. the last replay if there is one. The summary
+says so, and earlier deliveries keep their failures in the timeline.
+
+**Timeline** (`buildTimeline()`). It's built from stored records only, with recorded timestamps; "time not recorded"
+appears where there is none.
+- **Each delivery is its own labelled group** ("Original delivery", "Delivered again (n)"), with its state and
+  "(current)" on the newest.
+- **Entries:**
+  - saved, or retried by hand
+  - each attempt in plain words: the receiving system returned an error / refused it / no reply in time (timed
+    out) / could not connect / *interrupted: outcome unknown* / in progress
+  - "Waiting before another attempt (about N s, from the recorded times)", or with the due time while waiting
+  - the end: delivery confirmed, or the stop reason; when none was recorded, it says so instead of inventing one
+- **The receiving system's record** is a separate group: processed (with its confirmation code), and repeats
+  recognized (the latest time).
+
+**Technical details** (collapsed):
+- the request that created the alert, with the token shown only as a placeholder
+- the response status (202, and 200 for an identical repeat)
+- IDs and timestamps, each with a one-line plain definition
+- every attempt's HTTP status, error category, start and end
+- the receipt fields
+- a short explanation of **submission idempotency** (the sender side: a repeated request returns the same alert)
+  versus **receiver duplicate protection** (the receiving side: the same Event ID is recognized and not processed
+  twice)
+- the raw API data
+
 ## Known gaps (data the API doesn't provide)
+
+- **The alert list has no receiver data**, so history cards show processing only for alerts whose receipt was read
+  in this page.
+- **Alerts created elsewhere** (another tab, or the API directly) appear after the next refresh. Polling runs only
+  while this page's alerts are active or after a visitor action.
 
 - **Guides are a browser-side layer.** The server knows nothing about a "scenario", and the mode is per session, so
   exclusivity across tabs or devices can't be guaranteed.

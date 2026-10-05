@@ -1247,6 +1247,94 @@ push; `/ready` 200.
 - Rerun against Render: Stage 15 49/49, Stage 14 41/41, Stage 13 56/56, Stage 12 24/25 (the expected network log).
 - The checks created about 15 sessions and 50 synthetic alerts.
 
+## Stage 17: Understandable outcomes and event history (2026-10-05)
+
+**Before starting.** Clean tree at `a03ffb5`. Findings:
+- The history showed only the 20 newest alerts, with no way to load more, and the journey couldn't open an alert
+  outside that page.
+- The list was rebuilt every 2 s.
+- `GET /v1/events` carries no receiver data.
+- The "What happened so far" list showed tries but not waits, stop reasons, interrupted attempts or the receiver's
+  record, even though all of them are in stored fields (`startedAt`/`endedAt`, `completedAt`, `failureReason`,
+  `firstReceivedAt`/`lastReceivedAt`).
+
+**Decisions** (details in `docs/frontend-notes.md` → *Outcomes and history*)
+- **Adapter:** `buildTimeline()` and `buildOutcome()` in `journey-model.js` (pure, unit-tested).
+  - The timeline groups each delivery separately, in plain words and with recorded times. Interrupted attempts are
+    marked unknown, and no stop reason is invented.
+  - The outcome keeps acknowledgement evidence (Delivery confirmed / Retried successfully / Stopped / Not
+    finished) apart from receipt evidence (Processed once / Processed / Not processed; hidden when unknown).
+  - Timing appears only when both ends are recorded and only for the original delivery.
+  - The summary always describes the newest delivery and says so.
+- **History store:**
+  - Every alert seen in the session. The polled first page is merged in, older pages load on request via the API's
+    cursor, and alerts that slide off the first page are kept with "Status as of …".
+  - Cards are updated in place, keyed by event ID.
+  - Processing appears on a card only when its receipt was read in this page.
+  - Viewing an alert updates its card from the detail read.
+- **`keepFocus()`** now also holds the focused element's position on screen (no jumps when content above it
+  changes), and re-focuses with `preventScroll`.
+- **New alert** (a draft only), **Reset view** ("nothing was cancelled or deleted").
+- **Technical details:** the request with the token as a placeholder, the 202/200 explanation, IDs and timestamps
+  with plain definitions, per-attempt HTTP status/category/start/end, the receipt, and submission idempotency vs
+  receiver duplicate protection.
+- No backend or API change. No new dependency.
+
+**Found and fixed while verifying**
+- **Page jump:** the focused card's button kept focus but its card moved down by about 585 px when the journey
+  above grew, and later by about 166 px when a new card was inserted above it. `keepFocus()` now compensates in
+  both cases: the focus check measures less than 30 px of movement.
+- **Load older focus:** when the older page held only alerts already kept in the list, focus fell to the page body.
+  It now lands on the last card.
+- **Text:** "p.m.." doubled periods and a waiting line ending ". (next try…)"; the processing sentence repeated
+  under the outcome.
+- **Phone:** cards were tall (the button on its own row), and timeline times sat below their entries, readable as
+  belonging to the next one.
+- **Test-side mistakes, corrected and re-run:** miscounted alerts (a replay is not a new alert); a session assertion
+  that ignored the test's own session; `$$eval` turned into `$eval` twice by `$`-patterns in my patch tooling; and
+  "Load older" assumed the older page held unseen alerts, which the history store had correctly already kept.
+
+**Verification (local, Node 22.18.0, Postgres 18.6, worker on; headless Edge with real API data)**
+- `npm test`: **171/171** (8 new timeline and outcome tests), `skipped 0`. Fixtures cover:
+  - each outcome type, including non-retryable, session-ended and "no reason recorded" stops, which the mock
+    receiver can't produce live
+  - interrupted attempts
+  - in progress and waiting with the recorded due time
+  - replay groups
+  - "processed once" only from the receipt (two attempts with no repeat in the record → *Processed*; receipt
+    unavailable → hidden)
+  - no timing across a retry by hand
+- **Stage 17 browser suite: 46/46.**
+  - **Empty history**, before and with a session.
+  - **Delivery confirmed:** outcome, separate processing line, timing, and a timeline with recorded times.
+  - **Retried successfully:** with "Waiting before another attempt (about N s, from the recorded times)".
+  - **Processed once:** "reached it 2 times", plus the timed-out attempt and the recognized repeat.
+  - **Stopped:** "allowance (4) was exhausted", *Not processed*, and the recorded stop reason.
+  - **Replay:** *Retried successfully … after a retry by hand*, groups "Original delivery: Stopped" and "Delivered
+    again (1): Confirmed (current)", the summary naming the newest delivery, no timing.
+  - **Cards:** fields, processing hidden for a never-viewed alert and shown when read, and stable newest-first order.
+  - **Focus:** an update arrived (a new card above, the journey growing) while a card's button had focus; focus
+    stayed and the button moved less than 30 px.
+  - **Browsing:** viewing an older alert made only GET requests.
+  - **Technical details:** a placeholder instead of the token, the Idempotency-Key, HTTP 202, definitions, both
+    protections, and no token or secret anywhere in the page's HTML.
+  - **Pagination:** 20 after a reload, then *Load older alerts* by keyboard with the cursor → 21, "All your alerts
+    are shown.", focus on a card, and "Status as of" on older cards; the oldest alert opened.
+  - **Stale:** offline → "Reconnecting… Showing the last known state", with the history kept.
+  - **New alert:** draft, title focused, nothing sent. **Reset view:** "nothing was cancelled or deleted", only
+    GETs.
+  - Exactly one session (the test's own). No horizontal scroll; axe 0 violations on desktop and phone; no script
+    errors.
+- **Regression:** Stage 16 49/49, Stage 15 49/49, Stage 14 41/41, Stage 13 56/56, Stage 12 24/25 (only the expected
+  network log). Earlier suites were updated to the new card markup and the new timeline wording.
+
+**Not verified**
+- Real screen readers.
+- Other browsers; real phones.
+- Very long histories (up to the session limit of 100 alerts) beyond the 22 tested.
+- Safari's scroll anchoring (the page compensates itself, so it shouldn't depend on it).
+
+
 
 
 

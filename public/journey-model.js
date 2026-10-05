@@ -213,6 +213,149 @@
     return { ...d, state: 'settling', attemptCount: newest.attemptNumber, nextAttemptAt: null };
   }
 
+  // --- Stage 17: timeline and outcome -------------------------------------------------------------
+
+  const seconds = (fromIso, toIso) => {
+    const ms = Date.parse(toIso) - Date.parse(fromIso);
+    return Number.isFinite(ms) ? Math.max(0, Math.round(ms / 1000)) : null;
+  };
+
+  // One stored attempt in plain words. Only recorded fields are used; no reason is invented.
+  function attemptEntry(d, a) {
+    const n = a.attemptNumber;
+    const base = { key: `${d.id}:${n}`, attempt: n, at: a.startedAt, endedAt: a.endedAt ?? null };
+    if (a.outcome === 'in_progress') return { ...base, tone: 'is-active', icon: 'send', text: `Attempt ${n}: in progress, no result yet.` };
+    if (a.outcome === 'delivered') return { ...base, tone: 'is-done', icon: 'check', text: `Attempt ${n}: delivery confirmed (the receiving system acknowledged it).` };
+    if (a.outcome === 'lease_expired') {
+      return { ...base, tone: 'is-unknown', icon: 'question', interrupted: true,
+        text: `Attempt ${n}: interrupted. The delivery service stopped before recording a result, so the outcome is unknown.` };
+    }
+    const text = {
+      http_error: a.retryable === false
+        ? `Attempt ${n}: the receiving system refused it (an error that retrying cannot fix).`
+        : `Attempt ${n}: the receiving system returned an error.`,
+      timeout: `Attempt ${n}: no reply in time (timed out). That alone does not show whether it was processed.`,
+      network_error: `Attempt ${n}: could not connect to the receiving system.`,
+    }[a.errorCategory] ?? `Attempt ${n}: did not get through (no reason was recorded).`;
+    return { ...base, tone: a.errorCategory === 'timeout' ? 'is-waiting' : 'is-failed', icon: a.errorCategory === 'timeout' ? 'hourglass' : 'cross', text };
+  }
+
+  function stopText(d) {
+    return {
+      attempts_exhausted: `Delivery stopped: all ${d.maxAttempts} attempts allowed were used.`,
+      non_retryable: 'Delivery stopped: the receiving system refused it in a way retrying cannot fix.',
+      session_expired: 'Delivery stopped: the demo session ended first.',
+    }[d.failureReason] ?? 'Delivery stopped (no reason was recorded).';
+  }
+
+  // The selected alert's history from stored records. Each delivery (the original, then each manual
+  // retry) is its own labelled group; the receiving system's record is a separate group.
+  function buildTimeline(event, records, receipt, receiptState) {
+    let replayNumber = 0;
+    const groups = (records ?? []).map((d, index) => {
+      const isReplay = Boolean(d.replayOf);
+      if (isReplay) replayNumber += 1;
+      const items = [{
+        key: `${d.id}:start`, at: d.createdAt ?? (isReplay ? null : event.createdAt), tone: 'is-idle', icon: isReplay ? 'replay' : 'box',
+        text: isReplay ? 'Retried by hand: a new delivery of the same alert was started.' : 'Saved and queued for delivery.',
+      }];
+      d.attempts.forEach((a, i) => {
+        items.push(attemptEntry(d, a));
+        const next = d.attempts[i + 1];
+        if (next && a.outcome === 'failed' && a.endedAt) {
+          const waited = seconds(a.endedAt, next.startedAt);
+          items.push({ key: `${d.id}:${a.attemptNumber}:wait`, at: a.endedAt, tone: 'is-waiting', icon: 'clock',
+            text: `Waiting before another attempt${waited !== null ? ` (about ${waited} s, from the recorded times)` : ''}.` });
+        }
+        if (next && a.outcome === 'lease_expired') {
+          items.push({ key: `${d.id}:${a.attemptNumber}:requeued`, at: null, tone: 'is-idle', icon: 'retry',
+            text: 'Queued again straight away, because the result of that attempt is unknown.' });
+        }
+      });
+      if (d.state === 'pending' && d.attempts.length === 0) {
+        items.push({ key: `${d.id}:queued`, at: null, tone: 'is-waiting', icon: 'clock', text: 'Waiting for the first attempt.' });
+      }
+      if (d.state === 'retry_scheduled' || d.state === 'settling' || (d.state === 'pending' && d.attempts.length > 0)) {
+        items.push({ key: `${d.id}:waiting`, at: d.attempts.at(-1)?.endedAt ?? null, tone: 'is-waiting', icon: 'clock',
+          text: d.nextAttemptAt ? 'Waiting before another attempt.' : 'Waiting for the next step.', dueAt: d.nextAttemptAt ?? null });
+      }
+      if (d.state === 'delivered') items.push({ key: `${d.id}:end`, at: d.completedAt ?? null, tone: 'is-done', icon: 'check', text: 'Delivery confirmed.' });
+      if (d.state === 'failed') items.push({ key: `${d.id}:end`, at: d.completedAt ?? null, tone: 'is-failed', icon: 'stop', text: stopText(d) });
+      return {
+        id: d.id,
+        label: isReplay ? `Delivered again (${replayNumber})` : 'Original delivery',
+        current: index === records.length - 1,
+        items,
+      };
+    });
+
+    let receiver;
+    if (receiptState !== 'ok' || !receipt) {
+      receiver = [{ key: 'receipt:unknown', at: null, tone: 'is-unknown', icon: 'question',
+        text: receiptState === 'loading' ? 'Checking the receiving system\'s record…' : 'Unknown: the receiving system\'s record could not be loaded.' }];
+    } else if (receipt.processed) {
+      receiver = [{ key: 'receipt:processed', at: receipt.firstReceivedAt, tone: 'is-done', icon: 'inbox',
+        text: `Processed the alert${receipt.result?.confirmationCode ? ` (confirmation ${receipt.result.confirmationCode})` : ''}.` }];
+      if (receipt.duplicateCount > 0) {
+        receiver.push({ key: 'receipt:repeats', at: receipt.lastReceivedAt, tone: 'is-done', icon: 'inbox',
+          text: `Recognized ${plural(receipt.duplicateCount, 'repeat delivery', 'repeat deliveries')} and did not process again`
+            + `${receipt.duplicateCount > 1 ? ' (the time shown is the latest)' : ''}.` });
+      }
+    } else {
+      receiver = [{ key: 'receipt:none', at: null, tone: 'is-idle', icon: 'dash', text: 'No processing recorded so far.' }];
+    }
+    return { groups, receiver };
+  }
+
+  // The compact outcome. Sender evidence (acknowledgements) and receiver evidence (the receipt) stay
+  // separate; "processed once" comes only from the receipt, never from attempt counts. Anything the data
+  // can't support is left out (null).
+  function buildOutcome(event, records, status, proc) {
+    let delivery;
+    const allAttempts = records ? records.flatMap((d) => d.attempts) : null;
+    const byHand = Boolean(records && records.length > 1);
+    if (status.code === 'confirmed') {
+      const earlierFailure = allAttempts ? allAttempts.some((a) => a.outcome === 'failed') : false;
+      delivery = earlierFailure
+        ? { code: 'retried', label: 'Retried successfully', tone: 'is-done',
+          text: `A later attempt was acknowledged after an earlier failure${byHand ? ' (after a retry by hand)' : ''}.` }
+        : { code: 'confirmed', label: 'Delivery confirmed', tone: 'is-done', text: 'The receiving system acknowledged the alert.' };
+    } else if (status.code === 'stopped') {
+      delivery = { code: 'stopped', label: 'Stopped', tone: 'is-failed', text: {
+        attempts_exhausted: `The configured attempt allowance (${status.max}) was exhausted.`,
+        non_retryable: 'A terminal error occurred: the receiving system refused it.',
+        session_expired: 'The demo session ended before it was delivered.',
+      }[status.reason] ?? 'The delivery stopped; no reason was recorded.' };
+    } else {
+      delivery = { code: 'in_progress', label: 'Not finished', tone: 'is-waiting', text: 'Delivery is still under way.' };
+    }
+
+    let processingOutcome = null;
+    if (proc.code === 'processed') {
+      processingOutcome = proc.repeats > 0
+        ? { code: 'processed_once', label: 'Processed once', tone: 'is-done',
+          text: `The receiver's record shows one synthetic processing result, although the alert reached it ${proc.repeats + 1} times.` }
+        : { code: 'processed', label: 'Processed', tone: 'is-done', text: 'The receiver\'s record shows one synthetic processing result.' };
+    } else if (proc.code === 'none_recorded') {
+      processingOutcome = { code: 'none', label: 'Not processed', tone: 'is-idle', text: 'The receiver\'s record shows no processing.' };
+    }
+
+    // A timing figure only where both ends are recorded, and only for the original delivery (a retry by
+    // hand includes human waiting time, which would make the number misleading).
+    let timing = null;
+    const latest = records?.at(-1);
+    if (status.code === 'confirmed' && latest && !latest.replayOf && latest.completedAt) {
+      const s = seconds(event.createdAt, latest.completedAt);
+      if (s !== null) timing = `Confirmed about ${s} s after the alert was accepted (from the recorded times).`;
+    }
+
+    // Which delivery the summary describes: always the newest one; earlier ones stay in the timeline.
+    const current = records && records.length > 1
+      ? `This summary describes the newest delivery (Delivered again (${records.length - 1})). Earlier deliveries and their failures stay in the timeline below.`
+      : null;
+    return { delivery, processing: processingOutcome, timing, current };
+  }
+
   // Main entry point.
   //   local:        null | { status: 'sending' | 'uncertain', title, message }  (browser-only, before the server confirms)
   //   event:        null | event resource (GET /v1/events data[] or the POST response's `event`)
@@ -289,11 +432,13 @@
       processing: proc,
       explanation: (latest.replayOf ? 'This is a new delivery, started by hand. ' : '') + explain({ status, ack, proc, attempts }),
       deliveries: history,
+      timeline: buildTimeline(event, records, receipt, receiptState),
+      outcome: buildOutcome(event, records, status, proc),
       stale,
     };
   }
 
-  const api = { toJourneyView, deliveryStatus, attemptStatus, acknowledgement, processing };
+  const api = { toJourneyView, deliveryStatus, attemptStatus, acknowledgement, processing, reconcile };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.JourneyModel = Object.freeze(api);
 })(typeof window !== 'undefined' ? window : globalThis);

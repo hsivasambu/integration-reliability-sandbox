@@ -116,7 +116,14 @@ const state = {
   sessionNote: null,       // shown when a stored session turned out to be expired
   creatingSession: false,
   events: [],
-  hasMoreEvents: false,
+  known: new Map(),        // event id -> { event, checkedAt }: every alert seen in this session (Stage 17)
+  firstPageIds: new Set(), // ids on the polled first page (the rest show "status as of")
+  olderCursor: null,       // the API's cursor for the next older page
+  olderLoaded: false,
+  loadingOlder: false,
+  olderError: null,
+  receipts: new Map(),     // event id -> { processed, code, repeats, at }: receipts actually read in this page
+  viewNote: null,          // shown in the empty journey after "Reset view"
   selectedId: storage.get(KEYS.selected),
   detail: null,            // { eventId, deliveries, receipt, receiptState: 'ok' | 'unavailable' }
   detailController: null,  // cancels the selected alert's in-flight requests when the selection changes
@@ -305,7 +312,10 @@ async function refresh() {
     throw new Unavailable(`The API answered HTTP ${events.status !== 200 ? events.status : receiver.status}.`);
   }
   state.events = events.data.data;
-  state.hasMoreEvents = Boolean(events.data.nextCursor);
+  const checkedAt = Date.now();
+  for (const e of state.events) state.known.set(e.id, { event: e, checkedAt });
+  state.firstPageIds = new Set(state.events.map((e) => e.id));
+  if (!state.olderLoaded) state.olderCursor = events.data.nextCursor;
   state.receiver = receiver.data;
   if (summary.status === 200) state.summary = summary.data;
   // An unconfirmed submission can be confirmed by reading: if an alert with its Idempotency-Key is in the
@@ -352,6 +362,25 @@ async function loadDetail(eventId) {
     receipt: receiptOk ? receipt.data : null,
     receiptState: receiptOk ? 'ok' : 'unavailable',
   };
+  // The detail read is the freshest status for this alert: update its history card too.
+  const entry = state.known.get(eventId);
+  const records = deliveries.data.deliveries.map(JourneyModel.reconcile);
+  const latest = records.at(-1);
+  if (entry && latest) {
+    entry.event = {
+      ...entry.event,
+      delivery: {
+        id: latest.id, replayOf: latest.replayOf, state: latest.state === 'settling' ? entry.event.delivery.state : latest.state,
+        attemptCount: latest.attemptCount, maxAttempts: latest.maxAttempts, nextAttemptAt: latest.nextAttemptAt,
+        failureReason: latest.failureReason, statusUrl: latest.statusUrl, replayCount: records.filter((d) => d.replayOf).length,
+      },
+    };
+    entry.checkedAt = Date.now();
+  }
+  if (receiptOk) {
+    const r = receipt.data;
+    state.receipts.set(eventId, { processed: r.processed, code: r.result?.confirmationCode ?? null, repeats: r.duplicateCount, at: Date.now() });
+  }
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -378,6 +407,7 @@ function setToken(token) {
     state.connection = { status: 'live', lastUpdatedAt: null };
   }
   if (token !== state.token) {
+    resetHistory();
     storage.set(KEYS.sessionTag, token ? crypto.randomUUID() : null);
     if (state.guide) {
       state.guide = null;
@@ -465,6 +495,7 @@ function selectEvent(eventId) {
   state.detail = null;
   state.detailNote = null;
   state.showLocal = false;
+  if (eventId) state.viewNote = null;
 }
 
 // --- composer --------------------------------------------------------------------
@@ -1024,10 +1055,26 @@ const MODE_INFO = {
 
 // Re-renders a region and puts keyboard focus back on the "same" control (matched by
 // data-focus-key), so the 2-second refresh does not disrupt keyboard or screen-reader users.
+// It also keeps the focused element where it is on screen: if this region grows or shrinks (a new alert
+// above, a longer timeline), the page scrolls by the same amount, so nothing jumps under the visitor.
 function keepFocus(container, renderFn) {
-  const key = container.contains(document.activeElement) ? document.activeElement.dataset.focusKey : null;
+  const active = document.activeElement;
+  const focused = active && active !== document.body && document.contains(active) ? active : null;
+  const key = focused && container.contains(focused) ? focused.dataset.focusKey : null;
+  const top = focused?.getBoundingClientRect().top;
   renderFn();
-  if (key) container.querySelector(`[data-focus-key="${CSS.escape(key)}"]`)?.focus();
+  let target = focused && document.contains(focused) ? focused : null;
+  if (key) {
+    const again = container.querySelector(`[data-focus-key="${CSS.escape(key)}"]`);
+    if (again) {
+      if (document.activeElement !== again) again.focus({ preventScroll: true });
+      target = again;
+    }
+  }
+  if (target && top !== undefined) {
+    const shift = target.getBoundingClientRect().top - top;
+    if (Math.abs(shift) >= 1) window.scrollBy(0, shift);
+  }
 }
 
 function render() {
@@ -1217,36 +1264,169 @@ function renderPending() {
     techLine(pending.lastError, `Idempotency-Key ${pending.key}`)));
 }
 
+// --- alert history (Stage 17) ----------------------------------------------------------
+// Every alert this page has seen in the current session, newest first. The first page (20 newest) is
+// refreshed by polling; older pages are loaded only when asked ("Load older alerts", the API's cursor).
+// Alerts that slide off the first page stay listed with the time their status was last read.
+
+const findEvent = (id) => (id ? state.known.get(id)?.event ?? null : null);
+
+function knownEvents() {
+  return [...state.known.values()].map((k) => k.event)
+    .sort((a, b) => (b.createdAt > a.createdAt ? 1 : b.createdAt < a.createdAt ? -1 : (a.id < b.id ? -1 : 1)));
+}
+
+function resetHistory() {
+  state.known = new Map();
+  state.firstPageIds = new Set();
+  state.olderCursor = null;
+  state.olderLoaded = false;
+  state.loadingOlder = false;
+  state.olderError = null;
+  state.receipts = new Map();
+}
+
+// A bounded read of the next older page, only on request.
+async function loadOlder() {
+  if (state.loadingOlder || !state.olderCursor || !state.token) return;
+  const token = state.token;
+  const before = state.known.size;
+  state.loadingOlder = true;
+  state.olderError = null;
+  renderHistoryMore();
+  try {
+    const res = await api('GET', `/v1/events?limit=20&cursor=${encodeURIComponent(state.olderCursor)}`);
+    if (state.token !== token) return;
+    if (res.status !== 200) { state.olderError = `The API answered HTTP ${res.status}.`; return; }
+    const checkedAt = Date.now();
+    for (const e of res.data.data) if (!state.firstPageIds.has(e.id)) state.known.set(e.id, { event: e, checkedAt });
+    state.olderCursor = res.data.nextCursor;
+    state.olderLoaded = true;
+  } catch (err) {
+    if (!(err instanceof Aborted)) state.olderError = err.message;
+  } finally {
+    state.loadingOlder = false;
+    keepFocus($('event-list'), renderEvents);
+    // If the button went away (no more pages), keep keyboard users in the list: focus the first newly
+    // loaded card, or the last card if the page held nothing new (those alerts were already listed).
+    if (document.activeElement === document.body || !document.activeElement) {
+      const all = knownEvents();
+      const target = all[before] ?? all.at(-1);
+      if (target) $('event-list').querySelector(`[data-focus-key="event-${CSS.escape(target.id)}"]`)?.focus();
+    }
+  }
+}
+
+function historyCard() {
+  const li = h('li', { class: 'history-entry' });
+  const button = h('button', { type: 'button', class: 'btn btn-quiet hc-view' }, 'View journey');
+  button.addEventListener('click', () => {
+    const id = li.dataset.eventId;
+    state.viewNote = null;
+    selectEvent(id);
+    render();
+    pollNow(); // bounded reads: the alert list, the receiver summary, this alert's history and receipt
+  });
+  li.append(h('article', { class: 'history-card' },
+    h('div', { class: 'hc-head' }, h('span', { class: 'hc-icon' }), h('h3', { class: 'hc-title' }), h('p', { class: 'hc-time' })),
+    h('p', { class: 'hc-delivery' }),
+    h('p', { class: 'hc-processing' }),
+    h('p', { class: 'hc-asof' }),
+    button));
+  return li;
+}
+
+// Updates a card in place (no rebuild), so focus and scroll position are kept while statuses change.
+function updateCard(li, event) {
+  const status = JourneyModel.deliveryStatus(event.delivery, Date.now());
+  const selected = event.id === state.selectedId && !state.showLocal;
+  const titleId = `hc-title-${event.id}`;
+  li.dataset.eventId = event.id;
+  const card = li.firstChild;
+  card.className = `history-card ${status.tone}${selected ? ' is-selected' : ''}`;
+  card.setAttribute('aria-labelledby', titleId);
+  const [head, delivery, processing, asof, button] = card.children;
+  head.children[0].replaceChildren(icon(status.icon));
+  head.children[1].id = titleId;
+  if (head.children[1].textContent !== event.payload.title) head.children[1].textContent = event.payload.title;
+  head.children[2].textContent = time(event.createdAt);
+  const replays = event.delivery.replayCount;
+  delivery.replaceChildren(h('span', { class: 'hc-label' }, 'Delivery: '), status.label,
+    replays ? ` · retried by hand ${replays === 1 ? 'once' : `${replays} times`}` : '');
+  // Processing is shown only when the receiver's record was actually read in this page.
+  const r = state.receipts.get(event.id);
+  processing.hidden = !r;
+  if (r) {
+    processing.replaceChildren(h('span', { class: 'hc-label' }, 'Processing: '), r.processed
+      ? `processed${r.code ? ` (${r.code})` : ''}${r.repeats ? ` · ${r.repeats} repeat${r.repeats === 1 ? '' : 's'} recognized` : ''}`
+      : `none recorded when checked at ${time(new Date(r.at).toISOString())}`);
+  }
+  const k = state.known.get(event.id);
+  const stale = !state.firstPageIds.has(event.id);
+  asof.hidden = !stale;
+  if (stale) asof.textContent = `Status as of ${time(new Date(k.checkedAt).toISOString())}. View the journey to refresh it.`;
+  button.dataset.focusKey = `event-${event.id}`;
+  button.setAttribute('aria-current', selected ? 'true' : 'false');
+  button.setAttribute('aria-describedby', titleId);
+}
+
 function renderEvents() {
   const list = $('event-list');
-  if (!state.token) {
-    list.replaceChildren(h('li', { class: 'history-empty' }, 'Your alerts will appear here.'));
+  const events = state.token ? knownEvents() : [];
+  if (events.length === 0) {
+    list.replaceChildren(h('li', { class: 'history-empty' }, state.token
+      ? 'No alerts yet. Send one, or try a scenario below.'
+      : 'Your alerts will appear here.'));
+    renderHistoryMore();
     return;
   }
-  if (state.events.length === 0) {
-    list.replaceChildren(h('li', { class: 'history-empty' }, 'No alerts yet. Send one or start an experiment.'));
-    return;
+  const ids = new Set(events.map((e) => e.id));
+  const existing = new Map();
+  for (const li of [...list.children]) {
+    if (li.dataset.eventId && ids.has(li.dataset.eventId)) existing.set(li.dataset.eventId, li);
+    else li.remove();
   }
-  const items = state.events.map((event) => {
-    const view = JourneyModel.deliveryStatus(event.delivery, Date.now());
-    const replays = event.delivery.replayCount;
-    const button = h('button', {
-      type: 'button', class: `history-item ${view.tone}`, 'aria-current': event.id === state.selectedId ? 'true' : 'false',
-      'data-focus-key': `event-${event.id}`,
-    },
-    icon(view.icon),
-    h('span', { class: 'h-title' }, event.payload.title),
-    h('span', { class: 'h-time' }, time(event.createdAt)),
-    h('span', { class: 'h-state' }, view.label, replays ? ` · delivered again ${replays === 1 ? 'once' : `${replays} times`}` : ''));
-    button.addEventListener('click', () => {
-      selectEvent(event.id);
-      render();
-      pollNow();
-    });
-    return h('li', {}, button);
-  });
-  if (state.hasMoreEvents) items.push(h('li', { class: 'hint' }, 'Showing your 20 newest alerts.'));
-  list.replaceChildren(...items);
+  let previous = null;
+  for (const event of events) {
+    const li = existing.get(event.id) ?? historyCard();
+    updateCard(li, event);
+    const expected = previous ? previous.nextSibling : list.firstChild;
+    if (li !== expected) list.insertBefore(li, expected); // new cards are inserted; existing ones keep their place
+    previous = li;
+  }
+  renderHistoryMore();
+}
+
+function renderHistoryMore() {
+  const more = $('history-more');
+  const parts = [];
+  if (state.token && state.olderCursor) {
+    parts.push(h('button', {
+      type: 'button', class: 'btn btn-quiet', 'data-focus-key': 'load-older', disabled: state.loadingOlder, onclick: () => loadOlder(),
+    }, state.loadingOlder ? 'Loading…' : 'Load older alerts'));
+  } else if (state.token && state.olderLoaded) {
+    parts.push(h('p', { class: 'hint' }, 'All your alerts are shown.'));
+  }
+  if (state.olderError) parts.push(h('p', { class: 'hint' }, `Could not load older alerts (${state.olderError}). You can try again.`));
+  keepFocus(more, () => more.replaceChildren(...parts));
+}
+
+// "New alert": a draft action only. Nothing is sent until Send alert is pressed; an unconfirmed
+// submission (if any) is kept separately.
+function newAlertDraft() {
+  choosePreset(0);
+  $('submit-result').replaceChildren(h('p', { class: 'hint' }, 'New draft ready. Nothing is sent until you press Send alert.'));
+  const composer = $('composer-heading');
+  if (composer.getBoundingClientRect().top < 0) composer.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' });
+  $('title').focus();
+}
+
+// "Reset view": only clears what the journey shows.
+function resetView() {
+  selectEvent(null);
+  state.viewNote = 'View reset. Nothing was cancelled or deleted: your alerts are still listed under Recent alerts, and any delivery in progress continues.';
+  render();
+  $('journey-heading').focus();
 }
 
 function renderPollStatus(mode, delay) {
@@ -1349,22 +1529,8 @@ function journeyNow(v) {
     h('p', { class: 'jd-explain' }, v.explanation),
     h('dl', { class: 'jd-facts' }, facts.flatMap(([k, val]) => [h('dt', {}, k), h('dd', {}, val)])),
     v.ack.note ? h('p', { class: 'hint' }, h('strong', {}, `Acknowledgement: ${v.ack.label}. `), v.ack.note) : null,
-    v.processing.code === 'unknown' || v.processing.code === 'processed'
-      ? h('p', { class: 'hint' }, v.processing.detail) : null);
-}
-
-// Every delivery (original and replays) with its tries, keyed by delivery and attempt IDs.
-function journeyHistory(v) {
-  if (!v.server) return null;
-  if (!v.deliveries.length) return h('p', { class: 'hint' }, 'Loading what happened so far…');
-  return h('div', { class: 'jd-history' },
-    h('h4', {}, 'What happened so far'),
-    ...v.deliveries.map((group) => h('div', { class: 'delivery-group', 'data-delivery-id': group.id },
-      h('p', { class: 'delivery-group-name' }, group.label, ': ', h('strong', {}, group.status.label)),
-      group.attempts.length
-        ? h('ul', { class: 'tries' }, group.attempts.map((a) => h('li', { class: a.tone, 'data-attempt-key': a.key },
-          icon(a.icon), h('span', {}, `Try ${a.number}: ${a.text} (${fullTime(a.startedAt)})`))))
-        : h('p', { class: 'hint' }, 'No tries yet.'))));
+    // The outcome panel already states the processing result; only an unknown record is repeated here.
+    v.processing.code === 'unknown' ? h('p', { class: 'hint' }, v.processing.detail) : null);
 }
 
 function staleBanner(v) {
@@ -1375,6 +1541,44 @@ function staleBanner(v) {
       : 'Reconnecting… Nothing could be loaded yet.');
 }
 
+// The outcome, from evidence: what the sender's acknowledgements show, and separately what the receiver's
+// record shows. Anything the data can't support is omitted.
+function journeyOutcome(v) {
+  if (!v.server || !v.outcome) return null;
+  const o = v.outcome;
+  const row = (heading, x) => h('div', { class: `jo-row ${x.tone}` },
+    h('p', { class: 'jo-label' }, heading),
+    h('p', { class: 'jo-value' }, h('strong', {}, x.label), ` · ${x.text}`));
+  return h('section', { class: 'jo', 'aria-label': 'Outcome' },
+    h('h4', {}, 'Outcome'),
+    row('Delivery (acknowledgements)', o.delivery),
+    o.processing ? row('Processing (receiver\'s record)', o.processing) : null,
+    o.timing ? h('p', { class: 'hint' }, o.timing) : null,
+    o.current ? h('p', { class: 'hint' }, o.current) : null);
+}
+
+// The stored history as a readable timeline: one group per delivery, plus the receiver's record.
+function journeyTimeline(v) {
+  if (!v.server) return null;
+  if (!v.timeline || v.timeline.groups.length === 0) return h('p', { class: 'hint' }, 'Loading what happened so far…');
+  const entry = (item) => h('li', { class: `tl-item ${item.tone}`, 'data-key': item.key, 'data-attempt-key': item.attempt ? item.key : null },
+    icon(item.icon),
+    h('span', { class: 'tl-text' }, item.dueAt
+      ? `${item.text.replace(/\.$/, '')} (next try due at ${fullTime(item.dueAt)})`
+      : item.text),
+    h('span', { class: 'tl-time' }, item.at ? h('time', { datetime: item.at }, fullTime(item.at)) : 'time not recorded'));
+  return h('section', { class: 'jd-history', 'aria-label': 'What happened so far' },
+    h('h4', {}, 'What happened so far'),
+    h('p', { class: 'hint' }, `Times come from the stored records (accepted by the sandbox at ${fullTime(v.acceptedAt)})`),
+    ...v.timeline.groups.map((g) => h('div', { class: `delivery-group${g.current ? ' is-current' : ''}`, 'data-delivery-id': g.id },
+      h('p', { class: 'delivery-group-name' }, g.label, ': ', h('strong', {}, v.deliveries.find((x) => x.id === g.id)?.status.label ?? ''),
+        g.current && v.timeline.groups.length > 1 ? ' (current)' : ''),
+      h('ol', { class: 'timeline' }, g.items.map(entry)))),
+    h('div', { class: 'delivery-group receiver-group' },
+      h('p', { class: 'delivery-group-name' }, 'Receiving system\'s record'),
+      h('ol', { class: 'timeline' }, v.timeline.receiver.map(entry))));
+}
+
 // Technical lines kept from the earlier UI, shown only in the technical view.
 function attemptLine(a) {
   const parts = [`Attempt ${a.attemptNumber}: ${a.outcome}`];
@@ -1382,26 +1586,54 @@ function attemptLine(a) {
   if (a.errorCategory) parts.push(a.errorCategory);
   if (a.retryable !== null) parts.push(`retryable: ${a.retryable}`);
   if (a.durationMs !== null) parts.push(`${a.durationMs} ms`);
+  parts.push(`started ${a.startedAt}`);
+  parts.push(a.endedAt ? `ended ${a.endedAt}` : 'no end time recorded');
   return parts.join(' · ');
 }
 
+// Technical details: permitted request data, statuses, non-secret IDs and timestamps, with plain
+// definitions. The demo token and server secrets are never part of any of this.
 function technicalView(event, detail) {
+  const term = (name, definition, ...value) => [h('dt', {}, name), h('dd', {}, h('span', { class: 'def' }, definition), ...value)];
+  const request = [
+    'POST /v1/events',
+    'Content-Type: application/json',
+    'Authorization: Bearer <your demo token, never shown>',
+    `Idempotency-Key: ${event.idempotencyKey}`,
+    '',
+    JSON.stringify({ type: event.type, payload: event.payload }, null, 2),
+  ].join('\n');
   const details = h('details', { class: 'tech', open: state.techOpen },
-    h('summary', { 'data-focus-key': 'tech' }, 'Technical view: IDs, status codes and raw API data'),
+    h('summary', { 'data-focus-key': 'tech' }, 'Technical details: request, status codes, IDs and timestamps'),
+    h('h5', {}, 'The request that created this alert'),
+    h('pre', {}, request),
+    h('p', {}, 'Response: HTTP 202 Accepted (saved and queued, not yet delivered). Sending exactly the same request again returns HTTP 200 with this same alert.'),
+    h('h5', {}, 'Identifiers and times'),
+    h('dl', { class: 'tech-terms' },
+      ...term('Event ID', 'identifies this alert in the sandbox.', h('code', {}, event.id)),
+      ...term('Idempotency-Key', 'a label sent with the request, so a repeat of the same request is recognized instead of creating a second alert.', h('code', {}, event.idempotencyKey)),
+      ...term('Accepted at', 'when the sandbox saved the alert.', h('code', {}, event.createdAt)),
+      ...term('Status URL', 'where the delivery history can be read.', h('code', {}, event.delivery.statusUrl))),
+    ...(detail?.deliveries ?? []).map((d) => h('div', { class: 'tech-delivery' },
+      h('p', {}, h('strong', {}, d.replayOf ? 'Retry by hand (replay) ' : 'Original delivery '), h('code', {}, d.id)),
+      h('p', { class: 'def' }, d.replayOf
+        ? `A delivery is one series of attempts. This one was started by hand after delivery ${d.replayOf.slice(0, 8)}… stopped.`
+        : 'A delivery is one series of attempts to send the alert, with its own attempt allowance.'),
+      h('p', {}, `State ${d.state}${d.failureReason ? `, reason ${d.failureReason}` : ''} · created ${d.createdAt}${d.completedAt ? ` · finished ${d.completedAt}` : ''}`),
+      h('ul', { class: 'tech-list' }, d.attempts.map((a) => h('li', {}, attemptLine(a)))))),
+    detail
+      ? h('div', { class: 'tech-delivery' },
+        h('p', {}, h('strong', {}, 'Receiver receipt')),
+        h('p', { class: 'def' }, 'The receiving system\'s own record of what it processed (a receipt), separate from what the sender saw.'),
+        h('p', {}, detail.receiptState === 'ok'
+          ? `processed ${detail.receipt.processed}${detail.receipt.result ? `, confirmation ${detail.receipt.result.confirmationCode}` : ''}, deliveries received ${detail.receipt.deliveriesReceived}, repeats recognized ${detail.receipt.duplicateCount}${detail.receipt.firstReceivedAt ? `, first ${detail.receipt.firstReceivedAt}` : ''}${detail.receipt.lastReceivedAt ? `, latest ${detail.receipt.lastReceivedAt}` : ''}`
+          : 'could not be loaded (shown as Unknown)'))
+      : null,
+    h('h5', {}, 'Two different protections against duplicates'),
     h('ul', { class: 'tech-list' },
-      h('li', {}, 'Event ID: ', h('code', {}, event.id)),
-      h('li', {}, 'Idempotency-Key: ', h('code', {}, event.idempotencyKey)),
-      h('li', {}, 'Accepted with HTTP 202 at ', h('code', {}, event.createdAt)),
-      h('li', {}, 'Status URL: ', h('code', {}, event.delivery.statusUrl)),
-      ...(detail?.deliveries ?? []).map((d) => h('li', {},
-        d.replayOf ? 'Replay delivery ' : 'Original delivery ', h('code', {}, d.id), `: state ${d.state}`,
-        d.failureReason ? `, failureReason ${d.failureReason}` : '',
-        h('ul', {}, d.attempts.map((a) => h('li', {}, attemptLine(a)))))),
-      detail
-        ? h('li', {}, detail.receiptState === 'ok'
-          ? `Receiver receipt: processed ${detail.receipt.processed}, deliveriesReceived ${detail.receipt.deliveriesReceived}, duplicateCount ${detail.receipt.duplicateCount}`
-          : 'Receiver receipt: could not be loaded (shown as Unknown)')
-        : null),
+      h('li', {}, h('strong', {}, 'Submission idempotency'), ' (sender side): the Idempotency-Key makes a repeated request return the same alert, so retrying a send can never create a second alert.'),
+      h('li', {}, h('strong', {}, 'Receiver duplicate protection'), ' (receiving side): the receiving system remembers each alert\'s Event ID, so when the same alert is delivered again (after a timeout or a retry) it recognizes it and does not process it twice.')),
+    h('h5', {}, 'Raw API data'),
     h('pre', {}, JSON.stringify({ event, deliveries: detail?.deliveries ?? null, receipt: detail?.receipt ?? null }, null, 2)));
   details.addEventListener('toggle', () => { state.techOpen = details.open; });
   return details;
@@ -1420,7 +1652,7 @@ function currentJourneyView() {
       stale: null, // the local state is the browser's own; staleness applies to server data
     });
   }
-  const event = state.token ? state.events.find((e) => e.id === state.selectedId) : null;
+  const event = state.token ? findEvent(state.selectedId) : null;
   if (!event) return null;
   const detail = state.detail?.eventId === event.id ? state.detail : null;
   return JourneyModel.toJourneyView({
@@ -1444,9 +1676,10 @@ function renderDetail() {
   const v = currentJourneyView();
   if (!v) {
     container.replaceChildren(h('div', { class: 'journey-empty' },
+      state.viewNote ? h('p', { class: 'notice is-idle' }, state.viewNote) : null,
       h('p', {}, !state.token
         ? 'Send an alert to see its journey here, step by step.'
-        : state.events.length ? 'Choose an alert from Recent alerts to see its journey.' : 'Send an alert to see its journey here.'),
+        : state.known.size ? 'Choose View journey on any alert under Recent alerts.' : 'Send an alert to see its journey here.'),
       h('ul', { class: 'jd-legend' }, EMPTY_STEPS.map(([name, iconName, text]) =>
         h('li', {}, icon(iconName), h('span', {}, h('strong', {}, name), ` · ${text}`))))));
     announce(null);
@@ -1455,7 +1688,7 @@ function renderDetail() {
     return;
   }
 
-  const event = v.server ? state.events.find((e) => e.id === v.eventId) : null;
+  const event = v.server ? findEvent(v.eventId) : null;
   const detail = event && state.detail?.eventId === event.id ? state.detail : null;
   const canReplay = v.server && v.delivery.code === 'stopped' && detail;
   const recovery = canReplay
@@ -1465,7 +1698,8 @@ function renderDetail() {
   const actions = v.server
     ? h('div', { class: 'journey-actions' },
       h('button', { type: 'button', class: 'btn', 'data-focus-key': 'duplicate', onclick: () => submitDuplicate(event) },
-        'Send an exact copy'))
+        'Send an exact copy'),
+      h('button', { type: 'button', class: 'btn btn-quiet', 'data-focus-key': 'reset-view', onclick: () => resetView() }, 'Reset view'))
     : null;
 
   // replaceChildren() would print null as text, so empty parts are filtered out.
@@ -1476,8 +1710,9 @@ function renderDetail() {
       ? (v.stale ? 'Last known state' : `Updated ${fullTime(new Date(state.connection.lastUpdatedAt ?? Date.now()).toISOString())}`)
       : 'Not confirmed by the sandbox yet'),
     journeyDiagram(v, recovery),
+    journeyOutcome(v),
     journeyNow(v),
-    journeyHistory(v),
+    journeyTimeline(v),
     actions,
     v.server ? h('p', { class: 'journey-sub' }, '"Send an exact copy" repeats the original request, to show that it cannot create a second alert.') : null,
     v.server ? state.detailNote : null,
@@ -1659,6 +1894,7 @@ async function checkStatus() {
 // --- wiring ------------------------------------------------------------------------
 
 $('check-status').addEventListener('click', checkStatus);
+$('new-alert').addEventListener('click', newAlertDraft);
 for (const id of ['title', 'message']) {
   $(id).addEventListener('input', () => {
     // Re-check a field only once it is showing an error, so typing is not interrupted.
