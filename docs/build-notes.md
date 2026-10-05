@@ -456,3 +456,67 @@ second deploy. `/ready` 200.
   again → 200 + `Idempotent-Replayed` (same id); K2 → 409 `already_replayed`; another session → 404.
 - About 3 s later the history showed the original failed (4×503) and the replay delivered (1×200, `replayOf` = original).
   Receiver: processed once, 0 duplicates. Event summary: `delivered`, `replayCount` 1.
+
+## Stage 9: Browser UI (2026-10-05)
+
+**Decisions**
+- Plain JavaScript, no framework or build step: `public/index.html`, `app.css`, `app.js` (about 600 lines).
+  The stop-gap `demo.js` and `health-check.js` were removed.
+- **Rendering.** All rendering goes through a tiny `h()` helper that creates elements and text nodes. There is
+  no `innerHTML` anywhere (a test asserts this), and server-provided text is only ever text.
+- **Token.** Kept in `sessionStorage` (`irs.token`), never in a URL, never in `localStorage`. A 401 clears it and
+  offers a new session; sessions are only ever created by a click. The limits of this model are explained
+  on the page and in the README.
+- **CSP and headers.** Added to every response: `default-src 'self'; script-src 'self'; style-src 'self';
+  img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';
+  object-src 'none'`, plus `nosniff` and `no-referrer`. The page has no inline script, styles or handlers;
+  the favicon is a `data:` SVG.
+- **Polling.**
+  - A single `pollNow()` loop: at most one refresh in flight, with requests made meanwhile coalesced.
+  - Every 2 s while any delivery is active; stops when idle; restarted by submit or replay.
+  - Paused on `visibilitychange` (hidden) and on `pagehide`; an immediate refresh when visible again.
+  - Exponential backoff on failure (4, 8, 16, then 30 s maximum), with a *Retry now* button.
+  - Each refresh: the events list (20) and the receiver summary, plus the selected event's deliveries and
+    receipt. That's 4 requests at most.
+- **Cold starts.** After 4 s a banner says the server may be waking and that nothing has failed. A request
+  only fails after 90 s, or when it gets a non-JSON reply (for example a hosting placeholder page). Delivery
+  state shown is always the server's.
+- **Three lanes per event:** API acceptance (with *Submit duplicate*, reusing the stored `idempotencyKey`
+  and payload), HTTP delivery (every delivery and attempt, plus *Replay failed delivery*), and receiver
+  processing (with an explanation when it processed despite a sender timeout).
+- **Retry-safe actions.** The submit key is kept until the server answers. The replay key is kept per
+  delivery in `sessionStorage` until answered.
+- **Accessibility.** Labels, fieldset/legend, `aria-live` regions, `:focus-visible` outline, skip link.
+  `keepFocus()` restores focus to the same control across 2-second re-renders; the radio buttons are created
+  once and only updated. Layout: one column, two from 52rem. Dark mode follows the system setting.
+
+**Verification**
+- `npm test`: 111/111 pass. 5 new tests in `test/ui.test.js`:
+  - CSP and security headers present, with no `unsafe-*`
+  - exactly one same-origin script, with no inline script, handlers or styles
+  - asset content types
+  - `app.js` has no `innerHTML`/`document.write`/`localStorage`/token-in-URL
+  - old scripts return 404
+- Browser automation (Chrome extension) wasn't available. Instead I ran the real `index.html` + `app.js` in
+  jsdom (installed in a scratch folder, **not** a project dependency) against a live local server with the
+  worker on: **27/27 checks passed** for the main flows, plus 4/4 extra checks.
+  - Main flows:
+    - API status Ready
+    - submit disabled before a session
+    - session start; token in `sessionStorage` and not in the URL
+    - client-side validation
+    - Scenario 1 (202 notice, 503 with retry time, switch to success, delivered on attempt 2, processed once)
+    - duplicate submission → 200 + `Idempotent-Replayed`, still 1 event
+    - Scenario 2 (timeout with no response while the receiver already processed; then delivered,
+      1 duplicate, explanation shown)
+    - Scenario 3 (failed after 4 attempts, replay 202, original kept failed, Replay 1 delivered)
+    - polling stops when idle; never more than 1 events request in flight
+    - 0 requests in 4.5 s while hidden, immediate refresh on visible
+    - simulated network failure → "Trying again in 4 s", 0 calls in the next 3 s, recovery via *Retry now*
+    - a stale token → "expired" note, 0 sessions auto-created, *Start a new session* offered
+  - Extra checks:
+    - a 5.5 s `/health` shows the waking notice ("Nothing has failed") instead of an error, then clears
+    - a server 422 with details is shown
+    - a 429 quota error is shown as "limit reached"
+- Not verified by me: visual layout at phone width, real screen-reader output, and real-browser focus rings.
+  These need a human with a browser (manual steps are in the stage summary).

@@ -4,82 +4,96 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Integration Reliability Sandbox</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
-    pre { background: #f3f3f3; padding: 0.75rem; overflow-x: auto; white-space: pre-wrap; }
-    section { border-top: 1px solid #ccc; margin-top: 1.5rem; padding-top: 0.5rem; }
-    label { display: block; margin-top: 0.5rem; }
-    input, textarea { width: 100%; box-sizing: border-box; font: inherit; }
-    .note { background: #fff6d6; border-left: 4px solid #d9a400; padding: 0.5rem 0.75rem; }
-    ul { padding-left: 1.2rem; }
-  </style>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%232b6cb0'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-  <h1>Integration Reliability Sandbox</h1>
-  <p>A learning sandbox that will accept synthetic JSON events, store them, and deliver them
-     reliably to a controlled mock receiver.</p>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <h1>Integration Reliability Sandbox</h1>
+    <p>Send synthetic events to a controlled mock receiver and watch what a reliable integration does
+       when the receiver fails, times out, or sees the same event twice. All data is synthetic.</p>
+  </header>
 
-  <section>
-    <h2>Service health</h2>
-    <button id="check" type="button">Check health</button>
-    <pre id="result" aria-live="polite">Not checked yet.</pre>
-  </section>
+  <div id="wake-banner" class="banner banner-info" role="status" aria-live="polite" hidden></div>
 
-  <section>
-    <h2>Demo session</h2>
-    <p>An anonymous, temporary credential (not an account). It is kept only in this page and is
-       lost if you reload.</p>
-    <button id="start-session" type="button">Start demo session</button>
-    <pre id="session-status" aria-live="polite">No session.</pre>
-  </section>
+  <main id="main">
+    <section class="panel" aria-labelledby="status-heading">
+      <h2 id="status-heading">API status</h2>
+      <p class="muted">Checks <code>/health</code> (the process is running) and <code>/ready</code> (the database is reachable).</p>
+      <button id="check-status" type="button">Check status</button>
+      <p id="status-result" class="result" role="status" aria-live="polite">Not checked yet.</p>
+    </section>
 
-  <section>
-    <h2>Submit a synthetic event</h2>
-    <p class="note"><strong>Accepted is not delivered.</strong> A <code>202 Accepted</code> means the event
-       is stored durably and queued. A background worker delivers it to the mock receiver, retrying failures
-       after 2, 4 and 8 seconds (4 attempts in total). Use <em>Check delivery</em> to follow it.</p>
-    <form id="event-form">
-      <label>Title (max 100 characters)
-        <input id="title" name="title" maxlength="100" required value="Synthetic test notification">
-      </label>
-      <label>Message (max 500 characters)
-        <textarea id="message" name="message" maxlength="500" rows="3" required>This is synthetic demo data.</textarea>
-      </label>
-      <p>Idempotency-Key: <code id="idem-key">(new key on submit)</code><br>
-         <small>A failed or repeated submit reuses this key, so the event is stored only once.</small></p>
-      <button type="submit">Submit event</button>
-      <button id="resubmit" type="button">Send same request again</button>
-      <button id="check-delivery" type="button">Check delivery</button>
-      <button id="replay" type="button">Replay failed delivery</button>
-    </form>
-    <pre id="event-result" aria-live="polite">Nothing submitted yet.</pre>
-  </section>
+    <section class="panel" aria-labelledby="session-heading">
+      <h2 id="session-heading">Demo session</h2>
+      <div id="session-area" aria-live="polite"></div>
+      <details class="note">
+        <summary>How the demo token is stored</summary>
+        <p>Starting a session gives this tab an anonymous token that expires after 24 hours. It is kept in
+           this tab's <code>sessionStorage</code>: it survives a reload, disappears when the tab closes, and
+           is never put in a URL. Any script running on this page could read it, which is acceptable for a
+           throwaway demo credential with no personal data, but not for real accounts (those would use
+           <code>HttpOnly</code> cookies). The page only loads its own scripts and never inserts received
+           text as HTML.</p>
+      </details>
+    </section>
 
-  <section>
-    <h2>Mock receiver mode</h2>
-    <p>Choose how this session's simulated destination behaves. It applies to your session only and
-       affects events delivered after you change it. In every mode, an event the receiver has already
-       processed is recognized by its event ID and answered with the original result, not processed again.</p>
-    <label>Mode
-      <select id="receiver-mode">
-        <option value="success">success: answers 200 immediately</option>
-        <option value="server_error">server_error: answers 503, processes nothing</option>
-        <option value="timeout">timeout: answers too late (after the 2 s client timeout), processes nothing</option>
-        <option value="process_then_timeout">process_then_timeout: processes, then answers too late</option>
-      </select>
-    </label>
-    <button id="save-mode" type="button">Save mode</button>
-    <button id="load-mode" type="button">Show current mode</button>
-    <pre id="receiver-status" aria-live="polite">Start a demo session to configure the receiver.</pre>
-  </section>
+    <section class="panel" aria-labelledby="scenarios-heading">
+      <h2 id="scenarios-heading">Guided scenarios</h2>
+      <p class="muted">Each scenario sets your receiver's mode and submits one event. Follow the steps and
+         compare what you see with the expected result.</p>
+      <div id="scenarios" class="scenarios"></div>
+    </section>
 
-  <section>
-    <h2>My events</h2>
-    <button id="refresh" type="button">Refresh list</button>
-    <ul id="event-list"></ul>
-  </section>
+    <div class="columns">
+      <section class="panel" aria-labelledby="receiver-heading">
+        <h2 id="receiver-heading">Your mock receiver</h2>
+        <form id="receiver-form">
+          <fieldset>
+            <legend>How should the receiver behave for your session?</legend>
+            <div id="receiver-modes" class="radio-list"></div>
+          </fieldset>
+        </form>
+        <p id="receiver-status" class="result" role="status" aria-live="polite"></p>
+      </section>
 
-  <script src="/health-check.js"></script>
-  <script src="/demo.js"></script>
+      <section class="panel" aria-labelledby="submit-heading">
+        <h2 id="submit-heading">Submit a synthetic event</h2>
+        <form id="event-form" novalidate>
+          <label for="title">Title <span class="muted">(1–100 characters)</span></label>
+          <input id="title" name="title" maxlength="100" required aria-describedby="title-error">
+          <p id="title-error" class="field-error" hidden></p>
+          <label for="message">Message <span class="muted">(1–500 characters)</span></label>
+          <textarea id="message" name="message" maxlength="500" rows="3" required aria-describedby="message-error"></textarea>
+          <p id="message-error" class="field-error" hidden></p>
+          <div class="button-row">
+            <button type="submit" id="submit-event" class="primary">Submit event</button>
+            <button type="button" id="new-example">Use another example</button>
+          </div>
+        </form>
+        <div id="submit-result" class="result" role="status" aria-live="polite"></div>
+      </section>
+    </div>
+
+    <div class="columns columns-wide">
+      <section class="panel" aria-labelledby="events-heading">
+        <h2 id="events-heading">Your events</h2>
+        <p id="poll-status" class="muted" role="status" aria-live="polite"></p>
+        <ul id="event-list" class="event-list"></ul>
+      </section>
+
+      <section class="panel" aria-labelledby="detail-heading">
+        <h2 id="detail-heading">Event details</h2>
+        <div id="detail" aria-live="polite"><p class="muted">Select an event to see its delivery history.</p></div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <p>Free hosting: the service sleeps after 15 minutes without traffic and takes about a minute to wake up.
+       Scheduled deliveries wait in the database until it is awake again.</p>
+  </footer>
+  <script src="/app.js"></script>
 </body>
 </html>

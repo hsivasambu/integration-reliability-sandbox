@@ -31,6 +31,19 @@ function createApp({ pool, config = {} } = {}) {
   app.disable('x-powered-by');
   app.set('trust proxy', settings.trustProxy);
 
+  // Browser hardening. The page keeps a demo token in sessionStorage, so it must only ever run
+  // its own same-origin scripts: no inline scripts, no third-party code, no framing.
+  app.use((req, res, next) => {
+    res.set({
+      'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; "
+        + "img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; "
+        + "frame-ancestors 'none'; object-src 'none'",
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+    });
+    next();
+  });
+
   // Liveness check: the process is running. Express answers HEAD with the
   // GET handler's status and headers but no body.
   app.get('/health', (req, res) => {

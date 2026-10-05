@@ -2,7 +2,7 @@
 
 A learning sandbox that will accept synthetic JSON events, persist them, and deliver them
 reliably to a controlled mock receiver.
-**Current stage: 8. Manual replay of a failed delivery.**
+**Current stage: 9. Browser UI for the full flow (sessions, events, retries, duplicates, replay).**
 
 ## Requirements
 
@@ -21,7 +21,8 @@ npm run dev:worker      # optional second terminal: standalone delivery worker (
 npm test                # all tests (database tests need TEST_DATABASE_URL)
 ```
 
-Open http://localhost:3000 and click **Check health**.
+Open http://localhost:3000. With `WORKER_ENABLED=true` in `.env` (or `npm run dev:worker` running), the page can
+run every scenario end to end.
 
 `npm run db:down` stops the database and keeps its data. To delete local data completely:
 `docker compose down -v`. That's the only destructive command, and nothing runs it automatically.
@@ -75,7 +76,7 @@ database only accepts connections from Render's private network (`ipAllowList: [
 
 | Method & path | Response |
 |---|---|
-| `GET /health` | `200 {"status":"ok","version":"0.8.0","inProcessWorker":true|false}` while the process runs (no database check) |
+| `GET /health` | `200 {"status":"ok","version":"0.9.0","inProcessWorker":true|false}` while the process runs (no database check) |
 | `HEAD /health` | `200`, headers only |
 | `GET /ready` | `200 {"status":"ready"}` if the database is reachable and migrated, otherwise `503` with `reason` |
 | `POST /v1/sessions` | `201` with a new demo token (shown once), `429` if rate limited, `503` at capacity |
@@ -90,7 +91,7 @@ database only accepts connections from Render's private network (`ipAllowList: [
 | `PUT /v1/receiver` | Body `{"mode": "<one of the four modes>"}`, which changes **your session's** mode |
 | `POST /internal/receiver/deliveries` | Mock receiver. Requires `Authorization: Bearer <RECEIVER_SECRET>`; `401` otherwise. Server-side callers only. |
 | Wrong method on any route above | `405` with an `Allow` header |
-| `GET /` | Landing page |
+| `GET /` | Browser UI (`public/index.html`, `app.js`, `app.css`) |
 | Anything else | `404 {"error":"not_found",...}` |
 
 API request bodies over 4 KB get `413`, and malformed JSON gets `400`.
@@ -199,6 +200,53 @@ Remove-Item event.json; Remove-Variable TOKEN
 ```
 
 The landing page has the same flow: **Start demo session**, **Submit event**, **Send same request again**, and **Refresh list**.
+
+## Browser UI
+
+A single page served by the same app (`public/`). It uses plain JavaScript with no framework or build step.
+
+| Area | What it shows |
+|---|---|
+| API status | `/health` + `/ready`, as in Stage 1 |
+| Demo session | Start / restart an anonymous session, its expiry, and how the token is stored |
+| Guided scenarios | Three one-click scenarios, with steps and the expected result |
+| Your mock receiver | The four modes as radio buttons (saved immediately, for your session only) |
+| Submit a synthetic event | A prefilled synthetic example, with validation and quota errors shown inline |
+| Your events | The 20 newest events, each with its delivery state, attempt *n* of 4, and next retry time |
+| Event details | Three separate lanes: **1. Accepted by the API** (202, idempotency key, *Submit duplicate*), **2. HTTP delivery** (every delivery and attempt, *Replay failed delivery*), **3. Receiver processing** (processed?, confirmation code, duplicates) |
+
+**Guided scenarios** (each sets the receiver mode and submits one event):
+1. **Recover from a temporary failure** (`server_error`, then *Switch receiver to success*). Expected: attempt 1
+   failed (503, retryable), attempt 2 delivered; the receiver processed once.
+2. **Prevent duplicate processing after a timeout** (`process_then_timeout`). Expected: attempt 1 timeout with no
+   response while the receiver already shows "processed"; attempt 2 delivered; the receiver shows 1 duplicate
+   and the same confirmation code.
+3. **Replay after retry exhaustion** (`server_error` for about 15 s, then success and *Replay*). Expected: the
+   original delivery stays failed with 4 attempts; Replay 1 is delivered on attempt 1.
+
+**Refreshing.** While any delivery is pending, retrying or in progress, the page refreshes every 2 s
+(the event list, receiver counts, and the selected event's details). There's at most one refresh in flight,
+and requests made meanwhile are queued, not overlapped. Refreshing stops when all work is finished,
+pauses while the tab is hidden, refreshes immediately when it's visible again, and backs off (4 s, 8 s, … up
+to 30 s) when the API can't be reached, with a *Retry now* button.
+
+**Cold starts.** If a request takes longer than 4 s, a notice explains that the free instance may be waking
+up (about a minute) and that nothing has failed. A request only counts as failed after 90 s with no answer,
+or when no API response arrives at all. Waiting is never shown as a delivery failure: delivery state always
+comes from the server.
+
+**Session handling.** The token lives in this tab's `sessionStorage` (survives reload, gone when the tab
+closes, never in a URL). If the API answers 401, the page clears it and offers *Start a new session*. It
+never creates sessions on its own. Any script on the page could read the token, which is acceptable for an
+anonymous 24-hour demo credential but not for real accounts (`HttpOnly` cookies would be used). To limit that
+risk:
+- The server sends a strict `Content-Security-Policy` (`script-src 'self'`, no inline scripts or styles, no
+  framing), plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+- The page builds all content with DOM text nodes; server text is never inserted as HTML.
+
+**Accessibility.** Real buttons, labelled form fields and a fieldset/legend for the modes. `aria-live`
+status regions, a visible focus outline, and a skip link. Keyboard focus is kept on the same control when the
+2-second refresh re-renders the list. The layout is a single column on phones and two columns from about 830 px.
 
 ## Delivery worker
 

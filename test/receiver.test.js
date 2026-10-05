@@ -188,7 +188,7 @@ describe('mock receiver', { skip }, () => {
 
     test('the secret never appears in browser-facing responses', async () => {
       const session = await newSession();
-      for (const path of ['/', '/demo.js', '/health-check.js']) {
+      for (const path of ['/', '/app.js', '/app.css']) {
         const res = await request(server).get(path);
         assert.ok(!res.text.includes(SECRET), path);
       }
