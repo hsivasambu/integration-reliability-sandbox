@@ -1023,4 +1023,13 @@ with DevTools `Fetch`)**
 - Very long outages: polling backs off to 30 s as before, so the countdown can sit at *Waiting* for that long
   after reconnecting.
 
+**Deployed check (2026-10-05, by Claude, after pushing 7535ab8).** `/journey-model.js` was served about 30 s after the
+push; `/ready` 200.
+- Stage 14 suite against Render: **41/41**. This included the held POST, offline during a retry (stale banner, then
+  *Waiting* at zero, never *Stopped*), failed receipt requests (*Unknown*), the cancelled late answer on a selection
+  change, the reload snapshot, the session switch with held old-session answers (no flash), and exhaustion and
+  replay.
+- Stage 13 suite: 56/56. Stage 12 flow suite: 35/36 (the same expected browser network log).
+- The checks created about 7 sessions and 18 synthetic alerts.
+
 
