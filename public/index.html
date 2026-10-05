@@ -53,6 +53,22 @@
   </section>
 
   <section>
+    <h2>Mock receiver mode</h2>
+    <p>Choose how this session's simulated destination behaves. It applies to your session only.
+       The receiver is not connected to event delivery yet.</p>
+    <label>Mode
+      <select id="receiver-mode">
+        <option value="success">success: answers 200 immediately</option>
+        <option value="server_error">server_error: answers 503, processes nothing</option>
+        <option value="timeout">timeout: answers too late (after the 2 s client timeout)</option>
+      </select>
+    </label>
+    <button id="save-mode" type="button">Save mode</button>
+    <button id="load-mode" type="button">Show current mode</button>
+    <pre id="receiver-status" aria-live="polite">Start a demo session to configure the receiver.</pre>
+  </section>
+
+  <section>
     <h2>My events</h2>
     <button id="refresh" type="button">Refresh list</button>
     <ul id="event-list"></ul>

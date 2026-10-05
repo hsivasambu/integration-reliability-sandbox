@@ -2,7 +2,7 @@
 
 A learning sandbox that will accept synthetic JSON events, persist them, and deliver them
 reliably to a controlled mock receiver.
-**Current stage: 3. Session-scoped event API with idempotent submission (no delivery yet).**
+**Current stage: 4. Mock receiver with per-session simulated outcomes (not yet connected to delivery).**
 
 ## Requirements
 
@@ -13,7 +13,7 @@ reliably to a controlled mock receiver.
 
 ```sh
 npm ci                  # install exact versions from package-lock.json
-cp .env.example .env    # then replace the placeholder password (3 places, same value)
+cp .env.example .env    # then replace the placeholder password (3 places) and RECEIVER_SECRET
 npm run db:up           # start local Postgres (port 5433) and wait until healthy
 npm run dev:migrate     # apply database migrations
 npm run dev             # start the app with .env loaded
@@ -40,6 +40,10 @@ The server refuses to start, and lists every problem, if required settings are m
 | `MAX_ACTIVE_SESSIONS` | `1000` | Cap on unexpired sessions across all clients |
 | `MAX_EVENTS_PER_SESSION` | `100` | Events one session may create (1–10000) |
 | `TRUST_PROXY` | `0` | Number of reverse proxies in front of the app (`1` on Render) |
+| `RECEIVER_SECRET` | **required** | Server-side secret for internal receiver calls (32+ characters, no spaces) |
+| `RECEIVER_URL` | `http://127.0.0.1:$PORT/internal/receiver/deliveries` | Fixed delivery destination (server config only) |
+| `DELIVERY_TIMEOUT_MS` | `2000` | How long the delivery client waits for an answer |
+| `RECEIVER_SLOW_RESPONSE_MS` | `4000` | Delay used by `timeout` mode. Must exceed `DELIVERY_TIMEOUT_MS`. |
 | `TEST_DATABASE_URL` | unset | Test database. Its name must end in `_test` because tests wipe it. |
 
 ## Database migrations
@@ -63,7 +67,7 @@ database only accepts connections from Render's private network (`ipAllowList: [
 
 | Method & path | Response |
 |---|---|
-| `GET /health` | `200 {"status":"ok","version":"0.3.0"}` while the process runs (no database check) |
+| `GET /health` | `200 {"status":"ok","version":"0.4.0"}` while the process runs (no database check) |
 | `HEAD /health` | `200`, headers only |
 | `GET /ready` | `200 {"status":"ready"}` if the database is reachable and migrated, otherwise `503` with `reason` |
 | `POST /v1/sessions` | `201` with a new demo token (shown once), `429` if rate limited, `503` at capacity |
@@ -71,6 +75,9 @@ database only accepts connections from Render's private network (`ipAllowList: [
 | `POST /v1/events` | `201` new event (stored, **pending, not delivered**); `200` identical repeat; `409` key reused with different payload; see [Events](#events) |
 | `GET /v1/events?limit=&cursor=` | `200 {"data":[...],"nextCursor"}`: your session's events, newest first |
 | `GET /v1/events/{id}` | `200 {"event"}` if it belongs to your session, otherwise `404` |
+| `GET /v1/receiver` | `200 {"mode","availableModes","receivedCount",...}`: your session's mock receiver settings |
+| `PUT /v1/receiver` | Body `{"mode":"success"|"server_error"|"timeout"}`, which changes **your session's** mode |
+| `POST /internal/receiver/deliveries` | Mock receiver. Requires `Authorization: Bearer <RECEIVER_SECRET>`; `401` otherwise. Server-side callers only. |
 | Wrong method on any route above | `405` with an `Allow` header |
 | `GET /` | Landing page |
 | Anything else | `404 {"error":"not_found",...}` |
@@ -171,6 +178,59 @@ Remove-Item event.json; Remove-Variable TOKEN
 
 The landing page has the same flow: **Start demo session**, **Submit event**, **Send same request again**, and **Refresh list**.
 
+## Mock receiver
+
+A stand-in for the external system that events will be delivered to. It isn't connected to the
+event API yet, so events stay `pending`. It lives at `POST /internal/receiver/deliveries` in the same app.
+
+**Who can call it.** Only server-side code holding `RECEIVER_SECRET`. The secret exists only in server
+environment variables. It's never sent to browsers, logged, or committed. The caller's destination is
+fixed by `RECEIVER_URL` (by default the app's own loopback address), redirects are refused, and
+visitors can never supply a URL. Request bodies are limited to 4 KB, and unknown fields get `422`.
+
+**Modes, per demo session** (stored in PostgreSQL table `receiver_settings`; default `success`):
+
+| Mode | Receiver behaviour | What the delivery client reports |
+|---|---|---|
+| `success` | Records a receipt, answers `200` immediately | `delivered`, HTTP 200 |
+| `server_error` | Answers `503` + `Retry-After: 1` immediately, records nothing | `http_error`, HTTP 503 |
+| `timeout` | Waits 4 s (asynchronously), then answers `503 simulated_slow_response`, records nothing | `timeout` after 2 s, no HTTP status |
+
+Set the mode with `PUT /v1/receiver` (your session token) or the **Mock receiver mode** panel on the
+landing page. One visitor's mode never affects another's.
+
+**503 vs timeout.** A **503** is an answer: the receiver says "I'm unavailable right now", quickly and
+unambiguously, and the caller knows nothing was processed. A **timeout** is the *absence* of an answer
+within the caller's limit. The caller can't tell whether the request was lost, is still being worked on,
+or was processed but the reply got lost. That uncertainty is why retries need idempotency.
+
+**If the caller gives up**, the receiver notices the closed connection, cancels its pending timer, and
+never writes a late response. No timers or errors are left behind. The wait uses an async timer, so
+`/health` and other requests keep being served while a slow response is pending.
+
+### Try it locally
+
+```sh
+npm run dev                 # terminal 1
+npm run receiver:try        # terminal 2: one real HTTP delivery per mode
+npm run receiver:try -- timeout
+```
+
+Expected (timings vary):
+
+```
+success       -> delivered     HTTP 200     25 ms  received
+server_error  -> http_error    HTTP 503     21 ms  simulated_server_error
+timeout       -> timeout       HTTP -     2007 ms  no response within 2000 ms
+
+Receipts recorded by the receiver: 1 (only 'success' processes deliveries)
+```
+
+The script creates a throwaway session directly in the database, so it needs `DATABASE_URL` and
+`RECEIVER_SECRET` from `.env` and the app running on `PORT`. It can't run against Render: there's no
+shell on free instances, and the database is private. That's intended, because only server-side code may
+call the receiver.
+
 ## Checks (replace BASE with `http://localhost:3000` or your Render URL)
 
 ```sh
@@ -193,6 +253,7 @@ On Windows PowerShell, type `curl.exe` instead of `curl` (`curl` is an alias for
 | `401 missing_token` / `invalid_token` | No `Authorization: Bearer` header / token unknown, malformed, or expired |
 | `404` on `/v1/events/{id}` | No such event **for your session**. Other sessions' events look identical to missing ones. |
 | `409 idempotency_key_conflict` | You reused an Idempotency-Key for a different event. Generate a new key. |
+| `401 receiver_unauthorized` | Call to `/internal/receiver/...` without the server-side secret. Expected for any browser or visitor. |
 | curl `Failed to connect` / exit code 7, browser "can't be reached" | **Nothing is listening** (server not running, wrong port/host) |
 | curl exit 6 `Could not resolve host` | Wrong hostname / typo in URL |
 | Render `502`/`503` or HTML "service waking up" page | Render can't reach a healthy app (crashed, still starting, or free instance spinning up) |
@@ -212,7 +273,8 @@ then listens. Check `/health` and `/ready` once the deploy shows **Live**.
    web service), plan **Free**.
 2. Copy its **Internal Database URL**.
 3. Web service → **Environment**: add `DATABASE_URL` (paste the URL; Render keeps it secret),
-   `MIGRATE_ON_START=true`, `TRUST_PROXY=1`. Save, and Render redeploys.
+   `MIGRATE_ON_START=true`, `TRUST_PROXY=1`, and `RECEIVER_SECRET` (click **Generate**, or paste a
+   32+ character random value). Save, and Render redeploys.
 
 | Setting | Value | Why |
 |---|---|---|

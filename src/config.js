@@ -24,6 +24,13 @@ function loadConfig(env = process.env) {
     problems.push('DATABASE_URL must start with postgres:// or postgresql://');
   }
 
+  const receiverSecret = env.RECEIVER_SECRET;
+  if (!receiverSecret) {
+    problems.push('RECEIVER_SECRET is required (a random string of at least 32 characters)');
+  } else if (receiverSecret.length < 32 || /\s/.test(receiverSecret)) {
+    problems.push('RECEIVER_SECRET must be at least 32 characters with no spaces');
+  }
+
   const config = {
     port: intSetting(env, 'PORT', 3000, 1, 65535, problems),
     // Hosting platforms such as Render require listening on all interfaces.
@@ -39,7 +46,24 @@ function loadConfig(env = process.env) {
     },
     maxActiveSessions: intSetting(env, 'MAX_ACTIVE_SESSIONS', 1000, 1, 100_000, problems),
     maxEventsPerSession: intSetting(env, 'MAX_EVENTS_PER_SESSION', 100, 1, 10_000, problems),
+    receiverSecret,
+    // How long the delivery client waits for the receiver before giving up.
+    deliveryTimeoutMs: intSetting(env, 'DELIVERY_TIMEOUT_MS', 2000, 500, 10_000, problems),
+    // How long the mock receiver's 'timeout' mode waits before answering.
+    receiverSlowResponseMs: intSetting(env, 'RECEIVER_SLOW_RESPONSE_MS', 4000, 1000, 10_000, problems),
   };
+
+  if (config.receiverSlowResponseMs <= config.deliveryTimeoutMs) {
+    problems.push('RECEIVER_SLOW_RESPONSE_MS must be longer than DELIVERY_TIMEOUT_MS, or timeouts cannot be simulated');
+  }
+
+  // Delivery destination is fixed by server configuration. By default the app calls its own
+  // mock receiver over loopback, which also works on Render.
+  config.receiverUrl = env.RECEIVER_URL
+    || `http://127.0.0.1:${config.port}/internal/receiver/deliveries`;
+  if (!/^https?:\/\/\S+$/.test(config.receiverUrl)) {
+    problems.push('RECEIVER_URL must be an http:// or https:// URL');
+  }
 
   if (problems.length > 0) {
     throw new ConfigError(`Invalid configuration:\n  - ${problems.join('\n  - ')}`);

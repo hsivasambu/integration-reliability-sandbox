@@ -29,6 +29,15 @@ services:
         value: "24"
       - key: MAX_EVENTS_PER_SESSION
         value: "100"
+      # Secret for internal mock receiver calls. Render generates a random value once;
+      # it is never committed and never sent to browsers.
+      - key: RECEIVER_SECRET
+        generateValue: true
+      - key: DELIVERY_TIMEOUT_MS
+        value: "2000"
+      - key: RECEIVER_SLOW_RESPONSE_MS
+        value: "4000"
+      # RECEIVER_URL is not set: the app calls its own receiver at http://127.0.0.1:$PORT.
     # PORT is set by Render (default 10000); HOST defaults to 0.0.0.0 in code.
     # Node version comes from .node-version (24).
 

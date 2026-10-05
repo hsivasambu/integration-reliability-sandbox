@@ -6,6 +6,7 @@ const { createRateLimiter } = require('./rate-limit');
 const { pendingMigrations } = require('./migrate');
 const { requireSession } = require('./auth');
 const { eventRoutes } = require('./events');
+const { receiverRoutes, receiverSettingsRoutes } = require('./receiver');
 const { sendError, methodNotAllowed } = require('./errors');
 
 const DEFAULTS = {
@@ -14,6 +15,8 @@ const DEFAULTS = {
   sessionRateLimit: { max: 10, windowMs: 60 * 60_000 },
   maxActiveSessions: 1000,
   maxEventsPerSession: 100,
+  receiverSecret: undefined, // without a secret, every receiver call is rejected
+  receiverSlowResponseMs: 4000,
 };
 
 function createApp({ pool, config = {} } = {}) {
@@ -83,6 +86,12 @@ function createApp({ pool, config = {} } = {}) {
   app.all('/v1/session', methodNotAllowed(['GET', 'HEAD']));
 
   app.use('/v1', eventRoutes(pool, settings));
+  app.use('/v1', receiverSettingsRoutes(pool));
+
+  // Mock receiver for server-side callers only (protected by RECEIVER_SECRET).
+  const receiver = receiverRoutes(pool, settings);
+  app.locals.receiverStats = receiver.stats;
+  app.use('/internal', receiver);
 
   app.use(express.static(path.join(__dirname, '..', 'public')));
 

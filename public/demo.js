@@ -97,3 +97,22 @@ $('refresh').addEventListener('click', async () => {
   }
   list.replaceChildren(...items);
 });
+
+function showReceiver(response, data) {
+  $('receiver-status').textContent = response.status === 200
+    ? `Mode: ${data.mode}\nDeliveries processed by the receiver: ${data.receivedCount}\n${data.notice}`
+    : `HTTP ${response.status}: ${data?.message ?? 'error'}`;
+  if (response.status === 200) $('receiver-mode').value = data.mode;
+}
+
+$('load-mode').addEventListener('click', async () => {
+  if (!token) return void ($('receiver-status').textContent = 'Start a demo session first.');
+  const { response, data } = await api('GET', '/v1/receiver');
+  showReceiver(response, data);
+});
+
+$('save-mode').addEventListener('click', async () => {
+  if (!token) return void ($('receiver-status').textContent = 'Start a demo session first.');
+  const { response, data } = await api('PUT', '/v1/receiver', { body: { mode: $('receiver-mode').value } });
+  showReceiver(response, data);
+});
