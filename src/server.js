@@ -38,6 +38,8 @@ async function main() {
       pollIntervalMs: config.workerPollIntervalMs,
       leaseMs: config.deliveryLeaseMs,
       maxAttempts: config.deliveryMaxAttempts,
+      retryBaseDelayMs: config.retryBaseDelayMs,
+      concurrency: config.workerConcurrency,
     });
     server.once('listening', () => worker.start());
   } else {

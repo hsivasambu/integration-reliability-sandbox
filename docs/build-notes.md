@@ -258,3 +258,61 @@ the env var: `/health` showed `inProcessWorker: true`. Results with the worker r
 This is the first confirmation that the app's loopback call to its own receiver
 (`http://127.0.0.1:10000/...`) works on Render. Not confirmed: whether the very first pending event was later
 delivered by the new instance. Its session token wasn't kept. The restart test covers that behaviour.
+
+## Stage 6: Durable retry scheduling and terminal failure (2026-10-04)
+
+**Decisions**
+- **Policy in one file** (`src/retry-policy.js`):
+  - Retry: timeouts, transport/connection errors (including a refused redirect), 408, 429, and 5xx.
+  - Terminal: any other 4xx (`failure_reason = non_retryable`).
+  - Delay: `RETRY_BASE_DELAY_MS × 2^(n−1)` = 2/4/8 s.
+  - `DELIVERY_MAX_ATTEMPTS = 4` total. After the 4th, the delivery fails with `attempts_exhausted`.
+  - No retry framework: three small functions.
+- **Migration 005.** Adds the `retry_scheduled` state and renames `available_at` → `next_attempt_at`. Adds
+  `deliveries.failure_reason` (`non_retryable` / `attempts_exhausted`; NULL for Stage 5 failures) and
+  `delivery_attempts.retryable`. The due-work partial index now covers `pending` and `retry_scheduled`.
+- **The database owns the schedule.** Completion writes `state`, `next_attempt_at = now + delay`, and the
+  attempt row in one statement. Workers claim `WHERE next_attempt_at <= now`. No in-memory timers hold
+  schedule state.
+- **Controllable clock.** Every time comparison in `delivery-store.js` uses
+  `coalesce($now::timestamptz, now())`. Production passes NULL (database clock, shared by all workers);
+  tests pass a fake time, so the 2+4+8 s schedule runs in milliseconds.
+- **Uncertain vs confirmed.**
+  - A confirmed failure is attempt `failed` + `error_category`; it gets backoff.
+  - A lost lease is attempt `lease_expired`: delivery back to `pending`, due immediately, no backoff.
+  - Both consume `attempt_count`, so the limit of 4 holds across crashes.
+- **Concurrency.** `WORKER_CONCURRENCY` (default 2) caps in-flight deliveries per worker. One polling run
+  at a time (`polling` flag). The loop wakes on the poll interval or when a slot frees, and the idle timer
+  is cleared when a slot frees first.
+- **API.** The delivery summary (on events and at the status URL) adds `maxAttempts`, `nextAttemptAt` (only
+  while `pending`/`retry_scheduled`), and `failureReason`. Attempts add `retryable`.
+- **Deterministic delays.** Jitter is explained in the README but not implemented. `Retry-After` is
+  documented as not yet honoured; the mock receiver's `Retry-After: 1` is ignored.
+
+**Verification (local, Node 22.18.0, Postgres 18.6)**
+- `npm test`: 91/91 pass, 5 consecutive clean full runs.
+  - 3 Stage 5 worker tests updated: a 503 or timeout is now `retry_scheduled`, not `failed`.
+  - 3 new policy unit tests (no DB).
+  - 7 new controllable-clock tests:
+    - immediate success
+    - server_error → success: next retry exactly t0+2000 ms in the API; not due at +1999 ms; delivered
+      on attempt 2 after the mode switch
+    - exhaustion: gaps exactly [2000, 4000, 8000], then `failed`/`attempts_exhausted`, no 5th attempt
+    - terminal 404 (expired session): 1 attempt, `non_retryable`, `retryable=false`
+    - restart during a scheduled retry: schedule verified in the DB row; a fresh pool and worker loop
+      leaves it alone before due and delivers it after the clock advances
+    - 3 crash recoveries (each `pending` and due immediately), then a real 503 on attempt 4 →
+      `attempts_exhausted`
+    - concurrency: 5 slow deliveries, concurrency 2, plus 3 concurrent extra `poll()` calls every 20 ms;
+      max in progress = 2
+- Mutation check: removing the `polling` guard let 3 deliveries run at once; the concurrency test caught
+  it in 2 of 3 runs (the race is timing-dependent).
+- Live (port 3130, real 2/4/8 s timing, worker enabled):
+  1. server_error, then switched to success: attempt 1 503 at :52.1, retry shown for :54.2, attempt 2
+     delivered at :54.3.
+  2. server_error throughout: attempts at :57.6, :59.7, :03.9, :12.3 (gaps of about 2.1, 4.2, 8.4 s; the
+     extra is poll granularity), then `failed` / `attempts_exhausted`.
+  3. Restart: after attempt 1, stopped the server (attempt 2 ran just before the stop took effect).
+     Attempt 3 fell due while the server was down. A worker-disabled restart left it `retry_scheduled`.
+     A worker-enabled restart sent the overdue retry about 1.5 s after start, and it was delivered (receiver
+     switched to success).

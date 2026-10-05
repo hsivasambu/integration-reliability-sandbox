@@ -22,6 +22,8 @@ const worker = createWorker({
   pollIntervalMs: config.workerPollIntervalMs,
   leaseMs: config.deliveryLeaseMs,
   maxAttempts: config.deliveryMaxAttempts,
+  retryBaseDelayMs: config.retryBaseDelayMs,
+  concurrency: config.workerConcurrency,
 });
 
 console.log(`Worker process delivering to ${config.receiverUrl}`);

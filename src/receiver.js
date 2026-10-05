@@ -124,7 +124,7 @@ function receiverSettingsRoutes(pool) {
       availableModes: MODES,
       updatedAt: settings.updated_at,
       receivedCount: count,
-      notice: 'The delivery worker sends your events here. Each event gets one attempt (no automatic retries yet).',
+      notice: 'The delivery worker sends your events here, retrying timeouts, 408, 429 and 5xx up to 4 attempts in total.',
     };
   }
 

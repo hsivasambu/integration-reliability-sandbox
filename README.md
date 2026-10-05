@@ -2,7 +2,7 @@
 
 A learning sandbox that will accept synthetic JSON events, persist them, and deliver them
 reliably to a controlled mock receiver.
-**Current stage: 5. Background worker makes one delivery attempt per event (no automatic retries yet).**
+**Current stage: 6. Durable retry scheduling (4 attempts: 2 s, 4 s, 8 s) and terminal failure.**
 
 ## Requirements
 
@@ -48,7 +48,9 @@ The server refuses to start, and lists every problem, if required settings are m
 | `WORKER_ENABLED` | `false` | `true` runs the delivery worker inside the web process (`true` on Render) |
 | `WORKER_POLL_INTERVAL_MS` | `1000` | How often an idle worker checks for due deliveries |
 | `DELIVERY_LEASE_MS` | `15000` | How long a claim lasts before another worker may take over. At least `DELIVERY_TIMEOUT_MS` + 1000. |
-| `DELIVERY_MAX_ATTEMPTS` | `3` | Cap on claims per delivery (currently only reached through lease recovery) |
+| `DELIVERY_MAX_ATTEMPTS` | `4` | Total attempts per delivery, including the first and any lost to crashes |
+| `RETRY_BASE_DELAY_MS` | `2000` | Retry *n* waits base × 2^(n−1): 2 s, 4 s, 8 s |
+| `WORKER_CONCURRENCY` | `2` | Deliveries one worker sends at the same time (1–10) |
 | `TEST_DATABASE_URL` | unset | Test database. Its name must end in `_test` because tests wipe it. |
 
 ## Database migrations
@@ -80,7 +82,7 @@ database only accepts connections from Render's private network (`ipAllowList: [
 | `POST /v1/events` | `202` accepted for asynchronous delivery (`eventId`, `statusUrl`); `200` identical repeat; `409` key reused with different payload; see [Events](#events) |
 | `GET /v1/events?limit=&cursor=` | `200 {"data":[...],"nextCursor"}`: your session's events, newest first |
 | `GET /v1/events/{id}` | `200 {"event"}` (including a `delivery` summary) if it belongs to your session, otherwise `404` |
-| `GET /v1/events/{id}/deliveries` | `200` delivery state and attempt history for your session's event, otherwise `404` |
+| `GET /v1/events/{id}/deliveries` | `200` delivery state, `nextAttemptAt`, `failureReason`, and attempt history for your session's event, otherwise `404` |
 | `GET /v1/receiver` | `200 {"mode","availableModes","receivedCount",...}`: your session's mock receiver settings |
 | `PUT /v1/receiver` | Body `{"mode":"success"|"server_error"|"timeout"}`, which changes **your session's** mode |
 | `POST /internal/receiver/deliveries` | Mock receiver. Requires `Authorization: Bearer <RECEIVER_SECRET>`; `401` otherwise. Server-side callers only. |
@@ -197,8 +199,8 @@ The landing page has the same flow: **Start demo session**, **Submit event**, **
 
 ## Delivery worker
 
-A background worker takes each accepted event and makes **one** HTTP attempt to the mock receiver. If
-it fails, the delivery stays failed; automatic retries come in a later stage.
+A background worker delivers each accepted event to the mock receiver and retries failures on a schedule
+stored in PostgreSQL, up to 4 attempts in total.
 
 **Where it runs.** On Render, inside the web process (`WORKER_ENABLED=true`), so there's no extra hosted
 service. Locally, either set `WORKER_ENABLED=true` or run `npm run dev:worker` (`src/worker-main.js`) next
@@ -207,28 +209,64 @@ to `npm run dev`. Several workers can run at once safely.
 **How it works.** The code lives in three modules: `src/events.js` (API), `src/worker.js` (loop) +
 `src/delivery-store.js` (SQL), and `src/delivery-client.js` (HTTP).
 
-1. **Poll.** Every `WORKER_POLL_INTERVAL_MS` (1 s), or immediately after finishing a job.
+1. **Poll.** Every `WORKER_POLL_INTERVAL_MS` (1 s), or as soon as an in-flight delivery frees a slot. Only one
+   polling run happens at a time, and at most `WORKER_CONCURRENCY` (2) deliveries are in flight per worker.
 2. **Recover.** Any delivery whose lease has expired goes back to `pending`, and its unfinished attempt is
-   labelled `lease_expired` (result unknown). After `DELIVERY_MAX_ATTEMPTS` claims it fails instead.
-3. **Claim.** One SQL statement picks the oldest due `pending` delivery (`FOR UPDATE SKIP LOCKED`, so
+   labelled `lease_expired` (result unknown). It's due again immediately, with no backoff, because nothing confirmed
+   a failure. It still counts toward `DELIVERY_MAX_ATTEMPTS`; at the limit the delivery fails (`attempts_exhausted`).
+3. **Claim.** One SQL statement picks the earliest due `pending` or `retry_scheduled` delivery (`next_attempt_at <= now`) (`FOR UPDATE SKIP LOCKED`, so
    competing workers never pick the same one), sets it `in_progress` with a fresh random `claim_token` and
    a lease of `DELIVERY_LEASE_MS` (15 s), and inserts the attempt row. **The attempt is recorded before anything is sent.**
 4. **Send.** A plain HTTP request with a 2 s timeout. No database transaction is open during the request.
-5. **Complete.** One SQL statement records the outcome. It only applies `WHERE claim_token = <mine>`, so a
-   worker that lost its lease can't overwrite a newer claim's result.
-6. **Stop.** On `SIGTERM`, the worker stops claiming, lets the in-flight attempt finish and record its
-   result (at most 2 s), and then the process exits.
+5. **Complete.** `src/retry-policy.js` decides the next state, and one SQL statement records it. It only
+   applies `WHERE claim_token = <mine>`, so a worker that lost its lease can't overwrite a newer claim's result.
+6. **Stop.** On `SIGTERM`, the worker stops claiming, lets in-flight attempts finish and record their
+   results (at most 2 s), and then the process exits. Scheduled retries stay in the database.
 
 | Delivery `state` | Meaning |
 |---|---|
-| `pending` | Waiting for a worker |
+| `pending` | Waiting for its first attempt (or re-queued after a lost lease) |
+| `retry_scheduled` | A retryable attempt failed; the next attempt is due at `nextAttemptAt` |
 | `in_progress` | Claimed; an attempt is under way |
-| `delivered` | The receiver answered 2xx (delivered **at the HTTP level**) |
-| `failed` | The attempt got a non-2xx, timed out, or couldn't connect (no retries yet) |
+| `delivered` | The receiver answered 2xx (delivered **at the HTTP level**). Final. |
+| `failed` | Final. `failureReason` is `non_retryable` (e.g. 404) or `attempts_exhausted` (4 attempts used) |
 
 Each attempt records `attemptNumber`, `outcome` (`in_progress`, `delivered`, `failed`, `lease_expired`),
 `startedAt`, `endedAt`, `responseStatus` (when a response arrived), `errorCategory` (`http_error`, `timeout`,
-`network_error`, `lease_expired`), and `durationMs`. See them at `GET /v1/events/{id}/deliveries`.
+`network_error`, `lease_expired`), `retryable`, and `durationMs`. See them at `GET /v1/events/{id}/deliveries`.
+
+### Retries
+
+All classification lives in `src/retry-policy.js`:
+
+| Attempt result | Retried? |
+|---|---|
+| 2xx | No: delivered |
+| Timeout, connection failure, refused redirect | Yes |
+| HTTP 408, 429, 5xx | Yes |
+| Any other 4xx (400, 401, 403, 404, 422, …) | No: `failed` / `non_retryable` (the request itself is wrong; repeating it won't help) |
+
+Attempt 1 happens right away; retries follow 2 s, 4 s and 8 s after each failure (`RETRY_BASE_DELAY_MS` × 2^(n−1)).
+After attempt 4 the delivery is `failed` / `attempts_exhausted`. While waiting, the API shows `state:
+"retry_scheduled"` and `nextAttemptAt`.
+
+**The database owns the schedule.** Each failure writes `next_attempt_at`, `attempt_count` and `state`. No
+in-memory timer remembers it. The poll timer only wakes the worker to ask PostgreSQL "what is due now?".
+If the process restarts (or sleeps on the free plan), overdue retries are sent as soon as a worker runs again.
+
+**Uncertain vs confirmed failures.** A `failed` attempt is a *confirmed* result (a status code, a timeout, or a
+refused connection) and follows the backoff schedule. A `lease_expired` attempt means the worker vanished
+and *nobody knows* what happened. It's re-queued immediately and isn't treated as a failure, but it still
+uses one of the 4 attempts, so a crash loop can't send unbounded copies.
+
+**Why larger systems add jitter.** With fixed delays, every delivery that failed during the same outage
+retries at the same instants (2 s, 6 s, 14 s later). That synchronised wave can knock a recovering receiver
+straight back down (a "thundering herd"). Production systems usually randomise each delay (for example
+"full jitter": a random wait between 0 and the computed delay) to spread the load. This demo keeps delays
+deterministic so the timeline is easy to follow.
+
+**Not implemented yet: `Retry-After`.** The mock receiver sends `Retry-After: 1` with its 503, and real 429/503
+responses often include one. The worker currently ignores it and uses its own schedule.
 
 **At-least-once, not exactly-once.** If a worker crashes *after* the receiver processed a delivery but
 *before* it recorded the result, the lease expires and another worker sends it again. The receiver then
@@ -240,7 +278,7 @@ done. Duplicate handling on the receiving side comes in a later stage.
 | | `WORKER_ENABLED=false` (and no `dev:worker`) | `WORKER_ENABLED=true` |
 |---|---|---|
 | `POST /v1/events` | `202`, delivery `pending` | `202`, delivery `pending` |
-| A few seconds later | Still `pending`, no attempts | `delivered` / `failed`, with one attempt |
+| A few seconds later | Still `pending`, no attempts | `delivered`, `retry_scheduled`, or `failed`, with its attempts |
 | Start `npm run dev:worker` | Pending work is picked up and delivered | (also fine; workers share safely) |
 
 On Render's free plan the instance sleeps after 15 minutes without inbound traffic, and the worker sleeps

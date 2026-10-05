@@ -36,8 +36,8 @@
   <section>
     <h2>Submit a synthetic event</h2>
     <p class="note"><strong>Accepted is not delivered.</strong> A <code>202 Accepted</code> means the event
-       is stored durably and queued. A background worker then makes one delivery attempt to the mock receiver.
-       Use <em>Check delivery</em> to see what happened.</p>
+       is stored durably and queued. A background worker delivers it to the mock receiver, retrying failures
+       after 2, 4 and 8 seconds (4 attempts in total). Use <em>Check delivery</em> to follow it.</p>
     <form id="event-form">
       <label>Title (max 100 characters)
         <input id="title" name="title" maxlength="100" required value="Synthetic test notification">

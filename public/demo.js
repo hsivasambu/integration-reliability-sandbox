@@ -127,12 +127,17 @@ $('check-delivery').addEventListener('click', async () => {
     return;
   }
   const { delivery } = data;
-  const lines = [`Delivery state: ${delivery.state}`];
+  const lines = [`Delivery state: ${delivery.state} (attempt ${delivery.attemptCount} of ${delivery.maxAttempts})`];
   if (delivery.state === 'pending') lines.push('Waiting for the worker to pick it up.');
+  if (delivery.nextAttemptAt && delivery.state === 'retry_scheduled') {
+    lines.push(`Next retry at ${new Date(delivery.nextAttemptAt).toLocaleTimeString()}`);
+  }
+  if (delivery.failureReason) lines.push(`Failed permanently: ${delivery.failureReason}`);
   for (const a of delivery.attempts) {
     lines.push(`Attempt ${a.attemptNumber}: ${a.outcome}`
       + (a.responseStatus ? ` | HTTP ${a.responseStatus}` : '')
       + (a.errorCategory ? ` | ${a.errorCategory}` : '')
+      + (a.retryable === true ? ' | retryable' : a.retryable === false ? ' | not retryable' : '')
       + (a.durationMs !== null ? ` | ${a.durationMs} ms` : ''));
   }
   $('event-result').textContent = lines.join('\n');

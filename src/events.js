@@ -22,7 +22,8 @@ const MESSAGE_FORBIDDEN = /[\u0000-\u0009\u000B-\u001F\u007F]/;
 // Event data plus a summary of its delivery job (delivery state lives only in `deliveries`).
 const EVENT_SELECT = `
   SELECT e.id, e.seq, e.type, e.payload, e.idempotency_key, e.request_hash,
-         e.created_at, e.updated_at, d.state AS delivery_state, d.attempt_count
+         e.created_at, e.updated_at, d.state AS delivery_state, d.attempt_count,
+         d.next_attempt_at, d.failure_reason
   FROM events e JOIN deliveries d ON d.event_id = e.id`;
 
 const isPlainObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -79,7 +80,7 @@ function canonicalJson(value) {
 
 const requestHash = (event) => crypto.createHash('sha256').update(canonicalJson(event)).digest();
 
-function toResource(row) {
+function toResource(row, maxAttempts) {
   return {
     id: row.id,
     type: row.type,
@@ -87,15 +88,24 @@ function toResource(row) {
     idempotencyKey: row.idempotency_key,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    delivery: {
-      state: row.delivery_state,
-      attemptCount: row.attempt_count,
-      statusUrl: statusUrl(row.id),
-    },
+    delivery: deliverySummary(row.delivery_state, row, maxAttempts, row.id),
   };
 }
 
 const statusUrl = (eventId) => `/v1/events/${eventId}/deliveries`;
+
+// Delivery fields shared by the event resource and the deliveries endpoint.
+// nextAttemptAt is only shown while the delivery is waiting for an attempt.
+function deliverySummary(state, row, maxAttempts, eventId) {
+  return {
+    state,
+    attemptCount: row.attempt_count,
+    maxAttempts,
+    nextAttemptAt: ['pending', 'retry_scheduled'].includes(state) ? row.next_attempt_at : null,
+    failureReason: row.failure_reason ?? null,
+    statusUrl: statusUrl(eventId),
+  };
+}
 
 function compareExisting(row, hash) {
   return row.request_hash.equals(hash) ? { outcome: 'replayed', row } : { outcome: 'conflict' };
@@ -143,7 +153,7 @@ async function createEvent(pool, { sessionId, idempotencyKey, event, maxEvents }
       // The delivery job is created in the same transaction: either both exist or neither does.
       const { rows: [delivery] } = await client.query(
         `INSERT INTO deliveries (event_id) VALUES ($1)
-         RETURNING state AS delivery_state, attempt_count`,
+         RETURNING state AS delivery_state, attempt_count, next_attempt_at, failure_reason`,
         [inserted.rows[0].id]);
       await client.query('COMMIT');
       return { outcome: 'created', row: { ...inserted.rows[0], ...delivery } };
@@ -190,7 +200,8 @@ function parseListQuery(query) {
   return details.length > 0 ? { details } : { limit, afterSeq };
 }
 
-function eventRoutes(pool, { maxEventsPerSession }) {
+function eventRoutes(pool, { maxEventsPerSession, deliveryMaxAttempts }) {
+  const resource = (row) => toResource(row, deliveryMaxAttempts);
   const router = express.Router();
   const auth = requireSession(pool);
 
@@ -222,7 +233,7 @@ function eventRoutes(pool, { maxEventsPerSession }) {
         return res.status(202).json({
           eventId: result.row.id,
           statusUrl: statusUrl(result.row.id),
-          event: toResource(result.row),
+          event: resource(result.row),
           notice: 'Accepted: stored durably and queued for asynchronous delivery. It has not been delivered yet; check statusUrl.',
         });
       case 'replayed':
@@ -230,7 +241,7 @@ function eventRoutes(pool, { maxEventsPerSession }) {
         return res.status(200).json({
           eventId: result.row.id,
           statusUrl: statusUrl(result.row.id),
-          event: toResource(result.row),
+          event: resource(result.row),
           notice: 'This Idempotency-Key was already used with the same payload. Returning the original event and its current delivery state; nothing new was stored.',
         });
       case 'conflict':
@@ -257,7 +268,7 @@ function eventRoutes(pool, { maxEventsPerSession }) {
       [req.session.id, afterSeq, limit + 1]);
     const page = rows.slice(0, limit);
     res.json({
-      data: page.map(toResource),
+      data: page.map(resource),
       nextCursor: rows.length > limit ? encodeCursor(page.at(-1).seq) : null,
     });
   });
@@ -271,27 +282,28 @@ function eventRoutes(pool, { maxEventsPerSession }) {
       `${EVENT_SELECT} WHERE e.id = $1 AND e.session_id = $2`,
       [req.params.id, req.session.id]);
     if (!rows[0]) return notFound(res);
-    res.json({ event: toResource(rows[0]) });
+    res.json({ event: resource(rows[0]) });
   });
 
   // Delivery state and full attempt history for one of this session's events.
   router.get('/events/:id/deliveries', auth, async (req, res) => {
     if (!UUID_PATTERN.test(req.params.id)) return notFound(res);
     const { rows: [delivery] } = await pool.query(
-      `SELECT d.id, d.state, d.attempt_count, d.created_at, d.updated_at, d.completed_at
+      `SELECT d.id, d.state, d.attempt_count, d.next_attempt_at, d.failure_reason,
+              d.created_at, d.updated_at, d.completed_at
        FROM deliveries d JOIN events e ON e.id = d.event_id
        WHERE e.id = $1 AND e.session_id = $2`,
       [req.params.id, req.session.id]);
     if (!delivery) return notFound(res);
     const { rows: attempts } = await pool.query(
-      `SELECT attempt_number, outcome, started_at, ended_at, response_status, error_category, duration_ms
+      `SELECT attempt_number, outcome, started_at, ended_at, response_status, error_category,
+              retryable, duration_ms
        FROM delivery_attempts WHERE delivery_id = $1 ORDER BY attempt_number`,
       [delivery.id]);
     res.json({
       eventId: req.params.id,
       delivery: {
-        state: delivery.state,
-        attemptCount: delivery.attempt_count,
+        ...deliverySummary(delivery.state, delivery, deliveryMaxAttempts, req.params.id),
         createdAt: delivery.created_at,
         updatedAt: delivery.updated_at,
         completedAt: delivery.completed_at,
@@ -302,6 +314,7 @@ function eventRoutes(pool, { maxEventsPerSession }) {
           endedAt: a.ended_at,
           responseStatus: a.response_status,
           errorCategory: a.error_category,
+          retryable: a.retryable,
           durationMs: a.duration_ms,
         })),
       },

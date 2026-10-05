@@ -57,7 +57,12 @@ function loadConfig(env = process.env) {
   config.workerEnabled = env.WORKER_ENABLED === 'true';
   config.workerPollIntervalMs = intSetting(env, 'WORKER_POLL_INTERVAL_MS', 1000, 200, 60_000, problems);
   config.deliveryLeaseMs = intSetting(env, 'DELIVERY_LEASE_MS', 15_000, 1000, 300_000, problems);
-  config.deliveryMaxAttempts = intSetting(env, 'DELIVERY_MAX_ATTEMPTS', 3, 1, 10, problems);
+  // Total attempts per delivery, including the first (4 = original + 3 retries).
+  config.deliveryMaxAttempts = intSetting(env, 'DELIVERY_MAX_ATTEMPTS', 4, 1, 10, problems);
+  // Retry n waits base × 2^(n−1): 2 s, 4 s, 8 s by default.
+  config.retryBaseDelayMs = intSetting(env, 'RETRY_BASE_DELAY_MS', 2000, 100, 60_000, problems);
+  // Deliveries one worker sends at the same time.
+  config.workerConcurrency = intSetting(env, 'WORKER_CONCURRENCY', 2, 1, 10, problems);
   if (config.deliveryLeaseMs < config.deliveryTimeoutMs + 1000) {
     problems.push('DELIVERY_LEASE_MS must be at least DELIVERY_TIMEOUT_MS + 1000, or healthy attempts would lose their lease');
   }

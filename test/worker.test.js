@@ -25,7 +25,9 @@ describe('delivery worker', { skip }, () => {
   const quietLog = { log() {}, error: (msg) => workerErrors.push(msg) };
 
   const newWorker = (overrides = {}) => createWorker({
-    pool, send, pollIntervalMs: 50, leaseMs: LEASE_MS, maxAttempts: 3, log: quietLog, ...overrides,
+    pool, send, pollIntervalMs: 50, leaseMs: LEASE_MS, maxAttempts: 4,
+    retryBaseDelayMs: 60_000, // retries are covered in retry.test.js; keep them out of the way here
+    log: quietLog, ...overrides,
   });
 
   before(async () => {
@@ -115,20 +117,21 @@ describe('delivery worker', { skip }, () => {
       assert.equal(await newWorker().runOnce(), false, 'nothing left to do');
     });
 
-    test('server error: 503 fails the delivery (no retry at this stage)', async () => {
+    test('server error: 503 is recorded as a retryable failure and a retry is scheduled', async () => {
       const session = await newSession();
       await setMode(session, 'server_error');
       const eventId = await submitEvent(session);
       await newWorker().runOnce();
 
       const delivery = await history(session, eventId);
-      assert.equal(delivery.state, 'failed');
+      assert.equal(delivery.state, 'retry_scheduled');
+      assert.ok(delivery.nextAttemptAt);
       assert.deepEqual(
         { ...delivery.attempts[0], startedAt: undefined, endedAt: undefined, durationMs: undefined },
         { attemptNumber: 1, outcome: 'failed', responseStatus: 503, errorCategory: 'http_error',
-          startedAt: undefined, endedAt: undefined, durationMs: undefined });
+          retryable: true, startedAt: undefined, endedAt: undefined, durationMs: undefined });
       assert.equal(await receipts(session), 0);
-      assert.equal(await newWorker().runOnce(), false, 'failed deliveries are not retried');
+      assert.equal(await newWorker().runOnce(), false, 'the retry is not due yet');
     });
 
     test('timeout: no response status, timeout category, nothing processed', async () => {
@@ -138,10 +141,11 @@ describe('delivery worker', { skip }, () => {
       await newWorker().runOnce();
 
       const delivery = await history(session, eventId);
-      assert.equal(delivery.state, 'failed');
+      assert.equal(delivery.state, 'retry_scheduled');
       const [attempt] = delivery.attempts;
       assert.equal(attempt.outcome, 'failed');
       assert.equal(attempt.errorCategory, 'timeout');
+      assert.equal(attempt.retryable, true);
       assert.equal(attempt.responseStatus, null);
       assert.ok(attempt.durationMs >= TIMEOUT_MS - 20 && attempt.durationMs < SLOW_MS, `${attempt.durationMs} ms`);
       assert.equal(await receipts(session), 0);
@@ -165,7 +169,8 @@ describe('delivery worker', { skip }, () => {
       // "Restart": a brand-new connection pool and worker, as a new process would have.
       const freshPool = createPool(url);
       const worker = createWorker({
-        pool: freshPool, send, pollIntervalMs: 50, leaseMs: LEASE_MS, maxAttempts: 3, log: quietLog,
+        pool: freshPool, send, pollIntervalMs: 50, leaseMs: LEASE_MS, maxAttempts: 4, retryBaseDelayMs: 60_000,
+        log: quietLog,
       });
       worker.start();
       try {
@@ -193,7 +198,7 @@ describe('delivery worker', { skip }, () => {
 
       await worker.stop();
       const delivery = await history(session, first);
-      assert.equal(delivery.state, 'failed', 'result recorded before stop() resolved');
+      assert.equal(delivery.state, 'retry_scheduled', 'result recorded before stop() resolved');
       assert.equal(delivery.attempts[0].errorCategory, 'timeout');
 
       const second = await submitEvent(session);

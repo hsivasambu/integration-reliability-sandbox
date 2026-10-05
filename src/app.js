@@ -18,6 +18,7 @@ const DEFAULTS = {
   receiverSecret: undefined, // without a secret, every receiver call is rejected
   receiverSlowResponseMs: 4000,
   workerEnabled: false,
+  deliveryMaxAttempts: 4,
 };
 
 function createApp({ pool, config = {} } = {}) {

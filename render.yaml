@@ -45,8 +45,13 @@ services:
         value: "1000"
       - key: DELIVERY_LEASE_MS
         value: "15000"
+      # 4 attempts in total (original + 3 retries), retried after 2 s, 4 s, 8 s.
       - key: DELIVERY_MAX_ATTEMPTS
-        value: "3"
+        value: "4"
+      - key: RETRY_BASE_DELAY_MS
+        value: "2000"
+      - key: WORKER_CONCURRENCY
+        value: "2"
     # PORT is set by Render (default 10000); HOST defaults to 0.0.0.0 in code.
     # Node version comes from .node-version (24).
 
