@@ -65,3 +65,11 @@ https://integration-reliability-sandbox.onrender.com all returned 200. One brows
   the container: /ready back to 200 without restarting the app.
 - `MIGRATE_ON_START=true` startup logs "Database schema is up to date" before "Listening".
 - Server log searched for the issued token: 0 occurrences.
+
+**Deployed check (2026-10-04, by Claude, after pushing 86270cb).** The Blueprint sync created the free
+database and redeployed in about 60 s. Results: GET /health 200 `0.2.0`; HEAD /health 200; /ready 200;
+POST /v1/sessions 201; GET /v1/session with the token 200; no header 401 missing_token; bad token 401
+invalid_token; GET /v1/sessions 405.
+The free database was created 2026-10-04. It **expires about 2026-11-03** and is deleted about 2026-11-17
+unless upgraded. Recovery: create a new free database (or let the Blueprint recreate it) and redeploy.
+Migrations rebuild the empty schema automatically, but existing sessions are lost.
