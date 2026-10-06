@@ -1408,3 +1408,14 @@ instrumented timers, `PerformanceObserver` layout shifts, `MutationObserver` on 
   scroll anchoring move a focused history card by 106 px (Stage 17 check; traced, then `overflow-anchor: none`
   on the composer). Stage 15 checks for "explicit Motion on overrides the system setting" were replaced by the
   Stage 18 rule; the Stage 14 empty-journey check now matches the uppercase node names case-insensitively.
+
+**Deployed checks** (`cc024dd` on Render; Brotli on all assets)
+- Stage 18 accessibility and motion suite 19/19: axe clean in six states, announcements only for real transitions,
+  connection loss announced once, OS reduced motion wins live and after reload.
+- Measurements: CLS 0.0003 (2 small shifts), 16 requests per 10 s during a retry, 0 requests and 0 intervals idle,
+  live-region mutations in 10 s of retry at most 3 per region.
+- Earlier suites: Stage 12 24/25 (the deliberate offline/401 console entries), 13 56/56, 14 41/41, 15 50/50,
+  17 46/46. Stage 16 failed its first run on Render in one block (interrupted setup, then the paused-lock checks
+  that follow it) and passed 49/49 on an immediate rerun and twice locally. The first run's details were not kept,
+  so the cause is not established; free-tier timing is the likely suspect, not a confirmed one.
+- Final release checks not run (stopped before them, as requested).
