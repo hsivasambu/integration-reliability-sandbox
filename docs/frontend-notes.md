@@ -268,6 +268,14 @@ doesn't pause the backend: deliveries continue on the server.
 
 ## Guided scenarios (Stage 16)
 
+**Where to click and where to look (Stage 19 follow-up).** Above the instruction, a cue line says either
+**Your turn: Press <button>.** (when a step needs the visitor) or **Watch: <Delivery service | Receiving system> in
+the journey below.** (while the guide waits for the sandbox; `watch` in `guideStep()`, unit-tested). The button
+to press, or the journey part to watch, gets a teal ring that pulses three times (about 4.5 s) when the cue first
+appears, then stays still. The page redraws these elements every refresh, so the pulse continues from its start
+time instead of restarting, and it never runs longer than 5 s. With motion off (the page's control or the system
+setting) the ring and the words stay, without the pulse. The guide's buttons are rebuilt only when they change.
+
 Four cards under *Try a scenario*: **Normal delivery**, plus three guides. Everything uses the existing endpoints
 only (`PUT /v1/receiver`, `POST /v1/events`, `POST /v1/deliveries/{id}/replay`, and the reads). There is no backend
 scenario, no restore endpoint and no timer.
@@ -436,7 +444,7 @@ nature, but at rest they are #f5f0e6 on #1b2c50 (about 13:1) and the static jour
 The page, its scripts and its CSP are real in both (the fixture suite serves them from the real app without a
 database). `npm test` stays browser-free.
 
-**Fixture suite (17 tests):** a double click while the request is in flight, and a person's double click after a
+**Fixture suite (20 tests):** a double click while the request is in flight, and a person's double click after a
 fast answer (Send alert and the scenario card); a lost answer resolved by *Check again* with the same key; a lost
 answer resolved by a refresh from the alert list, with no resend; a request that never arrived, created once by
 *Check again*; a late answer for the previously selected alert (every journey frame is recorded, so a brief leak
@@ -444,7 +452,8 @@ fails); single-flight polling; a late answer from the previous session; session 
 session; the quota message without retries; motion keyed by observed attempt IDs, never replayed by reselecting,
 resizing, toggling or refreshing; a paused worker (only the acceptance is illustrated; no try is claimed); reduced
 motion; keyboard-only use with visible focus; illustrations never covering text at 1440 and 390 px; the stale-build
-notice.
+notice; *Send alert* bringing the journey into view; the guide cues (ring, pulse that ends by itself, none with
+reduced motion).
 
 **Live suite (10 tests):** first visit (no session until the visitor acts), sample choice and a normal send,
 confirmed and processed; a double click creating one alert; a temporary failure recovered by the scheduled retry,

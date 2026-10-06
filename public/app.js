@@ -83,6 +83,8 @@ const ICON_PATHS = {
   list: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M4.5 6h.01', 'M4.5 12h.01', 'M4.5 18h.01'],
   'arrow-right': ['M4 12h15', 'M14 7l5 5-5 5'],
   'arrow-left': ['M20 12H5', 'M10 7l-5 5 5 5'],
+  'arrow-down': ['M12 4v15', 'M7 14l5 5 5-5'],
+  pointer: ['M6 3l13 7-6 1.5L10 18z', 'M13 11.5l5 6'],
   mail: ['M3.5 6.5h17v11h-17z', 'M3.5 7l8.5 6 8.5-6'],
   gap: ['M4 12h3', 'M10.5 12h3', 'M17 12h3'],
 };
@@ -604,7 +606,8 @@ function setPending(pending) {
 
 // "Send alert": validate, start a session only if there is none (and only because of this click),
 // save the key and payload, then send once. A new send always gets a new Idempotency-Key.
-async function sendDraft() {
+// reveal: bring the journey into view once the alert is on its way (scenario cards scroll to the guide instead).
+async function sendDraft({ reveal = true } = {}) {
   if (state.submitting || state.pendingSubmit) return null;
   if (!validateForm()) return null;
   state.submitting = true; // disables the button before anything is awaited, so double clicks do nothing
@@ -623,6 +626,7 @@ async function sendDraft() {
     guideNoteSubmission(state.pendingSubmit.key);
     state.showLocal = true; // the journey shows the alert as 'Sending to the sandbox' until the server answers
     render();
+    if (reveal) revealJourney();
     return await sendPending(false);
   } finally {
     state.submitting = false;
@@ -894,7 +898,7 @@ async function startScenario(id) {
     $('message').value = s.guided ? 'Synthetic data for a guided scenario.' : 'Synthetic data for a normal delivery.';
     saveDraft();
     render();
-    const eventId = await sendDraft();
+    const eventId = await sendDraft({ reveal: false });
     if (s.guided && eventId) saveGuide({ ...state.guide, stage: 'running', eventId });
     if (eventId) revealGuide(s.guided);
   } finally {
@@ -915,6 +919,15 @@ function guideAttachFromList() {
   if (g?.stage !== 'sending' || !g.submissionKey || state.pendingSubmit?.key === g.submissionKey && state.submitting) return;
   const found = state.events.find((e) => e.idempotencyKey === g.submissionKey);
   if (found) saveGuide({ ...g, stage: 'running', eventId: found.id });
+}
+
+// After Send alert the journey is where things happen: bring its top near the top of the screen (Stage 19). Only
+// in answer to the visitor's own press; background updates never scroll. Focus stays on the button that was pressed.
+function revealJourney() {
+  const top = $('journey').getBoundingClientRect().top;
+  if (top < 0 || top > window.innerHeight * 0.25) {
+    $('journey').scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' });
+  }
 }
 
 function revealGuide(guided) {
@@ -1058,10 +1071,66 @@ function renderGuide() {
       'The free service may be waking up; the guide continues when it answers. ',
       h('button', { type: 'button', class: 'btn-link', 'data-focus-key': 'reconnect', onclick: () => pollNow() }, 'Reconnect now')) : null,
   ].filter(Boolean));
-  keepFocus($('guide-actions'), () => $('guide-actions').replaceChildren(...r.actions.map((a) => h('button', {
-    type: 'button', class: `btn ${a.primary ? 'btn-primary' : 'btn-quiet'}`, 'data-focus-key': `guide-${a.id}`,
-    disabled: Boolean(state.guideBusy), onclick: () => guideAction(a.id),
-  }, a.label))));
+  // Where to act or look (Stage 19): "Your turn" names the button to press; otherwise "Watch" names the part of the
+  // journey whose change the guide is waiting for.
+  const primary = r.actions.find((a) => a.primary);
+  const turn = Boolean(primary) && !state.guideBusy;
+  const cueKey = `${state.guide.scenario}:${state.guide.eventId ?? ''}:${r.phase}`;
+  const cueLine = $('guide-cue');
+  const cueParts = turn ? ['pointer', 'Your turn', `Press ${primary.label}.`]
+    : r.watch ? ['arrow-down', 'Watch', `${WATCH_NAMES[r.watch]} in the journey below.`] : null;
+  updateIfChanged(cueLine, cueParts ? cueParts.join('|') : '', () => (cueParts
+    ? [h('span', { class: `cue-pill ${turn ? 'is-turn' : 'is-watch'}` }, icon(cueParts[0]), cueParts[1]), ' ', cueParts[2]]
+    : []));
+  cueLine.hidden = !cueParts;
+  // Buttons are rebuilt only when they change, so a running attention pulse isn't restarted by every refresh.
+  const actions = $('guide-actions');
+  const signature = JSON.stringify([r.actions, Boolean(state.guideBusy), cueKey]);
+  if (actions.dataset.sig !== signature) {
+    actions.dataset.sig = signature;
+    keepFocus(actions, () => actions.replaceChildren(...r.actions.map((a) => {
+      const button = h('button', {
+        type: 'button', class: `btn ${a.primary ? 'btn-primary' : 'btn-quiet'}`, 'data-focus-key': `guide-${a.id}`,
+        disabled: Boolean(state.guideBusy), onclick: () => guideAction(a.id),
+      }, a.label);
+      if (a.primary && turn) attention(button, `turn:${cueKey}`);
+      return button;
+    })));
+  }
+  markWatched();
+}
+
+const WATCH_NAMES = { delivery: 'Delivery service', receiver: 'Receiving system' };
+
+// Attention cues (Stage 19): a ring that pulses three times (about 4.5 s) when a cue first appears, then stays
+// still. The page redraws these elements on refreshes, so the pulse continues from when the cue began instead of
+// restarting, and never runs longer than that. With motion off (the page's control or the system setting) only the
+// still ring is shown.
+const CUE_MS = 4500;
+const cueStarts = new Map(); // cue key -> when it first appeared
+function attention(el, key) {
+  el.classList.add('cue-ring');
+  if (!cueStarts.has(key)) cueStarts.set(key, performance.now());
+  const elapsed = performance.now() - cueStarts.get(key);
+  if (motionOn() && elapsed < CUE_MS) {
+    el.classList.add('cue-pulse');
+    el.style.animationDelay = `-${Math.round(elapsed)}ms`;
+  }
+}
+
+// Rings the journey part the guide is waiting on, for the guide's own alert only.
+function markWatched() {
+  const r = guideOpen() ? currentGuideStep() : null;
+  const watch = r?.watch && state.selectedId && state.selectedId === state.guide?.eventId ? r.watch : null;
+  for (const [part, selector] of [['delivery', '.jd-delivery'], ['receiver', '.jd-receiver']]) {
+    const node = $('detail').querySelector(`.jd ${selector}`);
+    if (!node) continue;
+    if (watch === part) {
+      attention(node, `watch:${state.guide.eventId}:${r.phase}`);
+    } else {
+      node.classList.remove('cue-ring', 'cue-pulse');
+    }
+  }
 }
 
 function renderScenarioCards() {
@@ -1801,6 +1870,7 @@ function renderDetail() {
   announce(v);
   syncCountdown();
   startWaitIndicators();
+  markWatched(); // the guide's "Watch" ring survives the redraw
   // Motion is planned from what changed, after the true state is already on screen. It never holds
   // anything back and is skipped entirely when motion is off or the tab is hidden.
   const effects = motion.planner.observe(v);
@@ -1939,6 +2009,7 @@ function renderMotionToggle() {
   const system = systemReducesMotion();
   const button = $('motion-toggle');
   button.setAttribute('aria-pressed', on ? 'true' : 'false');
+  document.documentElement.dataset.motion = on ? 'on' : 'off'; // CSS stops attention pulses at once when off
   button.disabled = system;
   button.textContent = system ? 'Motion: off (system setting)' : on ? 'Motion: on' : 'Motion: off';
   const note = system

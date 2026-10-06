@@ -1498,3 +1498,24 @@ from an API problem.
 - Not checked on Render: quota and paused worker (would need different service settings), and an application
   rollback (verified locally only).
 - Stopped at the release checkpoint.
+
+### Stage 19 follow-up: scroll on send, guide cues, blog link (2026-10-06)
+
+Requested after the release: scroll to the journey when sending, make it more obvious where and when to click and
+look in the guided scenarios (an animation pointing at the button to press), and a link back to the main blog.
+- **Send alert** scrolls the journey's top near the top of the screen once the alert is on its way (smooth, or
+  instant with motion off). Only in answer to the visitor's press; focus stays on the button. Scenario cards keep
+  scrolling to the guide panel instead (`sendDraft({ reveal: false })`). Measured with fixtures: journey top from
+  -319 to 16 px at 1440 x 800 (page scrolled to the button), from 844 to 122 px at 390 x 844 (the accepted notice
+  then grows above it).
+- **Guide cues:** `guideStep()` now returns `watch` (`delivery`, `receiver` or `null`) for waiting steps. The panel
+  shows *Your turn: Press …* or *Watch: … in the journey below*, and rings the button or the journey node. The ring
+  pulses three times (about 4.5 s) and then stays still; it resumes rather than restarts across refreshes, and
+  there is no pulse with motion off. Checked: one running animation at the start of the turn, none 5.7 s later
+  through two refreshes; none with reduced motion.
+- **Footer:** "Back to the main blog" (https://blog.harry-sivasambu.com/), 38 px tall.
+- **Tests:** guide-model unit test for `watch`; fixture tests for the scroll, the cues and reduced motion (20 in
+  total); the live rescue test checks the *Your turn* cue.
+- **Results (local):** `npm test` 173/173 (skipped 0); fixture suite 20/20; live suite 8 pass, 2 skipped by design;
+  Stage 18 axe and motion suite 19/19 (axe ran with a *Your turn* cue on screen). Screenshots of both cues at 1440
+  and 390 px, and the footer at 390 px, inspected.

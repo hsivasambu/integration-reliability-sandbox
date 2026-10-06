@@ -38,7 +38,7 @@
   //   busy        'configuring' | 'sending' | 'restoring' | 'replaying' | null  (requests in flight in this page)
   //   pending     the composer's unconfirmed submission (Stage 13) or null
   //   eventKnown  whether an alert with the guide's submission key is in the alert list
-  function guideStep(guide, ctx) {
+  function stepFor(guide, ctx) {
     const s = SCENARIOS[guide.scenario];
     const total = s.steps;
     const leave = { id: 'leave', label: 'Leave guide' };
@@ -154,6 +154,17 @@
       ? ' The receiver is still set to "Processes, then replies late"; Normal delivery sets it back.' : '';
     return step(s.steps, s.steps, 'done', text + after,
       [{ id: 'again', label: 'Run it again' }, { id: 'close', label: 'Close guide' }], 'is-done');
+  }
+
+  // Where to look while the guide waits for the sandbox (Stage 19): the part of the journey whose state the next step
+  // depends on. Steps that need the visitor have none; their turn is shown on the button instead.
+  const WATCH = {
+    'await-failure': 'delivery', 'await-retry': 'delivery', 'await-stop': 'delivery', 'await-replay': 'delivery',
+    'await-timeout': 'receiver', 'await-repeat': 'receiver',
+  };
+  function guideStep(guide, ctx) {
+    const result = stepFor(guide, ctx);
+    return { ...result, watch: WATCH[result.phase] ?? null };
   }
 
   // Whether the guide's step is one where its event is finished (used to decide if the guide is "done").

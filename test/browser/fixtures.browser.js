@@ -396,3 +396,57 @@ test('a page loaded before a deploy says so; a current page does not', opt, asyn
   assert.equal(await stale.page.$eval('#build-note', (n) => n.hidden), false);
   await stale.close();
 });
+
+test('Send alert brings the journey into view and keeps focus on the button (phone)', opt, async () => {
+  const { page, t, close } = await open({ width: 390, height: 844 });
+  await page.$eval('#submit-event', (el) => el.scrollIntoView({ block: 'center' }));
+  assert.ok(await page.evaluate(() => document.getElementById('journey').getBoundingClientRect().top > window.innerHeight), 'journey starts below the screen');
+  await page.click('#submit-event');
+  await t.waitText('#submit-result', /Alert accepted/);
+  await sleep(1200); // smooth scrolling
+  const top = await page.evaluate(() => document.getElementById('journey').getBoundingClientRect().top);
+  assert.ok(top >= 0 && top < 844 * 0.3, `journey top at ${Math.round(top)} px`);
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'submit-event');
+  await close();
+});
+
+// The rescue guide, driven by the fixture: where to look while tries fail, then which button to press.
+async function rescueUntilStopped(fixture) {
+  const { page, api, t } = fixture;
+  await page.evaluate(() => document.getElementById('scenario-rescue').closest('article').querySelector('button').click());
+  await t.waitText('#detail .jd-alert', /Accepted/);
+  const ev = api.event();
+  api.startAttempt(ev);
+  api.failAttempt(ev, { retryInMs: 60000 });
+  await t.waitText('#guide-cue', /Watch Delivery service in the journey below/);
+  const watched = await page.$eval('#detail .jd-delivery', (n) => n.classList.contains('cue-ring'));
+  for (let i = 0; i < 3; i++) { api.startAttempt(ev); api.failAttempt(ev, { retryInMs: 60000 }); }
+  await t.waitText('#guide-cue', /Your turn Press Restore and retry/);
+  const cta = () => page.evaluate(() => {
+    const b = [...document.querySelectorAll('#guide-actions button')].find((x) => x.textContent === 'Restore and retry');
+    return { ring: b.classList.contains('cue-ring'), running: b.getAnimations().length };
+  });
+  return { watched, cta };
+}
+
+test('guide cues: "Watch" rings the journey part, "Your turn" rings the button; the pulse stops by itself', opt, async () => {
+  const fixture = await open();
+  const { page, close } = fixture;
+  const { watched, cta } = await rescueUntilStopped(fixture);
+  assert.equal(watched, true, 'the delivery service is ringed while the guide waits for the stop');
+  assert.equal(await page.$eval('#detail .jd-delivery', (n) => n.classList.contains('cue-ring')), false, 'no Watch ring once it is the visitor\'s turn');
+  await sleep(300);
+  assert.deepEqual(await cta(), { ring: true, running: 1 }, 'the button pulses when the turn starts');
+  await sleep(5500); // past the three pulses, through two refreshes
+  assert.deepEqual(await cta(), { ring: true, running: 0 }, 'the pulse ends; the still ring stays');
+  await screenshot(page, 'fixture-guide-your-turn');
+  await close();
+});
+
+test('guide cues with reduced motion: the ring and the words, no pulse', opt, async () => {
+  const fixture = await open({ setup: (p) => p.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]) });
+  const { cta } = await rescueUntilStopped(fixture);
+  await sleep(300);
+  assert.deepEqual(await cta(), { ring: true, running: 0 });
+  await fixture.close();
+});

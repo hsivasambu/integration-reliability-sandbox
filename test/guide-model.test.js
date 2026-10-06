@@ -106,3 +106,17 @@ test('the guided alert not selected: the guide asks to show it instead of guessi
   assert.equal(r.phase, 'elsewhere');
   assert.deepEqual(ids(r), ['show', 'leave']);
 });
+
+test('cues: waiting steps say which part of the journey to watch; steps that need the visitor do not', () => {
+  const watch = (scenario, v, extra) => guideStep(running(scenario, extra), ctx(v)).watch;
+  assert.equal(watch('recover', view([delivery(D1, 'in_progress', [live(1)])])), 'delivery', 'watch the first try fail');
+  assert.equal(watch('recover', view([delivery(D1, 'retry_scheduled', [rejected(1)])])), null, 'Restore receiver: the visitor acts');
+  assert.equal(watch('recover', view([delivery(D1, 'retry_scheduled', [rejected(1)])]), { restored: true }), 'delivery');
+  assert.equal(watch('twice', view([delivery(D1, 'in_progress', [live(1)])])), 'receiver', 'the record shows processing first');
+  assert.equal(watch('rescue', view([delivery(D1, 'retry_scheduled', [rejected(1)])])), 'delivery', 'wait for the stop');
+  const stopped = view([delivery(D1, 'failed', [rejected(1), rejected(2), rejected(3), rejected(4)], { failureReason: 'attempts_exhausted' })]);
+  const rescue = guideStep(running('rescue'), ctx(stopped));
+  assert.equal(rescue.phase, 'rescue');
+  assert.equal(rescue.watch, null, 'Restore and retry: the visitor acts');
+  assert.ok(rescue.actions.some((a) => a.primary));
+});

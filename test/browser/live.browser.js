@@ -156,6 +156,7 @@ test('retries exhausted, then one manual replay is confirmed', { skip: skipAll, 
   await startGuide(page, 'rescue');
   await t.waitText('#guide', /Delivery stopped: every automatic try failed/, 120000);
   assert.match(await t.deliveryBadge(), /Stopped/);
+  assert.match(await t.text('#guide-cue'), /Your turn Press Restore and retry/, 'the guide says which button to press');
   await shots(page, 'stopped');
   const replaysBefore = log.filter((r) => r.method === 'POST' && /\/replay$/.test(r.path)).length;
   await t.clickButton('#guide', 'Restore and retry');
