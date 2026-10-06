@@ -157,6 +157,7 @@ test('retries exhausted, then one manual replay is confirmed', { skip: skipAll, 
   await t.waitText('#guide', /Delivery stopped: every automatic try failed/, 120000);
   assert.match(await t.deliveryBadge(), /Stopped/);
   assert.match(await t.text('#guide-cue'), /Your turn Press Restore and retry/, 'the guide says which button to press');
+  assert.equal(await page.$('#detail .jd-recover'), null, 'Deliver again is hidden: only Restore and retry is offered');
   await shots(page, 'stopped');
   const replaysBefore = log.filter((r) => r.method === 'POST' && /\/replay$/.test(r.path)).length;
   await t.clickButton('#guide', 'Restore and retry');

@@ -486,6 +486,9 @@ details.tech h5 { margin: var(--space-3) 0 var(--space-1); font-size: var(--text
 .jd-wait { margin-top: var(--space-2); height: 4px; border-radius: 2px; background: var(--navy-line); overflow: hidden; }
 .jd-wait-fill { display: block; height: 100%; background: var(--amber-on-navy); transform-origin: left center; transform: scaleX(0); }
 .jd-recover { margin-top: var(--space-3); min-height: 2.5rem; padding: var(--space-1) var(--space-3); }
+/* In place of Deliver again while a guide owns the retry: points to the guide's Restore and retry. */
+.jd-guide-hint { display: flex; align-items: flex-start; gap: var(--space-2); margin: var(--space-3) 0 0; font-size: var(--text-sm); font-weight: 600; color: var(--teal-on-navy); }
+.jd-guide-hint .icon { flex: none; width: 1rem; height: 1rem; margin-top: 0.15rem; }
 .jd-already { color: var(--on-navy); }
 
 /* Motion (Stage 15): an overlay that is never redrawn by refreshes. Only transform and opacity move. */

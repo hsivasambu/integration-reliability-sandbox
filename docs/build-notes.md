@@ -1522,3 +1522,11 @@ look in the guided scenarios (an animation pointing at the button to press), and
 - **Deployed** (`9fe1968` on Render, 2026-10-06): `/health` build `9fe1968b3c26`, `/ready` 200, the page carries the
   cue line and the blog link; `npm run test:live` against Render 8 pass, 2 skipped by design (the rescue test now
   also checks the *Your turn* cue).
+
+### Follow-up: one retry button during a guide (2026-10-06)
+
+Requested: in the rescue scenario, offer only *Restore and retry*. While the guide's step for its alert offers
+*Restore and retry* (or that request is running or unconfirmed), the journey hides *Deliver again* and shows "Use
+Restore and retry in the guide above." Leaving the guide brings it back; later steps that point to *Deliver again*
+are unchanged. Fixture test (fails on the previous page, passes now); the live rescue test checks it too.
+Local results: `npm test` 173/173 (skipped 0), fixture suite 21/21, live suite 8 pass, 2 skipped by design.

@@ -450,3 +450,16 @@ test('guide cues with reduced motion: the ring and the words, no pulse', opt, as
   assert.deepEqual(await cta(), { ring: true, running: 0 });
   await fixture.close();
 });
+
+test('rescue guide: only Restore and retry is offered; Deliver again returns after leaving the guide', opt, async () => {
+  const fixture = await open();
+  const { page, t, close } = fixture;
+  await rescueUntilStopped(fixture);
+  await sleep(2500); // a refresh: the journey is redrawn
+  assert.equal(await page.$('#detail .jd-recover'), null, 'no Deliver again while the guide owns the retry');
+  assert.match(await t.text('#detail .jd-guide-hint'), /Use Restore and retry in the guide above/);
+  await t.clickButton('#guide-actions', 'Leave guide');
+  await t.waitFor('Deliver again after leaving the guide', () => Boolean(document.querySelector('#detail .jd-recover')));
+  assert.equal(await page.$('#detail .jd-guide-hint'), null);
+  await close();
+});

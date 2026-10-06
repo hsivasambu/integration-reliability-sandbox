@@ -1037,6 +1037,15 @@ function guideAction(id) {
   }
 }
 
+// While a guide's step for this alert is "Restore and retry" (or that request is running or unconfirmed), the
+// guide owns the retry, so the journey's Deliver again is hidden: it would retry without restoring the receiver,
+// and fail again. Leaving the guide brings Deliver again back.
+function guideOwnsRetry(eventId) {
+  if (!guideOpen() || state.guide.eventId !== eventId) return false;
+  if (state.guideBusy === 'restoring' || state.guideBusy === 'replaying') return true;
+  return Boolean(currentGuideStep()?.actions.some((a) => a.id === 'restore-retry' || a.id === 'replay-check'));
+}
+
 function currentGuideStep() {
   const g = state.guide;
   if (!g) return null;
@@ -1841,10 +1850,11 @@ function renderDetail() {
   const event = v.server ? findEvent(v.eventId) : null;
   const detail = event && state.detail?.eventId === event.id ? state.detail : null;
   const canReplay = v.server && v.delivery.code === 'stopped' && detail;
-  const recovery = canReplay
-    ? h('button', { type: 'button', class: 'btn btn-primary jd-recover', 'data-focus-key': 'replay', onclick: singleClick('replay', () => replayDelivery(v.deliveryId)) },
-      icon('replay'), 'Deliver again')
-    : null;
+  const recovery = !canReplay ? null
+    : guideOwnsRetry(v.eventId)
+      ? h('p', { class: 'jd-guide-hint' }, icon('pointer'), 'Use Restore and retry in the guide above.')
+      : h('button', { type: 'button', class: 'btn btn-primary jd-recover', 'data-focus-key': 'replay', onclick: singleClick('replay', () => replayDelivery(v.deliveryId)) },
+        icon('replay'), 'Deliver again');
   const actions = v.server
     ? h('div', { class: 'journey-actions' },
       h('button', { type: 'button', class: 'btn', 'data-focus-key': 'duplicate', onclick: () => submitDuplicate(event) },
