@@ -1483,3 +1483,18 @@ from an API problem.
   `/ready` 200, worker started, a new event delivered on attempt 1 and processed. No migration since 008.
 - The checks created about 30 local demo sessions; two alerts sent to the paused server stayed pending until the
   rollback server's worker delivered them.
+
+**Deployed checks** (`7351fc8` on Render, 2026-10-05)
+- Live within about 30 s of the push: `/health` `{"version":"0.12.0","build":"7351fc8fdf2d","inProcessWorker":true}`
+  (the build equals `git rev-parse --short=12 HEAD`, so Render provides `RENDER_GIT_COMMIT` at runtime), `/ready`
+  200. The page carries `<meta name="app-build" content="7351fc8fdf2d">` and `?v=7351fc8fdf2d` on its assets.
+- Smoke checks: `/` 200 with `Cache-Control: no-cache`, the CSP, `nosniff` and `X-Request-Id`; `/docs/` and
+  `/openapi.yaml` 200 (0.12.0); internal receiver and ops routes 401; the served `app.js` contains the new guard.
+- `npm run test:live` against Render: 8 pass, 2 skipped by design (quota and paused worker need servers configured
+  for them; checked locally). 83 s; 2 demo sessions and about 8 synthetic alerts.
+- Screenshots of every major outcome inspected at 1440 and 390 px. The *Technical details* line read "Build: page
+  7351fc8fdf2d, service 7351fc8fdf2d". In the recover scenario the scheduled retry recovered on try 4 of 4: the
+  suite's network drop delayed *Restore receiver* until three tries had failed, which the page reported as such.
+- Not checked on Render: quota and paused worker (would need different service settings), and an application
+  rollback (verified locally only).
+- Stopped at the release checkpoint.
