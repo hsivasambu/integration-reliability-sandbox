@@ -1519,3 +1519,6 @@ look in the guided scenarios (an animation pointing at the button to press), and
 - **Results (local):** `npm test` 173/173 (skipped 0); fixture suite 20/20; live suite 8 pass, 2 skipped by design;
   Stage 18 axe and motion suite 19/19 (axe ran with a *Your turn* cue on screen). Screenshots of both cues at 1440
   and 390 px, and the footer at 390 px, inspected.
+- **Deployed** (`9fe1968` on Render, 2026-10-06): `/health` build `9fe1968b3c26`, `/ready` 200, the page carries the
+  cue line and the blog link; `npm run test:live` against Render 8 pass, 2 skipped by design (the rescue test now
+  also checks the *Your turn* cue).
