@@ -13,6 +13,8 @@ PostgreSQL, worker inside the web process, migrations at startup via `MIGRATE_ON
 - [ ] If a new migration is included: decide now whether it is **backward compatible** (see
       [Migrations and rollback](#migrations-are-forward-only)). Prefer additive changes.
 - [ ] `version` in `package.json` and `info.version` in `docs/openapi.yaml` match (a test checks this).
+- [ ] Frontend changed? `npm run test:browser` (fixture suite, needs an installed Edge or Chrome) passes, and
+      `npm run test:live` passes against a local server with the worker on (see *Browser checks* below).
 
 ## Deployment smoke checklist
 
@@ -21,7 +23,7 @@ On Windows PowerShell type `curl.exe`. The first request after idling can take a
 
 | # | Check | Expect |
 |---|---|---|
-| 1 | `curl -s BASE/health` | `200`, the **new** `version`, `"inProcessWorker":true`. An old version means the deploy hasn't switched over yet (instances overlap for about a minute). A second deploy can follow when Blueprint env vars change. |
+| 1 | `curl -s BASE/health` | `200`, the **new** `version`, `build` = the first 12 characters of the pushed commit (`git rev-parse --short=12 HEAD`), `"inProcessWorker":true`. An old version or build means the deploy hasn't switched over yet (instances overlap for about a minute). A second deploy can follow when Blueprint env vars change. |
 | 2 | `curl -s BASE/ready` | `200 {"status":"ready"}`. `503 migrations_pending` = a migration didn't apply; `database_unreachable` = check the database in the dashboard (free database expiry: about 2026-11-03). |
 | 3 | Render **Logs** | `Applied migration …` or `Database schema is up to date`, then `listening` and `worker started`, with no `startup failed`. |
 | 4 | `curl -sI BASE/` | `200` with `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Request-Id`. |
@@ -33,6 +35,46 @@ On Windows PowerShell type `curl.exe`. The first request after idling can take a
 
 If 1–3 fail, the new version isn't serving. If 4–9 fail, it serves but misbehaves. Either way, see
 [Rollback](#rollback).
+
+## Frontend release checks (from 0.12.0)
+
+The page and the API ship together in one service, so one deploy updates both. Each deploy has a **build**
+identifier: `/health` reports it, and the server stamps the same value into the page (`<meta name="app-build">`,
+and `?v=<build>` on the page's own script and stylesheet URLs). That separates two problems that look alike:
+
+| Symptom | Cause | Check |
+|---|---|---|
+| The page shows *"This page was loaded before the service was updated. Reload the page…"* | A tab opened before a deploy (old page, new API) | Reload. Nothing is wrong with the service |
+| `/health` shows the old `build` | The deploy hasn't switched over (or failed) | Render **Events**; wait about a minute; then logs |
+| Page and `/health` builds match, but something misbehaves | A real problem in this build | Browser checks below; then [Rollback](#rollback) |
+
+*Technical details → Service status* shows "Build: page X, service Y" for the person looking at the page.
+Locally the build is `local` (set `BUILD_ID` to override).
+
+### Browser checks
+
+| # | Check | Expect |
+|---|---|---|
+| B1 | `curl -s BASE/ \| grep app-build` | `<meta name="app-build" content="<build>">`, the same build as `/health` |
+| B2 | `BASE_URL=BASE npm run test:live` (from a machine with Edge or Chrome) | 8 pass, 2 skipped (quota and paused worker need their own server). Creates 2 demo sessions and about 8 synthetic alerts; runs in about 1.5 minutes after the service is awake |
+| B3 | Open `BASE/` in a normal browser, press *Send alert* | Confirmed and processed within a few seconds; *Technical details → Service status* shows matching builds |
+| B4 | On a phone or a 390 px window | The journey stacks vertically; nothing needs sideways scrolling |
+
+`npm run test:browser` (fixtures) doesn't use the deployed service; it checks the page's own logic and runs before
+pushing.
+
+## Operational checklist (frontend)
+
+- **After every deploy:** smoke checks 1–3, then B1–B3.
+- **Free hosting:** the first visit after 15 idle minutes waits about a minute; the page shows "Waiting for the
+  server." and doesn't fail. Retries that were due while asleep run when it wakes.
+- **Demo sessions are limited** to 10 per hour per IP (`SESSION_RATE_LIMIT_MAX`). Repeated test runs from one
+  machine can hit this; the page then explains it, and the limit resets within the hour.
+- **Free database expiry (about 2026-11-03):** after it, `/ready` fails and the page shows *Service not ready*. See
+  *Losing the database entirely*.
+- **A visitor reports a stale or broken page:** compare the page build (Technical details) with `/health`. Different
+  means reload; the same means a real problem in that build.
+- **Nothing to clean up by hand:** expired sessions and their alerts are removed by the cleanup job.
 
 ## Rollback
 
@@ -48,7 +90,8 @@ Render keeps recent build artifacts (how many depends on the workspace plan).
 2. **Rolling back from the dashboard disables auto-deploy** (Render's safeguard). While it's off, pushes to `main`
    do **not** deploy. After fixing the problem on `main`, re-enable **Auto-Deploy** in the service settings
    (or trigger a manual deploy).
-3. Run smoke checks 1–3 and 8 again on the rolled-back version.
+3. Run smoke checks 1–3 and 8 again on the rolled-back version, and B1 and B3: `/health` must show the **old**
+   build, and an open tab of the newer page shows the "loaded before the service was updated" notice until reloaded.
 4. Alternative without the dashboard: `git revert <bad commit>` and push. That's a normal forward deploy, auto-deploy
    stays on, and the history shows what happened.
 
@@ -75,7 +118,9 @@ There are **no down migrations**. A Render rollback does **not** undo schema cha
 | 007 replay | Partly: re-adding `UNIQUE(event_id)` would fail once replays exist | Code before 0.8.0 can misread events with several deliveries. Not supported |
 | 008 operations | Additive (new table, widened CHECK) | 0.9.0 and 0.10.0 tolerate it. **0.10.0 was verified** (below); 0.9.0 was not |
 
-**Stage 11 adds no migration**, so rolling back from 0.11.0 to 0.10.0 is an application-only rollback. That was
+**Stages 11–19 add no migration** (the frontend stages change only `public/`, tests and docs, plus the `build`
+field on `/health` in 0.12.0), so rolling back from 0.12.0 to any 0.11.x build is an application-only rollback.
+Rolling back from 0.11.0 to 0.10.0 is also application-only. That was
 checked locally on 2026-10-05: 0.10.0 code (commit `caa3255`) started against the current schema, reported "Database
 schema is up to date", `/ready` 200, and delivered a new event on attempt 1. The only visible difference is that
 `/docs/` and `/openapi.yaml` return 404.

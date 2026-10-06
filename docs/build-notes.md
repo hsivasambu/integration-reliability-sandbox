@@ -1419,3 +1419,67 @@ instrumented timers, `PerformanceObserver` layout shifts, `MutationObserver` on 
   that follow it) and passed 49/49 on an immediate rerun and twice locally. The first run's details were not kept,
   so the cause is not established; free-tier timing is the likely suspect, not a confirmed one.
 - Final release checks not run (stopped before them, as requested).
+
+## Stage 19: Validation and release of the frontend (2026-10-05)
+
+**Before starting.** Clean tree at `befb5d1` (Stage 18 deployed). The browser checks of Stages 12–18 lived only in a
+scratch folder; nothing in the repository exercised the page in a browser, and nothing told a stale page apart
+from an API problem.
+
+**Added**
+- **Version 0.12.0** and a **build identifier**: `/health` returns `build` (first 12 characters of
+  `RENDER_GIT_COMMIT` on Render, `BUILD_ID` if set, otherwise `local`). The page is served stamped with the same
+  value (`<meta name="app-build">`, `?v=<build>` on its own assets, `Cache-Control: no-cache`, ETag revalidation).
+  If page and service differ, the page asks for a reload. Additive; the OpenAPI `Health` schema and tests updated.
+- **Browser tests in the repository** (`test/browser/`, `puppeteer-core` dev dependency driving an installed Edge
+  or Chrome; `npm test` stays browser-free):
+  - `npm run test:browser`: 17 tests against `fixture-api.js`, a scripted, session-scoped stand-in for the API
+    answered through request interception. For races and failure paths only; not evidence about the backend.
+  - `npm run test:live` with `BASE_URL`: 10 tests against a real server (8 need the worker; quota and paused-worker
+    checks need servers configured for them, and the suite picks what applies from `/health`).
+- Release, operational and rollback guidance in `docs/release-checklist.md`; results, defects and remaining
+  limitations in `docs/frontend-notes.md` → *Release validation* and *Remaining limitations*.
+
+**Defects found by the new tests, fixed**
+- **A person's double click could create two alerts.** Measured send time after the first (click to accepted):
+  77–161 ms against fixtures, 141–258 ms against the real local server, so a second click 200–400 ms later arrived
+  after acceptance and sent a new alert with a new key. Reproduced on the Stage 18 page (3 alerts for 1 send + 1
+  double click). Fix: a second press of the same control within 600 ms with nothing done in between is ignored
+  (Send alert, scenario cards, Deliver again); choosing a sample or editing a field resets it. A first attempt that
+  used `event.detail` didn't work: synthetic clicks and touch taps report a click count of 1.
+- **Keyboard focus was lost after each send** (`disabled` on Send alert drops focus to the page). Now
+  `aria-disabled`; the same checks ignore presses.
+- **Illustrations covered text at every width** (Stage 18's overlap audit only checked static labels). A sampler
+  comparing every visible illustration with every text run found overlaps at 1440, 1024, 768, 390 and 320 px.
+  Redesigned: 18 px icon-only tokens in lanes clear of the nodes and labels, and rings just outside node boxes.
+  After: no overlap at any of the five widths; a fixture test keeps it that way (it fails on the Stage 18 motion
+  with 10 distinct overlaps at 1440 px).
+
+**Test quality checks**
+- Mutation checks: removing the session guards fails the previous-session test. The selection test first passed
+  with every guard removed (polling is single-flight, so B's load waits and overwrites A's late answer within one
+  frame); it now records every journey frame and fails when A's state shows under B's title, even briefly.
+  Removing only `isCurrent()` still passes, because the abort calls also block it (layered guards).
+- The double-click and overlap tests were confirmed to fail on the Stage 18 page and pass after the fixes.
+- A live-suite bug of my own: `skip: null` made node:test report tests as skipped while hiding their failures.
+  Skip values are now `false` or a reason.
+
+**Results (local, 2026-10-05)**
+- `npm test` 172/172, `skipped 0` (backend and database tests included).
+- `npm run test:browser` 17/17.
+- `npm run test:live` against `WORKER_ENABLED=true`: 8 pass, 2 skipped by design. Against `WORKER_ENABLED=false`,
+  `MAX_EVENTS_PER_SESSION=2`, `LIVE_EVENT_LIMIT=2`: expiry, quota and paused worker pass.
+- Earlier scratch suites against a local worker server: Stage 12 24/25 (the deliberate offline/401 console
+  entries), 13 56/56, 14 41/41, 15 50/50, 16 49/49, 17 46/46, Stage 18 accessibility 19/19. Adapted for intended
+  changes only: presses 700 ms apart in Stage 13 (two Send presses within 600 ms now count as one), `aria-disabled`
+  instead of `disabled`, Stage 15 motion checks by effect type, token class and timing instead of text inside
+  illustrations, and the Stage 18 focus check accepting focus left on Send alert. One Stage 15 check failed once
+  because "processed" plays after the queued look-back (about 3.8 s); traced twice, one play per effect, then
+  50/50 twice.
+- Screenshots inspected (live suite, 1440 and 390 px, page and journey): confirmed, retry scheduled, offline stale,
+  retried successfully, processed once with a repeat recognized, stopped, replayed; fixtures: unconfirmed, quota,
+  paused worker; mid-animation frames of every token and ring at both widths.
+- **Rollback check:** 0.11.0 (`befb5d1`, exported with `git archive`) started against the current local schema:
+  `/ready` 200, worker started, a new event delivered on attempt 1 and processed. No migration since 008.
+- The checks created about 30 local demo sessions; two alerts sent to the paused server stayed pending until the
+  rollback server's worker delivered them.

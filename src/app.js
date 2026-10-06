@@ -1,3 +1,4 @@
+const fs = require('node:fs/promises');
 const path = require('node:path');
 const express = require('express');
 const { version } = require('../package.json');
@@ -26,7 +27,20 @@ const DEFAULTS = {
   apiRateLimit: { max: 600, windowMs: 60_000 },
   opsToken: undefined, // without it the private ops check is disabled
   workerStallSeconds: 60,
+  build: 'local', // see BUILD_ID in src/config.js
 };
+
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const PAGE_ASSETS = /(src|href)="\/((?:app|journey-model|journey-motion|guide-model)\.(?:js|css))"/g;
+
+// Stamps the page with the build it belongs to: a meta tag the page compares with /health, and ?v= on its own
+// script and stylesheet URLs so a new page never pairs with old cached assets.
+function stampPage(html, build) {
+  const v = encodeURIComponent(build);
+  return html
+    .replace('<meta charset="utf-8">', `<meta charset="utf-8">\n  <meta name="app-build" content="${v}">`)
+    .replace(PAGE_ASSETS, `$1="/$2?v=${v}"`);
+}
 
 function createApp({ pool, config = {} } = {}) {
   const settings = { ...DEFAULTS, ...config };
@@ -54,8 +68,9 @@ function createApp({ pool, config = {} } = {}) {
   // GET handler's status and headers but no body.
   app.get('/health', (req, res) => {
     res.set('Cache-Control', 'no-store');
-    // inProcessWorker says whether this process runs the delivery worker (WORKER_ENABLED).
-    res.json({ status: 'ok', version, inProcessWorker: settings.workerEnabled });
+    // build identifies the deployed code (see stampPage). inProcessWorker says whether this process runs the
+    // delivery worker (WORKER_ENABLED).
+    res.json({ status: 'ok', version, build: settings.build, inProcessWorker: settings.workerEnabled });
   });
   // Any other method on /health is a wrong-method error, not a missing route.
   app.all('/health', methodNotAllowed(['GET', 'HEAD']));
@@ -132,7 +147,13 @@ function createApp({ pool, config = {} } = {}) {
     app.get(`/docs/vendor/${file}`, (req, res) => res.sendFile(path.join(swaggerUi, file)));
   }
 
-  app.use(express.static(path.join(__dirname, '..', 'public')));
+  // The page itself, stamped with the build (read per request, so local edits show without a restart).
+  app.get(['/', '/index.html'], async (req, res) => {
+    const html = await fs.readFile(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+    res.set('Cache-Control', 'no-cache');
+    res.type('html').send(stampPage(html, settings.build));
+  });
+  app.use(express.static(PUBLIC_DIR));
 
   // Unknown routes get a JSON 404 so it is clear the server is up.
   app.use((req, res) => {

@@ -218,7 +218,8 @@ journey views and returns effects, keyed by **stable attempt keys** (`<deliveryI
   - → timeout → `timeout`
   - → connection failure → `no-connection`
 - **An attempt first seen already finished** (common: a success takes milliseconds and polling runs every 2 s)
-  gets a single `latest` effect. That's a short look back labelled **"Latest attempt (already finished)"**, played
+  gets a single `latest` effect. That's a short look back labelled **"Latest attempt (already finished)"** (a label
+  above the diagram, clear of the nodes), played
   only after its outcome is on screen, and only for the newest attempt. Older unseen attempts are not illustrated.
 - **Receipt evidence** drives the receiver card on its own: `processed` when a receipt first appears (even while
   the sender is still waiting), and `duplicate` ("Already processed") when the repeat count grows. A repeat never
@@ -229,6 +230,11 @@ journey views and returns effects, keyed by **stable attempt keys** (`<deliveryI
   nothing loops.
 - **Paths are measured from the current layout when an effect starts:** left to right in the row layout, and
   stacked on phones (forward packets down the left of the path labels, replies up the right).
+- **Illustrations never cover text (Stage 19).** Everything that moves is an 18 px icon-only token
+  (`JourneyMotion.TOKEN`) in a lane that stops 6 px short of the nodes: along the arrow line in the row layout,
+  along the edges of the path area when stacked. Node effects (accepted, processed, repeat) are rings drawn just
+  outside the node's box, never labels on top of it. The words are already on screen as static text. A fixture
+  test samples every visible illustration every 30 ms against every text run in the diagram, at 1440 and 390 px.
 - **Deduplication** is per effect type and key, so an attempt's live send and its later outcome both play, and
   never twice.
 - **The queue holds at most 2 pending effects**, keeping the newest.
@@ -237,14 +243,14 @@ journey views and returns effects, keyed by **stable attempt keys** (`<deliveryI
 
 | State | Static (always) | Motion (when on) |
 |---|---|---|
-| Accepted | *Accepted* badge | Brief "Saved" card at Your alert |
-| Sending | *Sending*, "Try n of max" | Envelope "Try n" travels along *Delivery try* |
-| Confirmed | *Confirmed*; acknowledgement *Delivery confirmed* with a return arrow | Teal "Delivery confirmed" marker travels back |
-| HTTP error (e.g. 503) | *Error reply* with a return arrow (a reply arrived); the alert stays retryable | Restrained outlined "Error reply" marker travels back |
-| Timeout | Acknowledgement *Timed out* on a broken line; the note says it is not proof of no processing | "Timed out" chip on the acknowledgement path; nothing travels back |
+| Accepted | *Accepted* badge | A teal ring pulses around Your alert |
+| Sending | *Sending*, "Try n of max" | An envelope token travels along *Delivery try* |
+| Confirmed | *Confirmed*; acknowledgement *Delivery confirmed* with a return arrow | A teal check token travels back |
+| HTTP error (e.g. 503) | *Error reply* with a return arrow (a reply arrived); the alert stays retryable | A restrained outlined cross token travels back |
+| Timeout | Acknowledgement *Timed out* on a broken line; the note says it is not proof of no processing | An hourglass token pulses on the acknowledgement path; nothing travels back |
 | Retry scheduled | *Trying again*, countdown, a wait bar from the last try's `endedAt` to `nextAttemptAt` | The wait bar fills smoothly; a new packet only when the next attempt is observed |
 | Exhausted | *Stopped*, with **Deliver again** inside the delivery service | Nothing (it settles; no motion left) |
-| Duplicate | "Already processed: n repeats recognized, not processed again" | "Already processed" chip at the receiver; no second result |
+| Processed / duplicate | Processing record *Processed*; "Already processed: n repeats recognized, not processed again" | A teal ring pulses around the processing record; no second result |
 
 **Motion control.** *Motion: on/off* in the journey header (`aria-pressed`). A system request to reduce motion
 (`prefers-reduced-motion: reduce`) always wins: the button then reads *Motion: off (system setting)* and is
@@ -417,6 +423,74 @@ because the scenario locks depend on it. No requests and no intervals run when i
 heading). Motion labels are `aria-hidden` and fade over about 0.2 s; mid-fade frames have low contrast by
 nature, but at rest they are #f5f0e6 on #1b2c50 (about 13:1) and the static journey always carries the same text.
 
+## Release validation (Stage 19)
+
+**Two kinds of browser test, kept apart** (`test/browser/`, run with an installed Edge or Chrome through
+`puppeteer-core`; nothing is downloaded; `BROWSER_PATH` chooses the browser):
+
+| Suite | Command | What answers the page | Use it for |
+|---|---|---|---|
+| Fixture | `npm run test:browser` | `fixture-api.js`: a scripted, session-scoped stand-in for the API, answered through request interception. Nothing moves unless the test moves it; it can hold, drop or lose individual answers | Races and failure paths that the real backend can't reproduce on demand. **Not evidence about the backend** |
+| Live | `BASE_URL=… npm run test:live` | The real server: API, worker, receiver, database | End-to-end behaviour, locally or against the deployed service |
+
+The page, its scripts and its CSP are real in both (the fixture suite serves them from the real app without a
+database). `npm test` stays browser-free.
+
+**Fixture suite (17 tests):** a double click while the request is in flight, and a person's double click after a
+fast answer (Send alert and the scenario card); a lost answer resolved by *Check again* with the same key; a lost
+answer resolved by a refresh from the alert list, with no resend; a request that never arrived, created once by
+*Check again*; a late answer for the previously selected alert (every journey frame is recorded, so a brief leak
+fails); single-flight polling; a late answer from the previous session; session expiry without an automatic new
+session; the quota message without retries; motion keyed by observed attempt IDs, never replayed by reselecting,
+resizing, toggling or refreshing; a paused worker (only the acceptance is illustrated; no try is claimed); reduced
+motion; keyboard-only use with visible focus; illustrations never covering text at 1440 and 390 px; the stale-build
+notice.
+
+**Live suite (10 tests):** first visit (no session until the visitor acts), sample choice and a normal send,
+confirmed and processed; a double click creating one alert; a temporary failure recovered by the scheduled retry,
+with the network dropped while it waits; processing before a timeout with one receiver result; retries exhausted
+and one manual replay; refresh and selection changes; reduced motion; a real 401 for an unknown token. Two checks
+need their own server: *quota* (`LIVE_EVENT_LIMIT` = the server's `MAX_EVENTS_PER_SESSION`) and *paused worker*
+(`WORKER_ENABLED=false`; the suite reads `/health` and runs only the checks that apply). `SCREENSHOT_DIR` saves
+desktop and phone screenshots of each outcome.
+
+**Defects the validation found (fixed in 0.12.0):**
+- **A person's double click could send two alerts.** The in-flight guard covered clicks during the request, but a
+  local send is answered in about 80–160 ms, so the second click of a double click arrived after the first alert
+  was accepted and was taken as a new send. A second press of the same control within 600 ms with nothing done in
+  between is now ignored (Send alert, scenario cards, Deliver again); choosing a sample or editing a field makes
+  the next press deliberate. Timing is used because touch screens and synthetic clicks don't report a click count.
+- **Keyboard focus was lost after every send:** *Send alert* became `disabled` while sending, and a disabled button
+  drops focus to the page. It is now `aria-disabled` (presses are ignored by the same checks).
+- **Illustrations covered text** at every width (labelled chips over node text and path labels). See *Motion*.
+
+**Build identification.** `/health` reports `build` (the deploy's commit on Render); the page carries the same value
+in `<meta name="app-build">` and on its own asset URLs. If they differ, a notice asks the visitor to reload, so an
+old tab isn't mistaken for an API problem. Checked on load, with *Check again*, and when a tab comes back after 10
+minutes or more. See `docs/release-checklist.md` → *Frontend release checks*.
+
+## Remaining limitations
+
+- **Polling gaps.** Polling runs every 2 s only while one of this page's alerts is active, or right after a
+  visitor action; otherwise the page is idle and sends nothing.
+  - A step shorter than 2 s (a success usually takes milliseconds) is never seen in progress: the page shows the
+    finished state and a labelled look-back, not a live send.
+  - Alerts created elsewhere (another tab, the API directly) appear only at the next refresh.
+  - In a hidden tab polling pauses; deliveries continue on the server, and the page jumps to the current state
+    when the tab is visible again.
+  - After errors, polling backs off up to 30 s; the stale state is labelled with its time.
+  - The receiver mode is re-read every 30 s and when the tab returns, so a change made in another tab can show
+    late here.
+- **Cross-tab receiver-mode races.** The mode belongs to the session, and a duplicated tab shares the session.
+  Starting a scenario re-reads the session's active deliveries just before changing the mode, but two tabs can
+  both pass that check and change the mode one after the other; the last change applies to every waiting retry in
+  the session. The server has no lock or version for the mode, so the page can narrow this window but not close it.
+  Guides are browser-side, so a guide in one tab doesn't know about another tab's guide.
+- **A tab left visible across a deploy** learns about the new build only on the checks above (load, *Check again*,
+  return after 10 minutes). Until then it runs the old page against the new API, which is compatible in 0.12.0.
+- **The fixture API is a model.** Fixture tests prove the page's handling of the answers they script; only the
+  live suite says anything about the backend.
+
 ## Known gaps (data the API doesn't provide)
 
 - **The alert list has no receiver data**, so history cards show processing only for alerts whose receipt was read
@@ -453,8 +527,11 @@ never creates one automatically.
 
 ## Checking the page
 
-- `npm test` includes `test/ui.test.js` (CSP, no inline script/handlers/styles, safe DOM APIs in both scripts, no
-  token in URLs) and `test/journey-model.test.js` (the adapter's mapping, with fixtures).
-- For visual and flow checks, run a local server with the worker on (`WORKER_ENABLED=true`) and use a real browser.
-  Stages 12–18 used headless Edge with puppeteer-core and axe-core from a scratch folder (not project
-  dependencies), with DevTools `Fetch` interception to hold, fail or delay specific requests. See the build notes.
+- `npm test` includes `test/ui.test.js` (CSP, no inline script/handlers/styles, safe DOM APIs in all scripts, no
+  token in URLs, build-stamped asset URLs) and the adapter, motion-planner, guide and history tests (with fixtures).
+- `npm run test:browser`: the fixture browser suite (see *Release validation*).
+- `npm run test:live` with `BASE_URL`: the live browser suite against a running server. Locally:
+  `PORT=3001 WORKER_ENABLED=true npm run dev` in one terminal, `BASE_URL=http://127.0.0.1:3001 npm run test:live`
+  in another.
+- Stages 12–18 also used scratch-folder suites (puppeteer-core and axe-core outside the project) for screenshots,
+  accessibility and layout measurements. See the build notes.

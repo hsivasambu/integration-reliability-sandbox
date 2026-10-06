@@ -175,7 +175,7 @@ button, input, textarea, select { font: inherit; color: inherit; }
   background: none; border: 0; padding: 0; min-height: 0; color: var(--teal-strong);
   font-weight: 600; text-decoration: underline; text-underline-offset: 0.15em; cursor: pointer;
 }
-.btn:disabled, .btn-link:disabled { opacity: 0.55; cursor: not-allowed; }
+.btn:disabled, .btn-link:disabled, .btn[aria-disabled="true"] { opacity: 0.55; cursor: not-allowed; }
 .button-row { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-4); }
 
 /* Forms */
@@ -473,11 +473,15 @@ details.tech h5 { margin: var(--space-3) 0 var(--space-1); font-size: var(--text
   opacity: 0; will-change: transform, opacity; box-shadow: 0 2px 8px rgb(0 0 0 / 0.35);
 }
 .jm .icon { width: 1rem; height: 1rem; }
-.jm-packet { background: var(--on-navy); color: var(--navy); border-radius: var(--radius-sm); }
-.jm-marker.is-done, .jm-chip.is-done, .jm-card.is-done { background: var(--teal-on-navy); color: var(--navy); }
-.jm-marker.is-failed, .jm-chip.is-failed { background: var(--navy); color: var(--red-on-navy); border: 1px solid var(--red-on-navy); }
-.jm-chip.is-waiting { background: var(--navy); color: var(--amber-on-navy); border: 1px dashed var(--amber-on-navy); }
 .jm-history { background: var(--navy-raised); color: var(--on-navy); border: 1px solid var(--on-navy-soft); }
+/* Travelling tokens (icon only, JourneyMotion.TOKEN = 18 px) and rings around nodes: illustrations stay off the text. */
+.jm-token { width: 18px; height: 18px; padding: 0; justify-content: center; border-radius: 50%; box-sizing: border-box; }
+.jm-token .icon { width: 12px; height: 12px; }
+.jm-token.is-packet { background: var(--on-navy); color: var(--navy); }
+.jm-token.is-done { background: var(--teal-on-navy); color: var(--navy); }
+.jm-token.is-failed { background: var(--navy); color: var(--red-on-navy); border: 1px solid var(--red-on-navy); }
+.jm-token.is-waiting { background: var(--navy); color: var(--amber-on-navy); border: 1px dashed var(--amber-on-navy); }
+.jm-ring { padding: 0; background: transparent; box-shadow: none; border: 2px solid var(--teal-on-navy); border-radius: var(--radius-md); }
 
 /* "Now" summary and history */
 .jd-stale {

@@ -49,6 +49,20 @@ function updateIfChanged(el, signature, build) {
   return true;
 }
 
+// A second press of the same control within 600 ms, with nothing done in between (a double click, a double tap, a
+// bounced key), is not a new action: a fast answer to the first press would otherwise let the second one send
+// another alert. Timing is used rather than the click count, which touch screens and synthetic clicks don't
+// report. Each repeat restarts the window, so rapid presses are ignored until there is a pause.
+const REPEAT_MS = 600;
+const lastActivation = new Map();
+function isRepeat(control) {
+  const now = performance.now();
+  const repeat = now - (lastActivation.get(control) ?? -Infinity) < REPEAT_MS;
+  lastActivation.set(control, now);
+  return repeat;
+}
+const singleClick = (control, fn) => (e) => (isRepeat(control) ? undefined : fn(e));
+
 // Outline icons (24×24, stroke only). Decorative: the words next to them carry the meaning.
 const ICON_PATHS = {
   send: ['M4 12 20 4l-5.5 16-3-7z', 'M11.5 13 20 4'],
@@ -160,6 +174,8 @@ const state = {
   poll: { timer: null, running: false, again: false, failures: 0, lastError: null },
   slowRequests: 0,
   service: { status: 'checking', detail: null }, // checking | ready | not_ready | unreachable | offline
+  serverBuild: null,       // the build /health reports (compared with this page's own, see PAGE_BUILD)
+  healthCheckedAt: null,
 };
 
 // --- API access ----------------------------------------------------------------
@@ -408,7 +424,13 @@ document.addEventListener('visibilitychange', () => {
     renderPollStatus('paused');
     motion.player.cancelAll();
     state.motionResync = true; // the next fresh data is recorded without replaying what was missed
-  } else { state.receiverReadAt = 0; pollNow(); keepFocus($('detail'), renderDetail); }
+  } else {
+    state.receiverReadAt = 0;
+    pollNow();
+    keepFocus($('detail'), renderDetail);
+    // A tab left open for a while may have missed a deploy: check the service's build again (at most every 10 min).
+    if (Date.now() - (state.healthCheckedAt ?? 0) > 10 * 60_000) checkStatus();
+  }
   syncCountdown();
 });
 window.addEventListener('pagehide', stopPolling);
@@ -1053,7 +1075,7 @@ function renderScenarioCards() {
       ? h('button', { type: 'button', class: 'btn btn-quiet', 'data-focus-key': `start-${id}`, onclick: () => { revealGuide(true); $('guide').focus(); } }, 'Go to the guide')
       : h('button', {
         type: 'button', class: 'btn btn-primary', 'data-focus-key': `start-${id}`,
-        disabled: Boolean(lock), 'aria-describedby': lock ? reasonId : null, onclick: () => startScenario(id),
+        disabled: Boolean(lock), 'aria-describedby': lock ? reasonId : null, onclick: singleClick('scenario', () => startScenario(id)),
       }, s.guided ? 'Start guide' : 'Send a normal alert');
     return h('article', { class: `card experiment${s.guided ? '' : ' is-normal'}`, 'aria-labelledby': `scenario-${id}` },
       icon(s.icon, 'exp-icon'),
@@ -1256,7 +1278,9 @@ function renderComposer() {
   ].join('\n');
 
   const button = $('submit-event');
-  button.disabled = state.submitting || Boolean(pending);
+  // aria-disabled, not disabled: a disabled button drops keyboard focus to the page. Presses are ignored while
+  // sending or while an alert is unconfirmed (sendDraft checks both), so nothing can be sent twice.
+  button.setAttribute('aria-disabled', state.submitting || pending ? 'true' : 'false');
   const firstSend = state.submitting && !pending?.lastError; // not a "Check again"
   button.textContent = state.creatingSession ? 'Starting session…' : firstSend ? 'Sending…' : 'Send alert';
   $('send-hint').textContent = pending
@@ -1749,7 +1773,7 @@ function renderDetail() {
   const detail = event && state.detail?.eventId === event.id ? state.detail : null;
   const canReplay = v.server && v.delivery.code === 'stopped' && detail;
   const recovery = canReplay
-    ? h('button', { type: 'button', class: 'btn btn-primary jd-recover', 'data-focus-key': 'replay', onclick: () => replayDelivery(v.deliveryId) },
+    ? h('button', { type: 'button', class: 'btn btn-primary jd-recover', 'data-focus-key': 'replay', onclick: singleClick('replay', () => replayDelivery(v.deliveryId)) },
       icon('replay'), 'Deliver again')
     : null;
   const actions = v.server
@@ -1859,23 +1883,37 @@ function journeyGeometry() {
   if (!del || !rec || !fwd || !ack || !diagram || layer.width === 0) return null;
   const pt = (x, y) => ({ x: x - layer.left, y: y - layer.top });
   const mid = (r) => pt(r.left + r.width / 2, r.top + r.height / 2);
+  // Rings sit just outside a box's edge (in the surrounding padding), never on the text inside it.
+  const ringBox = (r, out = 4) => ({ ...pt(r.left - out, r.top - out), width: r.width + 2 * out, height: r.height + 2 * out });
   const card = box('.jd-receiver .jd-card') ?? rec;
   const row = rec.left >= del.right - 1;
-  const inset = 14; // stop short of the node edges so moving labels don't cover the node headings
-  // Stacked layout: forward packets travel down the left of the path labels, replies up the right.
-  const side = row ? 0 : Math.min(100, (rec.width / 2) - 40);
-  const f = { ...mid(fwd), x: mid(fwd).x - side };
-  const a = { ...mid(ack), x: mid(ack).x + side };
+  // Illustrations use empty space only. Travelling tokens (JourneyMotion.TOKEN px, icon only) stay in a lane between
+  // the nodes and stop GAP px short of them: in the row layout along the arrow line, in the stacked layout down the
+  // left edge (forward) and up the right edge (replies) of the path area, beside the centred path labels.
+  const r = JourneyMotion.TOKEN / 2;
+  const GAP = 6;
+  const lanes = row
+    ? {
+      forwardFrom: pt(del.right + GAP + r, mid(fwd).y + layer.top), forwardTo: pt(rec.left - GAP - r, mid(fwd).y + layer.top),
+      ackFrom: pt(rec.left - GAP - r, mid(ack).y + layer.top), ackTo: pt(del.right + GAP + r, mid(ack).y + layer.top),
+    }
+    : (() => {
+      const paths = box('.jd-paths') ?? diagram;
+      const fx = paths.left + GAP + r;
+      const ax = paths.right - GAP - r;
+      return {
+        forwardFrom: pt(fx, del.bottom + GAP + r), forwardTo: pt(fx, rec.top - GAP - r),
+        ackFrom: pt(ax, rec.top - GAP - r), ackTo: pt(ax, del.bottom + GAP + r),
+      };
+    })();
+  const halfway = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
   return {
-    alert: mid(box('.jd-alert')),
-    receiver: mid(card),
-    forwardMid: f,
-    ackMid: a,
+    ...lanes,
+    forwardMid: halfway(lanes.forwardFrom, lanes.forwardTo),
+    ackMid: halfway(lanes.ackFrom, lanes.ackTo),
+    alertBox: ringBox(box('.jd-alert')), // node effects are rings around these boxes, never labels on top of them
+    receiverBox: ringBox(card),
     top: pt(diagram.right - 120, diagram.top - 14), // right-hand side, clear of the 'Updated' line
-    forwardFrom: row ? pt(del.right + inset, f.y + layer.top) : pt(f.x + layer.left, del.bottom + inset),
-    forwardTo: row ? pt(rec.left - inset, f.y + layer.top) : pt(f.x + layer.left, rec.top - inset),
-    ackFrom: row ? pt(rec.left - inset, a.y + layer.top) : pt(a.x + layer.left, rec.top - inset),
-    ackTo: row ? pt(del.right + inset, a.y + layer.top) : pt(a.x + layer.left, del.bottom + inset),
   };
 }
 
@@ -1958,6 +1996,20 @@ function renderSummary() {
 
 // --- service status (/health and /ready) -------------------------------------------
 
+// The build this page was loaded from (stamped into it by the server) and the build the service reports. If they
+// differ, this tab was opened before an update: it says so, rather than letting old code look like an API problem.
+const PAGE_BUILD = document.querySelector('meta[name="app-build"]')?.content || null;
+
+function renderBuildNote() {
+  const stale = Boolean(PAGE_BUILD && state.serverBuild && PAGE_BUILD !== state.serverBuild);
+  const note = $('build-note');
+  const text = stale
+    ? 'This page was loaded before the service was updated. Reload the page to get the current version. Your session and alerts are kept.'
+    : '';
+  if (note.textContent !== text) note.textContent = text;
+  note.hidden = !stale;
+}
+
 async function checkStatus() {
   const result = $('status-result');
   const button = $('check-status');
@@ -1970,10 +2022,14 @@ async function checkStatus() {
     const ready = await api('GET', '/ready', { auth: false });
     const ms = Math.round(performance.now() - started);
     const ok = health.status === 200 && ready.status === 200;
+    state.healthCheckedAt = Date.now();
+    state.serverBuild = health.data.build ?? null;
+    renderBuildNote();
     setService(ok ? 'ready' : 'not_ready', ready.data.reason);
     result.replaceChildren(ok ? 'Ready.' : 'Not ready.',
       ` Process: ${health.data.status} (version ${health.data.version}, delivery worker in this process: ${health.data.inProcessWorker ? 'yes' : 'no'}). `,
-      `Database: ${ready.status === 200 ? 'ready' : `unavailable (${ready.data.reason})`}. Checked in ${ms} ms.`);
+      `Database: ${ready.status === 200 ? 'ready' : `unavailable (${ready.data.reason})`}. Checked in ${ms} ms. `,
+      `Build: page ${PAGE_BUILD ?? 'unknown'}, service ${state.serverBuild ?? 'unknown'}.`);
   } catch (err) {
     setService(navigator.onLine === false ? 'offline' : 'unreachable', err.message);
     result.replaceChildren(unavailableBox(err));
@@ -1994,6 +2050,11 @@ for (const id of ['title', 'message']) {
     renderComposer();
   });
 }
+$('submit-event').addEventListener('click', (e) => {
+  if (isRepeat('send')) e.preventDefault(); // see singleClick
+});
+// Choosing a sample or editing a field between two presses makes the second one deliberate, not a double click.
+for (const type of ['input', 'change']) $('event-form').addEventListener(type, () => lastActivation.delete('send'));
 $('event-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   await sendDraft();

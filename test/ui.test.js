@@ -19,11 +19,13 @@ test('landing page is served with a strict Content-Security-Policy', async () =>
 test('page loads only same-origin script and stylesheet, with no inline script or handlers', async () => {
   const { text } = await request(app).get('/');
   const scripts = [...text.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)];
-  assert.deepEqual(scripts.map((m) => m[1].trim()), ['src="/journey-model.js"', 'src="/journey-motion.js"', 'src="/guide-model.js"', 'src="/app.js"']);
+  // Same-origin only, stamped with the build (see stampPage in src/app.js; the default build is 'local').
+  assert.deepEqual(scripts.map((m) => m[1].trim()),
+    ['src="/journey-model.js?v=local"', 'src="/journey-motion.js?v=local"', 'src="/guide-model.js?v=local"', 'src="/app.js?v=local"']);
   assert.ok(scripts.every((m) => m[2].trim() === ''), 'no inline script');
   assert.doesNotMatch(text, /\son[a-z]+=/i, 'no inline event handlers');
   assert.doesNotMatch(text, /\sstyle=/i, 'no inline styles (blocked by the CSP)');
-  assert.match(text, /<link rel="stylesheet" href="\/app.css">/);
+  assert.match(text, /<link rel="stylesheet" href="\/app.css\?v=local">/);
 });
 
 test('UI assets are served with correct types', async () => {

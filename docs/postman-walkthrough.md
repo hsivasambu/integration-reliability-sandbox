@@ -61,7 +61,7 @@ The bottom half of the window is the response:
 | Where | What to look at |
 |---|---|
 | Top right of the response: **Status** | `200 OK` here. Each request's name says which status to expect |
-| **Body** tab | The JSON, for example `{"status":"ok","version":"0.11.0","inProcessWorker":true}`. `inProcessWorker: true` means this server runs the delivery worker, which folders 3–7 need |
+| **Body** tab | The JSON, for example `{"status":"ok","version":"0.12.0","build":"local","inProcessWorker":true}`. `inProcessWorker: true` means this server runs the delivery worker, which folders 3–7 need |
 | **Headers** tab | `X-Request-Id` (matches the server's log line), `Location` (on 202), `Idempotent-Replayed` (on repeats), `Retry-After` (on 429) |
 | **Test Results** tab | The checks the collection ran on this response. Green **PASS** = the API behaved as documented |
 | **Console** (bottom-left of the window) | Short notes from the scripts, such as `event_id = …`. The token is never printed |

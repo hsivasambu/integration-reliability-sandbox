@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Integration Reliability Sandbox API
-  version: 0.11.0
+  version: 0.12.0
   summary: Submit synthetic events and watch them being delivered, retried, deduplicated and replayed.
   description: |
     A learning sandbox. Every request uses synthetic data, and the only delivery destination is a mock
@@ -76,7 +76,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Health' }
-              example: { status: ok, version: 0.11.0, inProcessWorker: true }
+              example: { status: ok, version: 0.12.0, build: 1a2b3c4d5e6f, inProcessWorker: true }
 
   /ready:
     get:
@@ -792,10 +792,16 @@ components:
 
     Health:
       type: object
-      required: [status, version, inProcessWorker]
+      required: [status, version, build, inProcessWorker]
       properties:
         status: { const: ok }
         version: { type: string }
+        build:
+          type: string
+          description: >-
+            Identifies the deployed code: the first 12 characters of the deploy's Git commit on Render (or
+            `BUILD_ID`), and `local` otherwise. The page carries the same value in `<meta name="app-build">`; if
+            the two differ, the page was loaded before a deploy.
         inProcessWorker:
           type: boolean
           description: Whether this process runs the delivery worker (`WORKER_ENABLED`). It doesn't say whether the worker is healthy.

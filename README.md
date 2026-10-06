@@ -2,7 +2,7 @@
 
 A learning sandbox that accepts synthetic JSON events (shown in the browser as practice *alerts*), persists them, and delivers them
 reliably to a controlled mock receiver.
-**Current stage: 18. Visitor-facing frontend: polish and accessibility.**
+**Current stage: 19. Visitor-facing frontend: validated and released (0.12.0).**
 
 | Want to… | Go to |
 |---|---|
@@ -26,10 +26,14 @@ npm run dev:migrate     # apply database migrations
 npm run dev             # start the app with .env loaded
 npm run dev:worker      # optional second terminal: standalone delivery worker (if WORKER_ENABLED=false)
 npm test                # all tests (database tests need TEST_DATABASE_URL)
+npm run test:browser    # browser tests against a fixture API (needs Edge or Chrome installed; BROWSER_PATH to choose)
+BASE_URL=http://127.0.0.1:3000 npm run test:live   # browser tests against a running server (worker on)
 ```
 
 `npm test` reports database-backed tests as **skipped** (not failed) when `TEST_DATABASE_URL` is unset. Check the
-summary line says `skipped 0` before trusting a green run.
+summary line says `skipped 0` before trusting a green run. The two browser suites are described in
+[`docs/frontend-notes.md`](docs/frontend-notes.md) → *Release validation*: fixtures for races that can't be
+reproduced on demand, the live suite for the real backend.
 
 Open http://localhost:3000 (API reference at http://localhost:3000/docs/). With `WORKER_ENABLED=true` in `.env` (or `npm run dev:worker` running), the page can
 run every scenario end to end.
@@ -92,7 +96,7 @@ database only accepts connections from Render's private network (`ipAllowList: [
 
 | Method & path | Response |
 |---|---|
-| `GET /health` | `200 {"status":"ok","version":"0.11.0","inProcessWorker":true|false}` while the process runs (no database check) |
+| `GET /health` | `200 {"status":"ok","version":"0.12.0","build":"…","inProcessWorker":true|false}` while the process runs (no database check). `build` is the deploy's commit (first 12 characters) on Render, `local` otherwise |
 | `HEAD /health` | `200`, headers only |
 | `GET /ready` | `200 {"status":"ready"}` if the database is reachable and migrated, otherwise `503` with `reason` |
 | `POST /v1/sessions` | `201` with a new demo token (shown once), `429` if rate limited, `503` at capacity |
@@ -231,7 +235,7 @@ JavaScript, HTML, CSS and inline SVG; no framework or build step. Design notes a
 |---|---|
 | Header | *Follow an Alert*, a **Demo** label, service availability (`/health` + `/ready`; *You are offline* only for the visitor's own connection), and a *Technical details* link |
 | Compose an alert (left) | Three **sample alerts** (Service request, Equipment notification, Team update) that fill an editable title and message with live character counts, a message-card preview, *View request JSON*, and one **Send alert** button (it starts the anonymous session when needed). If the answer is lost: *We could not confirm whether your alert was accepted* with **Check again** (same Idempotency-Key and payload). Also shows the current test receiver as one line |
-| Alert journey (right, navy) | A diagram of the three real components: **Your alert → Delivery service ⇄ Receiving system**. The delivery service carries the state badge (*Saved, Waiting, Sending, Trying again, Stopped, Confirmed*), with tries used, the next try time and a countdown. Separate *Delivery try* and *Acknowledgement* paths, plus a *Processing record* card driven by the receiver's receipt (*Unknown* if it can't be loaded). Below: an **Outcome** (delivery from acknowledgements, processing from the receiver's record, kept separate), a plain explanation, a timestamped timeline per delivery (replays kept separate) and of the receiver's record, *Reset view*, *Send an exact copy*, *Deliver again* (only after it stopped), and *Technical details* (request, status codes, IDs, timestamps, plain definitions, raw JSON; never the token). On a connection problem the last known state stays, marked with its time and *Reconnecting…*. **Motion** (with a *Motion: on/off* control that defaults to the system reduced-motion setting): a packet for a try observed live, a return marker only when a reply arrived, *Timed out* without a return arrow, *Already processed* for a recognized repeat, and a labelled *Latest attempt (already finished)* look back when a try finished between refreshes. Illustrations only: the text is always current and nothing is held back |
+| Alert journey (right, navy) | A diagram of the three real components: **Your alert → Delivery service ⇄ Receiving system**. The delivery service carries the state badge (*Saved, Waiting, Sending, Trying again, Stopped, Confirmed*), with tries used, the next try time and a countdown. Separate *Delivery try* and *Acknowledgement* paths, plus a *Processing record* card driven by the receiver's receipt (*Unknown* if it can't be loaded). Below: an **Outcome** (delivery from acknowledgements, processing from the receiver's record, kept separate), a plain explanation, a timestamped timeline per delivery (replays kept separate) and of the receiver's record, *Reset view*, *Send an exact copy*, *Deliver again* (only after it stopped), and *Technical details* (request, status codes, IDs, timestamps, plain definitions, raw JSON; never the token). On a connection problem the last known state stays, marked with its time and *Reconnecting…*. **Motion** (a *Motion: on/off* control; a system request to reduce motion always wins): an envelope token for a try observed live, a return token only when a reply arrived, an hourglass for a timeout with nothing returning, a ring around the processing record when it is processed or a repeat is recognized, and a labelled *Latest attempt (already finished)* look back when a try finished between refreshes. Tokens travel in lanes clear of the text. Illustrations only: the text is always current and nothing is held back |
 | Recent alerts | Compact cards: title, time, delivery state, processing when the receiver's record was read, and *View journey*. Updated in place (focus and scroll position are kept). *Load older alerts* uses the API's cursor; *New alert* only prepares a draft |
 | Try a scenario | **Normal delivery** and three guides: *Recover from a temporary problem* (you restore the receiver; the next scheduled try delivers), *Avoid processing twice* (the real receiver recognizes the repeat), *Rescue a stopped delivery* (restore, then retry by hand with the replay endpoint). One instruction at a time in a panel above the journey; steps advance only on API evidence; nothing starts on page load. Starting a guide, or changing the receiver under *Set the test receiver yourself*, is paused with a reason while any alert in the session is still being delivered (the setting is session-wide) |
 | Technical details | Service status with versions, session summary and delivery-time metric, how the token is stored, API docs links |
@@ -672,6 +676,7 @@ On Windows PowerShell, type `curl.exe` instead of `curl` (`curl` is an alias for
 | curl exit 6 `Could not resolve host` | Wrong hostname / typo in URL |
 | Render `502`/`503` or HTML "service waking up" page | Render can't reach a healthy app (crashed, still starting, or free instance spinning up) |
 | Browser Network tab shows `(blocked:other)` or `(blocked:client)` | The browser, an extension, or security software blocked the request. It never reached the server. |
+| The page says *"This page was loaded before the service was updated"* | An old tab after a deploy: the page's build differs from `/health`'s `build`. Reload; the service is fine. |
 
 ## Deploying to Render
 

@@ -99,6 +99,14 @@ function loadConfig(env = process.env) {
     problems.push('RECEIVER_URL must be an http:// or https:// URL');
   }
 
+  // Build identifier, reported by /health and stamped into the page, so a page loaded before a deploy can be told
+  // apart from an API problem. Render sets RENDER_GIT_COMMIT for every deploy; BUILD_ID overrides it.
+  const build = (env.BUILD_ID || env.RENDER_GIT_COMMIT || '').slice(0, 12);
+  if (build && !/^[0-9A-Za-z._-]+$/.test(build)) {
+    problems.push('BUILD_ID may only contain letters, digits, ".", "_" and "-"');
+  }
+  config.build = build || 'local';
+
   if (problems.length > 0) {
     throw new ConfigError(`Invalid configuration:\n  - ${problems.join('\n  - ')}`);
   }

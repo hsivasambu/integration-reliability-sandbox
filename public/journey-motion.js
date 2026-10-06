@@ -7,7 +7,8 @@
 //    alert's history is seen (page load, first selection, or after the tab was hidden) it is recorded
 //    silently: history is never animated as if it were happening now.
 //  - createPlayer(layer): draws the effects in an overlay layer with the Web Animations API, using only
-//    transform and opacity. Animations are short and bounded, never loop, and never delay the state text,
+//    transform and opacity. Moving tokens are icon-only and travel in lanes clear of text; node effects are rings
+//    around the node, never labels on top of it. Animations are short and bounded, never loop, and never delay the state text,
 //    which the page renders independently. They are illustrations, not measurements of real transmission.
 //
 // Node tests load this file with require() and use only the planner.
@@ -92,6 +93,7 @@
   // Player (browser only)
 
   const MAX_PENDING = 2; // bounded queue: when many updates arrive, older pending effects are dropped
+  const TOKEN = 18;      // diameter (CSS px) of a travelling token; app.css .jm-token uses the same size
 
   function createPlayer(layer, { getGeometry, label }) {
     let running = null;   // { animations: Animation[], elements: Element[] }
@@ -183,48 +185,56 @@
       return el;
     };
 
-    // Draws one effect. Returns promises that settle when its animations end.
+    // A ring around a node (alert accepted, receiver processed): it lights the node's edge and never covers its text.
+    function pulse(el, box, duration, delay, run) {
+      el.dataset.motion = 'true';
+      Object.assign(el.style, { left: `${Math.round(box.x)}px`, top: `${Math.round(box.y)}px`,
+        width: `${Math.round(box.width)}px`, height: `${Math.round(box.height)}px` });
+      layer.append(el);
+      run.elements.push(el);
+      return animate(el, [
+        { opacity: 0, transform: 'scale(1)' },
+        { opacity: 1, transform: 'scale(1.015)', offset: 0.3 },
+        { opacity: 0, transform: 'scale(1.03)' },
+      ], { duration, delay }, run);
+    }
+
+    // Draws one effect. Returns promises that settle when its animations end. Everything that moves is an icon-only
+    // token in a lane clear of text (see journeyGeometry in app.js); the words are already on screen as static text.
     function draw(effect, g, run) {
       const out = [];
-      const packet = (text) => tag('jm-packet', text, effect, 'mail');
+      const token = (tone, iconName) => tag(`jm-token ${tone}`, null, effect, iconName);
+      const ring = (tone) => tag(`jm-ring ${tone}`, null, effect, null);
+      const reply = (outcome, duration, delay) => {
+        if (outcome === 'ack') return travel(token('is-done', 'check'), g.ackFrom, g.ackTo, duration, delay, run);
+        if (outcome === 'error-reply') return travel(token('is-failed', 'cross'), g.ackFrom, g.ackTo, duration, delay, run);
+        // No reply arrived: nothing travels back; a waiting token pulses on the reply path.
+        if (outcome === 'timeout') return flash(token('is-waiting', 'hourglass'), g.ackMid, duration + 600, delay, run);
+        if (outcome === 'no-connection') return flash(token('is-failed', 'cross'), g.forwardMid, duration + 600, delay, run);
+        return null;
+      };
       switch (effect.type) {
         case 'accepted':
-          out.push(flash(tag('jm-card is-done', 'Saved', effect, 'check'), g.alert, 900, 0, run));
+          out.push(pulse(ring('is-done'), g.alertBox, 900, 0, run));
           break;
         case 'send':
-          out.push(travel(packet(`Try ${effect.attempt}`), g.forwardFrom, g.forwardTo, 900, 0, run));
+          out.push(travel(token('is-packet', 'mail'), g.forwardFrom, g.forwardTo, 900, 0, run));
           break;
-        case 'ack':
-          out.push(travel(tag('jm-marker is-done', 'Delivery confirmed', effect, 'check'), g.ackFrom, g.ackTo, 800, 0, run));
-          break;
-        case 'error-reply': // an HTTP error reply was observed: a restrained marker comes back
-          out.push(travel(tag('jm-marker is-failed', 'Error reply', effect, 'cross'), g.ackFrom, g.ackTo, 800, 0, run));
-          break;
-        case 'timeout': // no reply arrived: nothing travels back
-          out.push(flash(tag('jm-chip is-waiting', 'Timed out', effect, 'hourglass'), g.ackMid, 1400, 0, run));
-          break;
-        case 'no-connection':
-          out.push(flash(tag('jm-chip is-failed', 'No connection', effect, 'cross'), g.forwardMid, 1400, 0, run));
+        case 'ack': case 'error-reply': case 'timeout': case 'no-connection':
+          out.push(reply(effect.type, 800, 0));
           break;
         case 'processed':
-          out.push(flash(tag('jm-chip is-done', 'Processed', effect, 'inbox'), g.receiver, 1200, 0, run));
+          out.push(pulse(ring('is-done'), g.receiverBox, 1200, 0, run));
           break;
         case 'duplicate':
-          out.push(flash(tag('jm-chip is-done', 'Already processed', effect, 'inbox'), g.receiver, 1500, 0, run));
+          out.push(pulse(ring('is-done'), g.receiverBox, 1500, 0, run));
           break;
         case 'latest': {
           // A short historical look back, clearly labelled; it never pretends to be live.
           out.push(flash(tag('jm-history', 'Latest attempt (already finished)', effect, 'clock'), g.top, 1700, 0, run));
-          out.push(travel(packet(`Try ${effect.attempt}`), g.forwardFrom, g.forwardTo, 600, 150, run));
-          if (effect.outcome === 'ack') {
-            out.push(travel(tag('jm-marker is-done', 'Confirmed', effect, 'check'), g.ackFrom, g.ackTo, 550, 800, run));
-          } else if (effect.outcome === 'error-reply') {
-            out.push(travel(tag('jm-marker is-failed', 'Error reply', effect, 'cross'), g.ackFrom, g.ackTo, 550, 800, run));
-          } else if (effect.outcome === 'timeout') {
-            out.push(flash(tag('jm-chip is-waiting', 'Timed out', effect, 'hourglass'), g.ackMid, 900, 800, run));
-          } else if (effect.outcome === 'no-connection') {
-            out.push(flash(tag('jm-chip is-failed', 'No connection', effect, 'cross'), g.forwardMid, 900, 800, run));
-          }
+          out.push(travel(token('is-packet', 'mail'), g.forwardFrom, g.forwardTo, 600, 150, run));
+          const back = reply(effect.outcome, 550, 800);
+          if (back) out.push(back);
           break;
         }
         default:
@@ -240,7 +250,7 @@
     };
   }
 
-  const api = { createPlanner, createPlayer, MAX_PENDING };
+  const api = { createPlanner, createPlayer, MAX_PENDING, TOKEN };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.JourneyMotion = Object.freeze(api);
 })(typeof window !== 'undefined' ? window : globalThis);
