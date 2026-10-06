@@ -1530,3 +1530,5 @@ Requested: in the rescue scenario, offer only *Restore and retry*. While the gui
 Restore and retry in the guide above." Leaving the guide brings it back; later steps that point to *Deliver again*
 are unchanged. Fixture test (fails on the previous page, passes now); the live rescue test checks it too.
 Local results: `npm test` 173/173 (skipped 0), fixture suite 21/21, live suite 8 pass, 2 skipped by design.
+- **Deployed** (`c15e969` on Render, 2026-10-06): build `c15e969f39fb`, `/ready` 200; `npm run test:live` against Render
+  8 pass, 2 skipped by design, including the check that only *Restore and retry* is offered.
