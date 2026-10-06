@@ -1354,3 +1354,57 @@ push; `/ready` 200.
 
 
 
+
+## Stage 18: Polish and accessibility across the frontend (2026-10-05)
+
+**Before starting.** Clean tree at `349d9b1`. Findings from an audit and a measurement script (headless Edge,
+instrumented timers, `PerformanceObserver` layout shifts, `MutationObserver` on live regions, request log):
+- The explicit *Motion: on* choice overrode an OS request to reduce motion.
+- Live regions were rewritten on every render or poll: in 10 s of an active retry, session line 9, result 10,
+  announcer 8, poll status 6, receiver lock 9, technical summary 9 mutations. The unconfirmed-send panel
+  (`role=alert`) was rebuilt the same way.
+- The announcer spoke on any change of the delivery/processing wording, including "Sending".
+- Cumulative layout shift 0.347 on a first visit and send: sample cards, preview, history and scenario cards were
+  created after the first paint (top shift 0.276 at 166 ms).
+- One em dash in the journey facts; error notices led with HTTP details.
+- Requests: one polling owner, 0 requests and 0 intervals when idle, 20 requests per 10 s while a retry is active
+  (events, receiver, summary, deliveries, receipt, 4 each). Assets: no images or fonts; Render serves Brotli
+  (`app.js` 92 KB raw, 28 KB transferred).
+
+**Changes** (details in `docs/frontend-notes.md` → *Polish and accessibility*)
+- Motion: OS request always wins; the control can only reduce further, shows *Motion: off (system setting)* and is
+  disabled then; changes re-evaluated live. Smooth scroll follows the same rule.
+- Announcer: meaningful transitions only (retry scheduled, confirmed, stopped, processed, repeat recognized), plus
+  one message each for connection lost and restored.
+- Live regions and the pending panel update only when their content changes; the stale banner and summary are no
+  longer live regions.
+- First-visit content of the composer, empty journey, history and scenarios is in `index.html`; the empty journey
+  is the three-part diagram marked *Not started*.
+- Composer order: Send directly under the message, its result after it, then preview and request JSON. Intro link
+  to the scenarios.
+- `GET /v1/receiver` every 30 s and on tab return instead of every poll.
+- Copy: no em dash, plain next actions, HTTP details in a collapsed *Technical details*.
+- Keyboard-focusable scrollable `<pre>`, 24 px disclosure targets, 3-line clamp for the title in the alert node.
+
+**Checked** (scratchpad scripts, not project dependencies)
+- After: CLS 0.0001 (1 shift, the header pill); 16 requests per 10 s during a retry; idle 0 requests, 0 intervals;
+  live-region mutations in 10 s of retry: session 3, result 2, announcer 3, poll status 1, lock 2, others 0.
+- Screens at 320, 390, 768 and 1440 px in six states (first visit, validation error with a 500-character message
+  and unbroken words, long alert confirmed, guide with an active retry, completed with technical details open,
+  offline stale), plus *Service not ready* at load. No horizontal scroll, no overlapping journey labels, no button
+  or summary under 24 px (radios sit inside full-card labels). 320 px also stands for 400% zoom of 1280 px.
+  Screenshots were inspected by eye; the 768 px row layout led to the title clamp.
+- axe-core (WCAG 2.0/2.1/2.2 A and AA tags): no violations in first visit, validation error, confirmed journey,
+  guide with active retry, completed with technical details, offline stale. Contrast findings appeared only on
+  `aria-hidden` motion labels mid-fade (excluded; they are about 13:1 at rest, and none appear with motion off).
+- Announcements in a guided retry: "Delivery confirmed", "Try 1 did not get through. Retry scheduled", "Try 2 …",
+  "Delivery confirmed" with no repeats; connection loss announced once; focus not moved by background work.
+- Motion: default on; toggle off; OS reduce applied live and after reload over a stored "on"; no animations under
+  OS reduce or explicit off while deliveries still complete; control usable again when the OS setting clears.
+- `npm test` 171/171.
+- Earlier browser suites, local: Stage 12 24/25 (the deliberate offline/401 console entries), 13 56/56, 14 41/41,
+  15 50/50, 16 49/49, 17 46/46. They found two problems in my own changes, both fixed: a reloaded session briefly
+  showed "Not started" while its alert loaded (Stage 14 check), and the moved result notice made the browser's
+  scroll anchoring move a focused history card by 106 px (Stage 17 check; traced, then `overflow-anchor: none`
+  on the composer). Stage 15 checks for "explicit Motion on overrides the system setting" were replaced by the
+  Stage 18 rule; the Stage 14 empty-journey check now matches the uppercase node names case-insensitively.

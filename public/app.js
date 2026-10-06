@@ -40,6 +40,15 @@ function h(tag, attrs = {}, ...children) {
   return el;
 }
 
+// Updates a region only when its content signature changes, so live regions don't re-announce the same
+// text on every refresh.
+function updateIfChanged(el, signature, build) {
+  if (el.dataset.sig === signature) return false;
+  el.dataset.sig = signature;
+  el.replaceChildren(...build().filter(Boolean));
+  return true;
+}
+
 // Outline icons (24×24, stroke only). Decorative: the words next to them carry the meaning.
 const ICON_PATHS = {
   send: ['M4 12 20 4l-5.5 16-3-7z', 'M11.5 13 20 4'],
@@ -93,7 +102,7 @@ const storage = {
 const time = (iso) => (iso ? new Date(iso).toLocaleTimeString() : '');
 const secondsUntil = (iso) => Math.max(0, Math.round((new Date(iso) - Date.now()) / 1000));
 const shortId = (id) => id.slice(0, 8);
-const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches || storage.get(KEYS.motion) === 'off';
 
 // Sample alerts. Each fits the API's only event type (demo.notification) and its two fields:
 // a title and a message. No urgency, recipients or routing exist in the API, so none are implied.
@@ -183,7 +192,7 @@ async function api(method, path, { body, headers = {}, auth = true, signal } = {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     const isJson = (response.headers.get('content-type') || '').includes('application/json');
-    if (!isJson) throw new Unavailable(`The server answered HTTP ${response.status} without API data; it may be starting up.`);
+    if (!isJson) throw new Unavailable(`The service may be starting up (HTTP ${response.status} without API data).`);
     const data = await response.json();
     // Only a 401 for the session that is still current ends it; a late answer for an older session doesn't.
     if (response.status === 401 && sentToken && sentToken === state.token) sessionExpired();
@@ -215,8 +224,10 @@ const ERROR_TEXT = {
 };
 const FIELD_NAMES = { 'payload.title': 'Alert title', 'payload.message': 'Alert message' };
 
+// Status codes and identifiers stay out of the default view: they sit in a collapsed "Technical details".
 function techLine(...parts) {
-  return h('p', { class: 'hint' }, h('span', { class: 'visually-hidden' }, 'Technical: '), parts.filter(Boolean).join(' · '));
+  return h('details', { class: 'tech tech-inline' }, h('summary', {}, 'Technical details'),
+    h('p', {}, parts.filter(Boolean).join(' · ')));
 }
 
 // Turns an API error answer into a readable notice (validation details included).
@@ -229,8 +240,8 @@ function errorBox(status, data) {
 }
 
 function unavailableBox(err) {
-  return h('div', { class: 'notice is-failed' }, h('strong', {}, 'No answer from the service. '), err.message,
-    ' As far as this page can tell, nothing was changed; you can try again.');
+  return h('div', { class: 'notice is-failed' }, h('strong', {}, 'No answer from the service. '),
+    'Nothing seems to have changed. Check your connection, then try again.', techLine(err.message));
 }
 
 // --- polling -------------------------------------------------------------------
@@ -259,6 +270,7 @@ async function pollNow() {
     state.poll.failures = 0;
     state.poll.lastError = null;
     if (completed) state.connection = { status: 'live', lastUpdatedAt: Date.now() };
+    announceConnection('live');
     // A successful refresh reached the API and its database.
     if (state.service.status !== 'ready') setService('ready');
   } catch (err) {
@@ -270,6 +282,7 @@ async function pollNow() {
       if (err instanceof Unavailable) setService(navigator.onLine === false ? 'offline' : 'unreachable', err.message);
       // Keep the last known state and mark it as stale. A polling failure is not a delivery failure.
       state.connection = { ...state.connection, status: 'reconnecting' };
+      announceConnection('reconnecting');
       keepFocus($('detail'), renderDetail);
       renderGuide();          // "Waiting for the delivery service" with Reconnect
       renderScenarioCards();  // locks depend on the connection too
@@ -303,20 +316,26 @@ async function refresh() {
   const controller = new AbortController();
   state.refreshController = controller;
   const { signal } = controller;
+  const readReceiver = !state.receiver || Date.now() - (state.receiverReadAt ?? 0) > 30000;
   const [events, receiver, summary] = await Promise.all([
-    api('GET', '/v1/events?limit=20', { signal }), api('GET', '/v1/receiver', { signal }), api('GET', '/v1/summary', { signal }),
+    api('GET', '/v1/events?limit=20', { signal }),
+    readReceiver ? api('GET', '/v1/receiver', { signal }) : null,
+    api('GET', '/v1/summary', { signal }),
   ]);
   // Answers for a session that is no longer current must never reach the screen.
   if (state.token !== token) return false;
-  if (events.status !== 200 || receiver.status !== 200) {
-    throw new Unavailable(`The API answered HTTP ${events.status !== 200 ? events.status : receiver.status}.`);
+  if (events.status !== 200 || (receiver && receiver.status !== 200)) {
+    throw new Unavailable(`The service answered with an error (HTTP ${events.status !== 200 ? events.status : receiver.status}).`);
   }
   state.events = events.data.data;
   const checkedAt = Date.now();
   for (const e of state.events) state.known.set(e.id, { event: e, checkedAt });
   state.firstPageIds = new Set(state.events.map((e) => e.id));
   if (!state.olderLoaded) state.olderCursor = events.data.nextCursor;
-  state.receiver = receiver.data;
+  if (receiver) {
+    state.receiver = receiver.data;
+    state.receiverReadAt = Date.now();
+  }
   if (summary.status === 200) state.summary = summary.data;
   // An unconfirmed submission can be confirmed by reading: if an alert with its Idempotency-Key is in the
   // list, it was accepted. Not finding it proves nothing, so that never resolves anything.
@@ -389,7 +408,7 @@ document.addEventListener('visibilitychange', () => {
     renderPollStatus('paused');
     motion.player.cancelAll();
     state.motionResync = true; // the next fresh data is recorded without replaying what was missed
-  } else { pollNow(); keepFocus($('detail'), renderDetail); }
+  } else { state.receiverReadAt = 0; pollNow(); keepFocus($('detail'), renderDetail); }
   syncCountdown();
 });
 window.addEventListener('pagehide', stopPolling);
@@ -694,6 +713,7 @@ async function setReceiverMode(mode) {
       return false;
     }
     state.receiver = res.data;
+    state.receiverReadAt = Date.now();
     status.textContent = `Saved. The test receiver now: ${MODE_INFO[mode][0]}.`;
     renderReceiver();
     return true;
@@ -1046,7 +1066,7 @@ function renderScenarioCards() {
       lock ? h('p', { class: 'hint lock-reason', id: reasonId }, lock) : null,
       mine ? h('p', { class: 'hint' }, 'In progress: the guide is shown above the journey.') : null);
   })));
-  $('scenario-note').replaceChildren(...[state.guideNote ? h('p', { class: 'notice is-waiting' }, state.guideNote) : null].filter(Boolean));
+  updateIfChanged($('scenario-note'), state.guideNote ?? '', () => [state.guideNote ? h('p', { class: 'notice is-waiting' }, state.guideNote) : null]);
 }
 
 const MODE_INFO = {
@@ -1112,21 +1132,26 @@ function renderService() {
     }[status];
   const pill = $('service-status');
   pill.className = `status-pill ${view[0]}`;
-  pill.replaceChildren(icon(view[1]), view[2]);
+  updateIfChanged(pill, view.join('|'), () => [icon(view[1]), view[2]]);
 }
 
 function renderWakeBanner() {
   const banner = $('wake-banner');
   banner.hidden = state.slowRequests === 0;
-  banner.textContent = state.slowRequests > 0
-    ? 'Waiting for the server… On the free hosting plan the service sleeps after 15 minutes without visitors '
-      + 'and can take about a minute to wake up. Nothing has failed: your request is still in progress.'
+  const text = state.slowRequests > 0
+    ? 'Waiting for the server. The free service sleeps after 15 minutes without visitors and can take about a '
+      + 'minute to wake up. Nothing has failed: your request is still on its way.'
     : '';
+  if (banner.textContent !== text) banner.textContent = text;
   renderService();
 }
 
 function renderSession() {
   const area = $('session-area');
+  const signature = JSON.stringify([state.token ? 1 : 0, state.expiresAt, state.sessionNote, state.creatingSession,
+    state.submitting, Boolean(state.pendingSubmit)]);
+  if (area.dataset.sig === signature) return;
+  area.dataset.sig = signature;
   const children = [];
   if (state.sessionNote) children.push(h('div', { class: 'notice is-waiting' }, state.sessionNote));
   if (state.token) {
@@ -1158,7 +1183,7 @@ function renderReceiver() {
     input.checked = input.value === current;
     input.disabled = !state.token || Boolean(lock);
   }
-  $('receiver-lock').textContent = lock ?? '';
+  if ($('receiver-lock').textContent !== (lock ?? '')) $('receiver-lock').textContent = lock ?? '';
   if (!state.token) $('receiver-status').textContent = 'Start a session to choose how the test receiver responds.';
   else if (state.receiver && !$('receiver-status').textContent) {
     $('receiver-status').textContent = `Currently: ${MODE_INFO[current]?.[0] ?? current}.`;
@@ -1189,14 +1214,16 @@ async function changeModeByHand(mode) {
 function renderComposer() {
   // Sample cards: created once, then only updated, so refreshes never move keyboard focus.
   const list = $('preset-list');
-  if (!list.firstChild) {
-    list.append(...PRESETS.map((p, i) => {
-      const input = h('input', { type: 'radio', name: 'preset', value: p.id, id: `preset-${p.id}` });
-      input.addEventListener('change', () => choosePreset(i));
-      return h('label', { for: `preset-${p.id}`, class: 'preset' }, input,
+  if (!list.dataset.bound) {
+    // index.html already contains these cards (so the first paint doesn't shift); create them only if not.
+    if (!list.querySelector('input')) {
+      list.replaceChildren(...PRESETS.map((p) => h('label', { for: `preset-${p.id}`, class: 'preset' },
+        h('input', { type: 'radio', name: 'preset', value: p.id, id: `preset-${p.id}` }),
         icon(p.icon, 'preset-icon'),
-        h('span', { class: 'preset-text' }, h('strong', {}, p.title), h('span', {}, p.message)));
-    }));
+        h('span', { class: 'preset-text' }, h('strong', {}, p.title), h('span', {}, p.message)))));
+    }
+    list.querySelectorAll('input').forEach((input, i) => input.addEventListener('change', () => choosePreset(i)));
+    list.dataset.bound = 'true';
   }
   list.querySelectorAll('input').forEach((input, i) => { input.checked = state.preset === i; });
 
@@ -1237,7 +1264,10 @@ function renderComposer() {
     : state.token ? '' : 'Sending starts a private demo session: anonymous, no sign-up, and it ends after 24 hours.';
 
   renderPending();
-  $('submit-result').replaceChildren(...[state.submitNote].filter(Boolean));
+  const result = $('submit-result');
+  if (result.firstChild !== state.submitNote && !(result.firstChild === null && !state.submitNote)) {
+    result.replaceChildren(...[state.submitNote].filter(Boolean));
+  }
 
   const mode = state.token ? state.receiver?.mode : 'success';
   $('receiver-label').replaceChildren(icon('inbox'),
@@ -1251,12 +1281,16 @@ function renderPending() {
   const area = $('pending-area');
   const pending = state.pendingSubmit;
   if (!pending || (pending.status === 'sending' && !pending.lastError)) {
-    area.replaceChildren();
+    if (area.firstChild) area.replaceChildren();
+    delete area.dataset.sig;
     return;
   }
   const checking = state.submitting;
   const draftDiffers = JSON.stringify(pending.body) !== JSON.stringify(draftBody());
-  area.replaceChildren(h('div', { class: 'notice is-waiting pending', role: 'alert' },
+  const signature = JSON.stringify([pending.key, pending.status, pending.lastError, checking, draftDiffers]);
+  if (area.dataset.sig === signature) return;
+  area.dataset.sig = signature;
+  keepFocus(area, () => area.replaceChildren(h('div', { class: 'notice is-waiting pending', role: 'alert' },
     h('p', {}, h('strong', {}, checking ? 'Checking…' : 'We could not confirm whether your alert was accepted.')),
     h('p', {}, 'The connection failed or timed out after the alert was sent. ',
       'Check again repeats the exact same request, so it cannot create a second alert.'),
@@ -1266,7 +1300,7 @@ function renderPending() {
       h('button', { type: 'button', class: 'btn btn-primary', 'data-focus-key': 'check-again', onclick: () => checkAgain(), disabled: checking },
         checking ? 'Checking…' : 'Check again'),
       h('button', { type: 'button', class: 'btn btn-quiet', onclick: () => stopChecking(), disabled: checking }, 'Stop checking')),
-    techLine(pending.lastError, `Idempotency-Key ${pending.key}`)));
+    techLine(pending.lastError, `Idempotency-Key ${pending.key}`))));
 }
 
 // --- alert history (Stage 17) ----------------------------------------------------------
@@ -1440,11 +1474,12 @@ function renderPollStatus(mode, delay) {
     active: 'Updating every 2 seconds while alerts are on their way.',
     idle: 'All alerts have finished. Updates resume when you send or deliver again.',
     paused: 'Updates paused while this tab is hidden.',
-    backoff: `Couldn't update (${state.poll.lastError}). Trying again in ${Math.round((delay ?? 0) / 1000)} s.`,
+    backoff: `Couldn't update. ${state.poll.lastError} Trying again in ${Math.round((delay ?? 0) / 1000)} s.`,
   }[mode];
   const el = $('poll-status');
-  el.replaceChildren(text ?? '');
-  if (mode === 'backoff') el.append(' ', h('button', { type: 'button', class: 'btn-link', onclick: () => pollNow() }, 'Retry now'));
+  updateIfChanged(el, `${mode}|${text}`, () => [text ?? '',
+    mode === 'backoff' ? ' ' : null,
+    mode === 'backoff' ? h('button', { type: 'button', class: 'btn-link', onclick: () => pollNow() }, 'Retry now') : null]);
 }
 
 // --- journey (Stage 14) ------------------------------------------------------------
@@ -1502,7 +1537,7 @@ function journeyDiagram(v, recovery) {
   const p = v.processing;
   return h('div', { class: 'jd', role: 'group', 'aria-label': 'Alert journey diagram' },
     journeyNode('alert', 'Your alert', 'bell', v.alert,
-      h('p', { class: 'jd-detail' }, v.title),
+      h('p', { class: 'jd-detail jd-alert-title', title: v.title }, v.title), // clamped; the full title is the heading above
       v.acceptedAt ? h('p', { class: 'jd-meta' }, `Accepted ${fullTime(v.acceptedAt)}`) : h('p', { class: 'jd-meta' }, v.alert.detail)),
     h('div', { class: `jd-link jd-handover ${v.handover.tone}` },
       h('span', { class: 'jd-line' }, icon('arrow-right', 'jd-arrow')), h('span', { class: 'jd-path-state' }, v.handover.label)),
@@ -1526,8 +1561,8 @@ function journeyNow(v) {
   const d = v.delivery;
   const facts = [
     ['Delivery', d.label],
-    ['Tries', triesText(d) ?? '—'],
-    ['Next try', d.code === 'retrying' ? `at ${fullTime(d.nextAttemptAt)}` : d.code === 'waiting' && d.nextAttemptAt ? `was due at ${fullTime(d.nextAttemptAt)}` : '—'],
+    ['Tries', triesText(d) ?? 'None yet'],
+    ['Next try', d.code === 'retrying' ? `at ${fullTime(d.nextAttemptAt)}` : d.code === 'waiting' && d.nextAttemptAt ? `was due at ${fullTime(d.nextAttemptAt)}` : 'None scheduled'],
     ['Processing', v.processing.label],
   ];
   return h('div', { class: 'jd-now' },
@@ -1540,7 +1575,7 @@ function journeyNow(v) {
 
 function staleBanner(v) {
   if (!v.stale) return null;
-  return h('p', { class: 'jd-stale', role: 'status' }, icon('offline'),
+  return h('p', { class: 'jd-stale' }, icon('offline'),
     v.stale.since
       ? `Reconnecting… Showing the last known state, from ${fullTime(v.stale.since)}`
       : 'Reconnecting… Nothing could be loaded yet.');
@@ -1611,7 +1646,7 @@ function technicalView(event, detail) {
   const details = h('details', { class: 'tech', open: state.techOpen },
     h('summary', { 'data-focus-key': 'tech' }, 'Technical details: request, status codes, IDs and timestamps'),
     h('h5', {}, 'The request that created this alert'),
-    h('pre', {}, request),
+    h('pre', { tabindex: '0', 'aria-label': 'Request details' }, request),
     h('p', {}, 'Response: HTTP 202 Accepted (saved and queued, not yet delivered). Sending exactly the same request again returns HTTP 200 with this same alert.'),
     h('h5', {}, 'Identifiers and times'),
     h('dl', { class: 'tech-terms' },
@@ -1639,7 +1674,7 @@ function technicalView(event, detail) {
       h('li', {}, h('strong', {}, 'Submission idempotency'), ' (sender side): the Idempotency-Key makes a repeated request return the same alert, so retrying a send can never create a second alert.'),
       h('li', {}, h('strong', {}, 'Receiver duplicate protection'), ' (receiving side): the receiving system remembers each alert\'s Event ID, so when the same alert is delivered again (after a timeout or a retry) it recognizes it and does not process it twice.')),
     h('h5', {}, 'Raw API data'),
-    h('pre', {}, JSON.stringify({ event, deliveries: detail?.deliveries ?? null, receipt: detail?.receipt ?? null }, null, 2)));
+    h('pre', { tabindex: '0', 'aria-label': 'Raw API records' }, JSON.stringify({ event, deliveries: detail?.deliveries ?? null, receipt: detail?.receipt ?? null }, null, 2)));
   details.addEventListener('toggle', () => { state.techOpen = details.open; });
   return details;
 }
@@ -1676,6 +1711,21 @@ const EMPTY_STEPS = [
   ['Receiving system', 'inbox', 'A test system inside this sandbox that confirms and processes alerts.'],
 ];
 
+// The same three-part diagram before anything is sent, so the journey is the main visual from the start.
+// Every part says "Not started"; nothing here comes from or claims any server state.
+function emptyDiagram() {
+  const idle = { label: 'Not started', tone: 'is-idle', icon: 'dash' };
+  const [alertText, deliveryText, receiverText] = EMPTY_STEPS.map(([, , text]) => text);
+  return h('div', { class: 'jd jd-empty', role: 'group', 'aria-label': 'Alert journey diagram, not started' },
+    journeyNode('alert', 'Your alert', 'bell', idle, h('p', { class: 'jd-meta' }, alertText)),
+    h('div', { class: 'jd-link jd-handover is-idle' }, h('span', { class: 'jd-line' }, icon('arrow-right', 'jd-arrow'))),
+    journeyNode('delivery', 'Delivery service', 'send', idle, h('p', { class: 'jd-meta' }, deliveryText)),
+    h('div', { class: 'jd-link jd-paths' },
+      journeyPath('forward', 'Delivery try', 'forward', { label: 'No try yet', tone: 'is-idle' }),
+      journeyPath('ack', 'Acknowledgement', 'back', { label: 'No reply yet', tone: 'is-idle', responseObserved: false })),
+    journeyNode('receiver', 'Receiving system', 'inbox', idle, h('p', { class: 'jd-meta' }, receiverText)));
+}
+
 function renderDetail() {
   const container = $('detail');
   const v = currentJourneyView();
@@ -1685,7 +1735,9 @@ function renderDetail() {
       h('p', {}, !state.token
         ? 'Send an alert to see its journey here, step by step.'
         : state.known.size ? 'Choose View journey on any alert under Recent alerts.' : 'Send an alert to see its journey here.'),
-      h('ul', { class: 'jd-legend' }, EMPTY_STEPS.map(([name, iconName, text]) =>
+      // "Not started" is only true before any session exists. With a session (a restored alert may still be
+      // loading) the parts are described without a state.
+      !state.token ? emptyDiagram() : h('ul', { class: 'jd-legend' }, EMPTY_STEPS.map(([name, iconName, text]) =>
         h('li', {}, icon(iconName), h('span', {}, h('strong', {}, name), ` · ${text}`))))));
     announce(null);
     syncCountdown();
@@ -1731,14 +1783,35 @@ function renderDetail() {
   if (motionOn() && !document.hidden) motion.player.enqueue(effects);
 }
 
-// Screen readers hear a short sentence only when the delivery or processing state actually changes,
-// not on every refresh.
+// Screen readers hear one short sentence only for meaningful transitions of the alert being watched:
+// a retry scheduled, delivery confirmed or stopped, processed, a repeat recognized. Not for "sending",
+// countdown ticks or routine refreshes, and nothing when a different alert is selected or the page loads.
+function meaningful(v) {
+  if (!v?.server) return null;
+  const d = v.delivery;
+  const parts = [];
+  if (d.code === 'retrying') parts.push(`Try ${d.triesSoFar} did not get through. Retry scheduled`);
+  if (d.code === 'confirmed') parts.push('Delivery confirmed');
+  if (d.code === 'stopped') parts.push('Delivery stopped');
+  if (v.processing.code === 'processed') parts.push(v.processing.repeats > 0 ? 'Repeat recognized, not processed again' : 'Receiver processed the alert');
+  return { eventId: v.eventId, key: `${d.code === 'retrying' ? `retry${d.triesSoFar}` : d.code}|${v.processing.code}|${v.processing.repeats ?? 0}`, text: parts.join('. ') };
+}
 function announce(v) {
-  const text = v ? `${v.title}: delivery ${v.delivery.label}. Processing ${v.processing.label}.` : null;
-  if (text === state.announced) return;
-  const first = state.announced === null;
-  state.announced = text;
-  if (text && !first) $('journey-announce').textContent = text;
+  const m = meaningful(v);
+  const previous = state.announced;
+  state.announced = m;
+  if (!m || !previous || previous.eventId !== m.eventId || previous.key === m.key || !m.text) return;
+  $('journey-announce').textContent = `${v.title}: ${m.text}.`;
+}
+// The connection itself: announced once when it is lost and once when it is back.
+function announceConnection(status) {
+  if (state.announcedConnection === status) return;
+  const previous = state.announcedConnection;
+  state.announcedConnection = status;
+  if (!previous) return;
+  $('journey-announce').textContent = status === 'reconnecting'
+    ? 'Connection lost. Showing the last known state. Reconnecting.'
+    : 'Connection restored.';
 }
 
 // Updates "in about N s" once a second while a retry is scheduled. When it reaches zero, the journey is
@@ -1764,8 +1837,9 @@ function tickCountdown() {
 // Illustrations only (public/journey-motion.js). The state text above is always current on its own.
 
 const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
-// The visitor's explicit choice wins; otherwise follow the system's reduced-motion setting.
-const motionOn = () => (storage.get(KEYS.motion) ?? (motionQuery.matches ? 'off' : 'on')) === 'on';
+// A system request to reduce motion always wins. The page's own control can only reduce motion further.
+const systemReducesMotion = () => motionQuery.matches;
+const motionOn = () => !systemReducesMotion() && storage.get(KEYS.motion) !== 'off';
 
 const motion = {
   planner: JourneyMotion.createPlanner(),
@@ -1824,20 +1898,29 @@ function startWaitIndicators() {
 
 function renderMotionToggle() {
   const on = motionOn();
+  const system = systemReducesMotion();
   const button = $('motion-toggle');
   button.setAttribute('aria-pressed', on ? 'true' : 'false');
-  button.textContent = on ? 'Motion: on' : 'Motion: off';
+  button.disabled = system;
+  button.textContent = system ? 'Motion: off (system setting)' : on ? 'Motion: on' : 'Motion: off';
+  const note = system
+    ? 'Your system asks for reduced motion, so animations stay off. Every state is still shown in words and icons.'
+    : 'Animations only illustrate what the delivery service reports. They are not real transmission timing. Turning them off changes nothing else.';
+  if ($('motion-note').textContent !== note) $('motion-note').textContent = note;
 }
 
 $('motion-toggle').addEventListener('click', () => {
+  if (systemReducesMotion()) return; // the system setting can't be overridden from here
   storage.set(KEYS.motion, motionOn() ? 'off' : 'on');
   if (!motionOn()) motion.player.cancelAll(); // stop at once; the state text is unaffected
   renderMotionToggle();
   startWaitIndicators();
 });
+// Re-evaluated whenever the system setting changes.
 motionQuery.addEventListener('change', () => {
   if (!motionOn()) motion.player.cancelAll();
   renderMotionToggle();
+  startWaitIndicators();
 });
 // Illustrations follow paths measured when they start. If the journey's width changes mid-flight (window
 // resized, layout switching between row and stacked), they are dropped; the state text stays. Height
@@ -1852,6 +1935,9 @@ new ResizeObserver(([entry]) => {
 function renderSummary() {
   const container = $('summary');
   const s = state.summary;
+  const signature = JSON.stringify([Boolean(state.token), s, state.receiver?.mode]);
+  if (container.dataset.sig === signature) return;
+  container.dataset.sig = signature;
   if (!state.token || !s) {
     container.replaceChildren(h('p', { class: 'hint' }, 'Start a session to see a summary.'));
     return;

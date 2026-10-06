@@ -2,7 +2,7 @@
 
 A learning sandbox that accepts synthetic JSON events (shown in the browser as practice *alerts*), persists them, and delivers them
 reliably to a controlled mock receiver.
-**Current stage: 17. Visitor-facing frontend: understandable outcomes and event history.**
+**Current stage: 18. Visitor-facing frontend: polish and accessibility.**
 
 | Want to… | Go to |
 |---|---|

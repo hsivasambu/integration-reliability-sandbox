@@ -290,9 +290,14 @@ legend { font-weight: 600; padding: 0; }
 .experiment.is-normal .exp-icon { color: var(--ink); }
 #scenario-note:empty { display: none; }
 
+/* The browser's scroll anchoring must not anchor inside the composer: a result appearing under Send alert would
+   otherwise scroll the whole page, moving a focused history card in the other column. Anchoring then uses the
+   journey and history, whose own redraws keep focus in place (keepFocus in app.js). */
+.composer { overflow-anchor: none; }
+
 /* Technical disclosure */
 details.tech { margin-top: var(--space-3); font-size: var(--text-sm); }
-details.tech > summary { cursor: pointer; font-weight: 600; color: var(--teal-strong); width: fit-content; }
+details.tech > summary { cursor: pointer; font-weight: 600; color: var(--teal-strong); width: fit-content; padding: 0.3rem 0; } /* at least 24 px tall (WCAG 2.5.8) */
 details.tech pre {
   background: var(--surface-sunk); border-radius: var(--radius-sm); padding: var(--space-3);
   overflow: auto; max-height: 22rem; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-xs);
@@ -410,6 +415,8 @@ details.tech h5 { margin: var(--space-3) 0 var(--space-1); font-size: var(--text
   padding: var(--space-2) var(--space-3);
 }
 .jd-card .jd-badge { margin-top: 0; font-size: var(--text-base); }
+/* The alert title inside the node is clamped (the full title is the journey heading); long words break. */
+.jd-alert-title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; overflow-wrap: anywhere; }
 .jd-card-title { margin: 0 0 var(--space-1); font-size: var(--text-xs); font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--on-navy-soft); }
 
 /* Links between components: a line with an arrowhead and a label. */

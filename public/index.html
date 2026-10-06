@@ -28,7 +28,8 @@
 
   <main id="main" class="shell">
     <p class="intro">Send a practice alert to a test receiver, then follow how the sandbox delivers it, tries again
-       when the receiver fails, and makes sure it is never processed twice. Every alert here is synthetic.</p>
+       when the receiver fails, and makes sure it is never processed twice. Every alert here is synthetic.
+       New here? <a href="#experiments-heading">Try a guided scenario</a>.</p>
     <noscript><p class="notice notice-bad">This demo needs JavaScript. The API itself is described at
       <a href="/docs/">/docs/</a>.</p></noscript>
 
@@ -41,39 +42,39 @@
           <fieldset class="presets">
             <legend>Sample alerts</legend>
             <p class="hint">Pick one to start. You can edit the words before sending.</p>
-            <div id="preset-list" class="preset-list"></div>
+            <div id="preset-list" class="preset-list"><label for="preset-service" class="preset"><input type="radio" name="preset" value="service" id="preset-service"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon preset-icon"><path d="M6 16v-5a6 6 0 1 1 12 0v5l1.5 2h-15z"></path><path d="M10 20.5a2 2 0 0 0 4 0"></path></svg><span class="preset-text"><strong>Service request</strong><span>Synthetic room A needs assistance.</span></span></label><label for="preset-equipment" class="preset"><input type="radio" name="preset" value="equipment" id="preset-equipment"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon preset-icon"><path d="M5 19l8-8"></path><path d="M12.5 6.5a4 4 0 0 1 5.5-1.5l-2.5 2.5 1 2 2 1 2.5-2.5a4 4 0 0 1-5.5 5.5"></path></svg><span class="preset-text"><strong>Equipment notification</strong><span>Demo device reports a maintenance issue.</span></span></label><label for="preset-team" class="preset"><input type="radio" name="preset" value="team" id="preset-team"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon preset-icon"><path d="M9 6h11"></path><path d="M9 12h11"></path><path d="M9 18h11"></path><path d="M4.5 6h.01"></path><path d="M4.5 12h.01"></path><path d="M4.5 18h.01"></path></svg><span class="preset-text"><strong>Team update</strong><span>A sample task is ready for review.</span></span></label></div>
           </fieldset>
 
           <label for="title">Alert title</label>
           <input id="title" name="title" required aria-describedby="title-count title-error" autocomplete="off" spellcheck="true">
-          <p class="field-meta"><span id="title-count" class="counter"></span></p>
+          <p class="field-meta"><span id="title-count" class="counter">15 of 100 characters</span></p>
           <p id="title-error" class="field-error" hidden></p>
 
           <label for="message">Alert message</label>
           <textarea id="message" name="message" rows="3" required aria-describedby="message-count message-error"></textarea>
-          <p class="field-meta"><span id="message-count" class="counter"></span></p>
+          <p class="field-meta"><span id="message-count" class="counter">34 of 500 characters</span></p>
           <p id="message-error" class="field-error" hidden></p>
 
-          <div class="preview" role="group" aria-labelledby="preview-label">
-            <p id="preview-label" class="preview-label">Preview</p>
-            <div id="preview" class="message-card"></div>
-          </div>
 
-          <details id="request-details" class="tech">
-            <summary>View request JSON</summary>
-            <pre id="request-json"></pre>
-            <p class="hint">The demo token is sent in the Authorization header but is never shown on this page.
-               The Idempotency-Key lets the sandbox recognize a repeated request, so checking again can never create a second alert.</p>
-          </details>
 
           <div class="button-row">
             <button type="submit" id="submit-event" class="btn btn-primary">Send alert</button>
           </div>
-          <p id="send-hint" class="hint"></p>
+          <p id="send-hint" class="hint">Sending starts a private demo session: anonymous, no sign-up, and it ends after 24 hours.</p>
+          <div id="pending-area"></div>
+          <div id="submit-result" class="result" role="status" aria-live="polite"></div>
+          <div class="preview" role="group" aria-labelledby="preview-label">
+            <p id="preview-label" class="preview-label">Preview</p>
+            <div id="preview" class="message-card"><p class="message-card-tag"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon"><path d="M6 16v-5a6 6 0 1 1 12 0v5l1.5 2h-15z"></path><path d="M10 20.5a2 2 0 0 0 4 0"></path></svg>Sample alert</p><p class="message-card-title">Service request</p><p class="message-card-body">Synthetic room A needs assistance.</p></div>
+          </div>
+          <details id="request-details" class="tech">
+            <summary>View request JSON</summary>
+            <pre id="request-json" tabindex="0" aria-label="Request JSON"></pre>
+            <p class="hint">The demo token is sent in the Authorization header but is never shown on this page.
+               The Idempotency-Key lets the sandbox recognize a repeated request, so checking again can never create a second alert.</p>
+          </details>
         </form>
-        <div id="pending-area"></div>
-        <div id="submit-result" class="result" role="status" aria-live="polite"></div>
-        <p id="receiver-label" class="receiver-label"></p>
+        <p id="receiver-label" class="receiver-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon"><path d="M4 13.5 6.5 5h11l2.5 8.5V19H4z"></path><path d="M4 13.5h4.5l1 2.5h5l1-2.5H20"></path></svg><span>Test receiver: <strong>Works normally</strong> (the default for a new session)<span class="hint receiver-hint">The scenarios below can change this.</span></span></p>
       </section>
 
       <div class="journey-column">
@@ -94,8 +95,8 @@
             <h2 id="journey-heading" class="journey-heading" tabindex="-1">Alert journey</h2>
             <button type="button" id="motion-toggle" class="motion-toggle" aria-pressed="true" aria-describedby="motion-note">Motion: on</button>
           </div>
-          <p id="motion-note" class="motion-note">Animations only illustrate what the delivery service reports; they are not real transmission timing. Turning them off changes nothing else.</p>
-          <div id="detail"></div>
+          <p id="motion-note" class="motion-note">Animations only illustrate what the delivery service reports. They are not real transmission timing. Turning them off changes nothing else.</p>
+          <div id="detail"><div class="journey-empty"><p>Send an alert to see its journey here, step by step.</p><div class="jd jd-empty" role="group" aria-label="Alert journey diagram, not started"><div class="jd-node jd-alert"><div class="jd-head"><span class="jd-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon"><path d="M6 16v-5a6 6 0 1 1 12 0v5l1.5 2h-15z"></path><path d="M10 20.5a2 2 0 0 0 4 0"></path></svg></span><p class="jd-name">Your alert</p></div><p class="jd-badge is-idle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon"><path d="M7 12h10"></path></svg>Not started</p><p class="jd-meta">What you send.</p></div><div class="jd-link jd-handover is-idle"><span class="jd-line"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon jd-arrow"><path d="M4 12h15"></path><path d="M14 7l5 5-5 5"></path></svg></span></div><div class="jd-node jd-delivery"><div class="jd-head"><span class="jd-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon"><path d="M4 12 20 4l-5.5 16-3-7z"></path><path d="M11.5 13 20 4"></path></svg></span><p class="jd-name">Delivery service</p></div><p class="jd-badge is-idle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon"><path d="M7 12h10"></path></svg>Not started</p><p class="jd-meta">Saves your alert, sends it, and tries again if needed.</p></div><div class="jd-link jd-paths"><div class="jd-path jd-forward is-idle"><span class="jd-path-name">Delivery try</span><span class="jd-line"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon jd-arrow"><path d="M4 12h15"></path><path d="M14 7l5 5-5 5"></path></svg></span><span class="jd-path-state">No try yet</span></div><div class="jd-path jd-ack is-idle is-unobserved"><span class="jd-path-name">Acknowledgement</span><span class="jd-line"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon jd-arrow"><path d="M4 12h3"></path><path d="M10.5 12h3"></path><path d="M17 12h3"></path></svg></span><span class="jd-path-state">No reply yet</span></div></div><div class="jd-node jd-receiver"><div class="jd-head"><span class="jd-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon"><path d="M4 13.5 6.5 5h11l2.5 8.5V19H4z"></path><path d="M4 13.5h4.5l1 2.5h5l1-2.5H20"></path></svg></span><p class="jd-name">Receiving system</p></div><p class="jd-badge is-idle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon"><path d="M7 12h10"></path></svg>Not started</p><p class="jd-meta">A test system inside this sandbox that confirms and processes alerts.</p></div></div></div></div>
           <div id="journey-motion" class="jm-layer" aria-hidden="true"></div>
           <p id="journey-announce" class="visually-hidden" aria-live="polite"></p>
         </section>
@@ -106,18 +107,18 @@
             <button type="button" id="new-alert" class="btn btn-quiet">New alert</button>
             <p id="poll-status" class="hint" role="status" aria-live="polite"></p>
           </div>
-          <ul id="event-list" class="history-list"></ul>
+          <ul id="event-list" class="history-list"><li class="history-empty">Your alerts will appear here.</li></ul>
           <div id="history-more" class="history-more"></div>
         </section>
       </div>
     </div>
 
     <section class="experiments" aria-labelledby="experiments-heading">
-      <h2 id="experiments-heading">Try a scenario</h2>
+      <h2 id="experiments-heading" tabindex="-1">Try a scenario</h2>
       <p class="hint">Send a normal alert, or follow a short guide through a failure and its recovery. Guides never start by
          themselves, and each step waits for what the sandbox actually reports.</p>
       <div id="scenario-note" role="status" aria-live="polite"></div>
-      <div id="scenarios" class="experiment-grid"></div>
+      <div id="scenarios" class="experiment-grid"><article class="card experiment is-normal" aria-labelledby="scenario-normal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon exp-icon"><path d="M4 12 20 4l-5.5 16-3-7z"></path><path d="M11.5 13 20 4"></path></svg><h3 id="scenario-normal">Normal delivery</h3><p>The receiver works normally. Send one alert and follow it from start to finish.</p><p class="note">Sets the receiver back to "Works normally" if needed, then sends one alert.</p><div class="button-row"><button type="button" class="btn btn-primary">Send a normal alert</button></div></article><article class="card experiment" aria-labelledby="scenario-recover"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon exp-icon"><path d="M20 12a8 8 0 1 1-2.4-5.7"></path><path d="M20 4v4.5h-4.5"></path></svg><h3 id="scenario-recover">Recover from a temporary problem</h3><p>The receiver rejects the first try. You restore it, and a scheduled retry succeeds.</p><p class="note">Sets your receiver to "Temporary outage" for the whole session, then sends one alert. One step at a time.</p><div class="button-row"><button type="button" class="btn btn-primary">Start guide</button></div></article><article class="card experiment" aria-labelledby="scenario-twice"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon exp-icon"><path d="M7 3h10"></path><path d="M7 21h10"></path><path d="M8 3c0 5 8 5 8 9s-8 4-8 9"></path><path d="M16 3c0 5-8 5-8 9s8 4 8 9"></path></svg><h3 id="scenario-twice">Avoid processing twice</h3><p>The receiver processes the alert but replies too late. A retry is recognized as the same alert.</p><p class="note">Sets your receiver to "Processes, then replies late" for the whole session, then sends one alert. One step at a time.</p><div class="button-row"><button type="button" class="btn btn-primary">Start guide</button></div></article><article class="card experiment" aria-labelledby="scenario-rescue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="icon exp-icon"><path d="M4 12a8 8 0 1 0 2.4-5.7"></path><path d="M4 4v4.5h4.5"></path><path d="M10.5 9.5v5l4-2.5z"></path></svg><h3 id="scenario-rescue">Rescue a stopped delivery</h3><p>Every automatic try fails. You restore the receiver and retry the delivery by hand.</p><p class="note">Sets your receiver to "Temporary outage" for the whole session, then sends one alert. One step at a time.</p><div class="button-row"><button type="button" class="btn btn-primary">Start guide</button></div></article></div>
       <details class="card receiver-details">
         <summary>Set the test receiver yourself</summary>
         <p id="receiver-lock" class="notice is-waiting lock-reason" role="status"></p>
@@ -148,7 +149,7 @@
         </div>
         <div>
           <h3>Session summary</h3>
-          <div id="summary" aria-live="polite"><p class="hint">Start a session to see a summary.</p></div>
+          <div id="summary"><p class="hint">Start a session to see a summary.</p></div>
         </div>
       </div>
 

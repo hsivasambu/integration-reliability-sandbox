@@ -194,7 +194,9 @@ seconds.
 - **Countdown reaching zero:** if the countdown ends before the API reports the next try, the journey says
   *Waiting for the next attempt*. It never claims a send.
 - **Screen readers:** the journey region isn't `aria-live` (it's redrawn every refresh). A separate hidden live
-  region announces one short sentence, only when the delivery or processing state of the shown alert changes.
+  region announces one short sentence only for meaningful transitions of the alert being watched: a retry scheduled,
+  delivery confirmed or stopped, processed, a repeat recognized. Losing and regaining the connection is announced
+  once each. "Sending", countdown ticks, polls, a page load and choosing another alert announce nothing (Stage 18).
 
 ## Motion (Stage 15)
 
@@ -244,8 +246,11 @@ journey views and returns effects, keyed by **stable attempt keys** (`<deliveryI
 | Exhausted | *Stopped*, with **Deliver again** inside the delivery service | Nothing (it settles; no motion left) |
 | Duplicate | "Already processed: n repeats recognized, not processed again" | "Already processed" chip at the receiver; no second result |
 
-**Motion control.** *Motion: on/off* in the journey header (`aria-pressed`). The default follows
-`prefers-reduced-motion`; an explicit choice is kept for the tab (`sessionStorage` `irs.motion`). With motion off,
+**Motion control.** *Motion: on/off* in the journey header (`aria-pressed`). A system request to reduce motion
+(`prefers-reduced-motion: reduce`) always wins: the button then reads *Motion: off (system setting)* and is
+disabled, whatever was chosen before. Without that request the page's own choice can turn motion off (kept for the
+tab in `sessionStorage` `irs.motion`). It can only reduce motion, never override the system. Both are re-evaluated
+when they change, without a reload. Smooth scrolling follows the same rule (Stage 18). With motion off,
 nothing is drawn in the layer and the wait bar is redrawn once a second without animation. Icons, text and the
 static path styling (broken line vs return arrow, current-path emphasis) carry everything. The global CSS
 reduced-motion rule doesn't apply to Web Animations, which is why motion is gated in JavaScript; the wait bar
@@ -375,6 +380,43 @@ appears where there is none.
   twice)
 - the raw API data
 
+## Polish and accessibility (Stage 18)
+
+**Hierarchy.** On wide screens the journey diagram is visible before anything is sent: the same three parts, each
+*Not started* (no server state is implied). The composer's *Send alert* sits directly under the message, with its
+result straight after it; the preview and request JSON follow. The intro links to the scenarios ("New here? Try a
+guided scenario"). On narrow screens the composer comes first and the journey stacks vertically.
+
+**Empty journey.** Before any session, the diagram shows each part as *Not started*. With a session and nothing
+selected (or a restored alert still loading) the parts are described without a state, because "Not started"
+would be untrue for an alert that exists.
+
+**Scroll anchoring.** The composer is excluded from the browser's scroll anchoring (`overflow-anchor: none`):
+a result appearing under *Send alert* used to scroll the page by its height and move a focused history card in
+the other column. Anchoring now uses the journey and history, whose redraws keep focus in place.
+
+**First paint.** `index.html` contains the first-visit content of the sample cards, counters, preview, empty
+journey, empty history and scenario cards (captured from what the script renders, no inline styles), so the page
+doesn't jump when the script runs. The script re-renders these regions as before.
+
+**Live regions update only on change.** Session line, poll status, service pill, scenario note, receiver lock and the
+unconfirmed-send panel compare a signature and leave the DOM alone when nothing changed. The stale banner and the
+technical summary are not live regions any more (the announcer covers connection changes).
+
+**Copy.** No em dashes. Error notices give the next action in plain words ("Check your connection, then try
+again."); HTTP statuses and keys sit in a collapsed *Technical details* inside the notice. Stale and unknown
+states keep their honest wording.
+
+**Requests.** One polling owner (`pollNow`/`refresh`). The receiver mode only changes through this page's own
+`PUT`, whose answer updates it, so `GET /v1/receiver` is read every 30 s while polling and when the tab returns,
+not every 2 s. During an active retry this is 16 requests per 10 s instead of 20. The summary stays per poll
+because the scenario locks depend on it. No requests and no intervals run when idle.
+
+**Accessibility details.** Scrollable `<pre>` blocks are keyboard-focusable. Disclosure summaries are at least
+24 px tall. The alert title inside the "Your alert" node is clamped to 3 lines (the full title is the journey
+heading). Motion labels are `aria-hidden` and fade over about 0.2 s; mid-fade frames have low contrast by
+nature, but at rest they are #f5f0e6 on #1b2c50 (about 13:1) and the static journey always carries the same text.
+
 ## Known gaps (data the API doesn't provide)
 
 - **The alert list has no receiver data**, so history cards show processing only for alerts whose receipt was read
@@ -414,5 +456,5 @@ never creates one automatically.
 - `npm test` includes `test/ui.test.js` (CSP, no inline script/handlers/styles, safe DOM APIs in both scripts, no
   token in URLs) and `test/journey-model.test.js` (the adapter's mapping, with fixtures).
 - For visual and flow checks, run a local server with the worker on (`WORKER_ENABLED=true`) and use a real browser.
-  Stages 12–14 used headless Edge with puppeteer-core and axe-core from a scratch folder (not project
+  Stages 12–18 used headless Edge with puppeteer-core and axe-core from a scratch folder (not project
   dependencies), with DevTools `Fetch` interception to hold, fail or delay specific requests. See the build notes.
