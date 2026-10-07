@@ -35,6 +35,9 @@ test('UI assets are served with correct types', async () => {
   const css = await request(app).get('/app.css');
   assert.equal(css.status, 200);
   assert.match(css.headers['content-type'], /text\/css/);
+  const icon = await request(app).get('/favicon.svg');
+  assert.equal(icon.status, 200);
+  assert.match(icon.headers['content-type'], /image\/svg\+xml/);
 });
 
 test('UI scripts render server text safely and never put the token in a URL', async () => {
